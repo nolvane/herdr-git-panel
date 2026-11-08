@@ -1788,39 +1788,42 @@ mod tests {
         terminal.backend().buffer().clone()
     }
 
-    fn row_text(buf: &Buffer, y: u16) -> Vec<String> {
-        (0..buf.area.width)
-            .map(|x| buf[(x, y)].symbol().to_string())
-            .collect()
-    }
-
-    /// The row of the heading bar (the one that says "Updated", a column
-    /// narrow panes keep).
-    fn heading_row(buf: &Buffer) -> u16 {
-        (0..buf.area.height)
-            .find(|&y| row_text(buf, y).concat().contains("Updated"))
-            .expect("heading bar")
-    }
-
-    /// The terminal column where `word` starts in the heading bar, if shown.
-    fn heading_x(buf: &Buffer, word: &str) -> Option<u16> {
-        let cells = row_text(buf, heading_row(buf));
-        let letters: Vec<&str> = word.split("").filter(|s| !s.is_empty()).collect();
-        (0..cells.len().saturating_sub(letters.len())).find_map(|x| {
-            let fits = letters.iter().enumerate().all(|(i, l)| cells[x + i] == *l);
+    /// Where `word` starts in row `y`, as a whole word.
+    fn word_x(buf: &Buffer, y: u16, word: &str) -> Option<u16> {
+        let cells: Vec<&str> = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
+        let letters: Vec<String> = word.chars().map(String::from).collect();
+        (0..=cells.len().checked_sub(letters.len())?).find_map(|x| {
+            let fits = letters.iter().zip(&cells[x..]).all(|(l, c)| l == c);
             // A whole word: blank (or the edge) before and after.
             let before = x == 0 || cells[x - 1] == " ";
-            let after = cells.get(x + letters.len()).is_none_or(|c| c == " ");
+            let after = cells.get(x + letters.len()).is_none_or(|c| *c == " ");
             (fits && before && after).then_some(x as u16)
         })
     }
 
-    /// The symbol and colour in the first line of the `n`th row, under the
-    /// first letter of `word` in the heading.
-    fn under(buf: &Buffer, word: &str, n: u16, step: u16) -> (String, Option<Color>) {
-        let x = heading_x(buf, word).unwrap_or_else(|| panic!("heading {word}"));
-        let cell = &buf[(x, heading_row(buf) + 1 + n * step)];
-        (cell.symbol().to_string(), Some(cell.fg))
+    /// The heading bar: the row on the bar colour that says "Updated" (a
+    /// column narrow panes keep), and where "Review" and "CI" start in it.
+    struct Headings {
+        y: u16,
+        review: Option<u16>,
+        ci: Option<u16>,
+    }
+
+    fn headings(buf: &Buffer) -> Headings {
+        let y = (0..buf.area.height)
+            .find(|&y| word_x(buf, y, "Updated").is_some_and(|x| buf[(x, y)].bg == BAR_BG))
+            .expect("heading bar");
+        Headings {
+            y,
+            review: word_x(buf, y, "Review"),
+            ci: word_x(buf, y, "CI"),
+        }
+    }
+
+    /// The symbol and colour at column `x` of terminal row `y`.
+    fn cell_at(buf: &Buffer, x: u16, y: u16) -> (String, Color) {
+        let cell = &buf[(x, y)];
+        (cell.symbol().to_string(), cell.fg)
     }
 
     fn app_with(review: Vec<MergeRequest>, mine: Vec<MergeRequest>, compact: bool) -> App {
@@ -1834,56 +1837,80 @@ mod tests {
         app
     }
 
+    /// A made-up merge request per review and pipeline state, newest first
+    /// (the list's order), with the review dot and the CI cell it shows.
+    fn samples() -> Vec<(MergeRequest, Color, (&'static str, Color))> {
+        vec![
+            (
+                sample_mr(6, ReviewState::Reviewed, Pipeline::Canceled),
+                YELLOW,
+                ("●", FAINT),
+            ),
+            (
+                sample_mr(5, ReviewState::Unreviewed, Pipeline::Manual),
+                FAINT,
+                ("●", FAINT),
+            ),
+            (
+                sample_mr(4, ReviewState::Approved, Pipeline::Success),
+                GREEN,
+                ("●", GREEN),
+            ),
+            (
+                sample_mr(3, ReviewState::ChangesRequested, Pipeline::Failed),
+                RED,
+                ("●", RED),
+            ),
+            (
+                sample_mr(2, ReviewState::Started, Pipeline::Running),
+                YELLOW,
+                ("●", YELLOW),
+            ),
+            (
+                sample_mr(1, ReviewState::Unreviewed, Pipeline::None),
+                FAINT,
+                ("–", FAINT),
+            ),
+        ]
+    }
+
+    fn sample_rows() -> Vec<MergeRequest> {
+        samples().into_iter().map(|(mr, _, _)| mr).collect()
+    }
+
     /// Checks every row of the shown section at one width: the review dot
     /// (to review only) and the CI dot or dash sit under the first letter
     /// of their heading, in the expected colour.
     fn assert_dots_aligned(app: &mut App, width: u16, ci_shown: bool) {
         let buf = render(app, width);
+        let h = headings(&buf);
         let step = if app.config.compact { 1 } else { 2 };
-        let rows: Vec<MergeRequest> = app.rows(app.section).into_iter().cloned().collect();
-        for (n, mr) in rows.iter().enumerate() {
-            let n = n as u16;
+        let expected = samples();
+        let shown: Vec<u64> = app.rows(app.section).iter().map(|mr| mr.iid).collect();
+        let order: Vec<u64> = expected.iter().map(|(mr, _, _)| mr.iid).collect();
+        assert_eq!(shown, order);
+        if !ci_shown {
+            assert_eq!(h.ci, None, "CI dropped at width {width}");
+        }
+        for (n, (_, review, ci)) in expected.into_iter().enumerate() {
+            let y = h.y + 1 + n as u16 * step;
             if app.section == Section::Review {
-                let color = match mr.review_of("me") {
-                    Some(ReviewState::Approved) => GREEN,
-                    Some(ReviewState::ChangesRequested) => RED,
-                    Some(ReviewState::Reviewed) | Some(ReviewState::Started) => YELLOW,
-                    _ => FAINT,
-                };
+                let x = h.review.expect("Review heading");
                 assert_eq!(
-                    under(&buf, "Review", n, step),
-                    ("●".to_string(), Some(color)),
+                    cell_at(&buf, x, y),
+                    ("●".to_string(), review),
                     "review dot of row {n} at width {width}"
                 );
             }
-            if !ci_shown {
-                assert_eq!(heading_x(&buf, "CI"), None, "CI dropped at width {width}");
-                continue;
+            if ci_shown {
+                let x = h.ci.expect("CI heading");
+                assert_eq!(
+                    cell_at(&buf, x, y),
+                    (ci.0.to_string(), ci.1),
+                    "CI of row {n} at width {width}"
+                );
             }
-            let expected = match mr.pipeline {
-                Pipeline::None => ("–", FAINT),
-                Pipeline::Success => ("●", GREEN),
-                Pipeline::Failed => ("●", RED),
-                Pipeline::Running => ("●", YELLOW),
-                Pipeline::Canceled | Pipeline::Manual => ("●", FAINT),
-            };
-            assert_eq!(
-                under(&buf, "CI", n, step),
-                (expected.0.to_string(), Some(expected.1)),
-                "CI of row {n} at width {width}"
-            );
         }
-    }
-
-    fn sample_rows() -> Vec<MergeRequest> {
-        vec![
-            sample_mr(6, ReviewState::Reviewed, Pipeline::Canceled),
-            sample_mr(5, ReviewState::Unreviewed, Pipeline::Manual),
-            sample_mr(4, ReviewState::Approved, Pipeline::Success),
-            sample_mr(3, ReviewState::ChangesRequested, Pipeline::Failed),
-            sample_mr(2, ReviewState::Started, Pipeline::Running),
-            sample_mr(1, ReviewState::Unreviewed, Pipeline::None),
-        ]
     }
 
     #[test]
@@ -1921,8 +1948,8 @@ mod tests {
             app.review_state.select(Some(0));
             assert_dots_aligned(&mut app, 160, true);
             let buf = render(&mut app, 160);
-            let x = heading_x(&buf, "Review").unwrap();
-            assert_eq!(buf[(x, heading_row(&buf) + 1)].bg, SELECTED_BG);
+            let h = headings(&buf);
+            assert_eq!(buf[(h.review.unwrap(), h.y + 1)].bg, SELECTED_BG);
         }
     }
 }
