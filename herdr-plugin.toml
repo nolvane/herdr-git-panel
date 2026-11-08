@@ -1,0 +1,33 @@
+# Herdr Git Panel: the GitLab merge requests and GitHub pull requests you review and your own.
+
+id = "git-panel"
+name = "Git Panel"
+version = "1.0.0"
+min_herdr_version = "0.9.0"
+description = "Lists the GitLab merge requests and GitHub pull requests to review and your own, with threads, approvals, pipeline and labels"
+platforms = ["linux", "macos"]
+
+# Builds the binary into the plugin root (needs cargo).
+[[build]]
+command = ["sh", "scripts/build.sh"]
+
+# The list itself. The "open" action opens it in the focused pane's directory.
+[[panes]]
+id = "list"
+title = "Git panel"
+placement = "overlay"
+command = ["./herdr-git-panel", "list"]
+
+[[actions]]
+id = "open"
+title = "Git panel: open or close"
+description = "Show the merge requests to review and your own"
+contexts = ["global"]
+command = ["./herdr-git-panel", "open"]
+
+[[actions]]
+id = "open-split"
+title = "Git panel: open or close below the pane"
+description = "Show the merge requests in a split below the pane"
+contexts = ["global"]
+command = ["./herdr-git-panel", "open", "split"]

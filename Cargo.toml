@@ -1,0 +1,17 @@
+[package]
+name = "herdr-git-panel"
+version = "1.0.0"
+edition = "2021"
+description = "Herdr plugin that shows the merge requests you have to review and your own, with threads, approvals, pipeline and labels"
+license = "MIT"
+publish = false
+
+[dependencies]
+ratatui = "0.30.2"
+serde_json = "1.0.154"
+unicode-width = "0.2.3"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true

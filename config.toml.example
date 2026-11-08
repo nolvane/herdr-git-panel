@@ -1,0 +1,28 @@
+# Herdr Git Panel settings. Copy to the directory
+# `herdr plugin config-dir git-panel` prints, as config.toml.
+# Changes apply the next time the list opens.
+
+# Which merge requests to show: "current" = only the project of the directory
+# the list is opened from (all projects when it is not a GitLab repository),
+# "all" = every project. Press a in the list to switch.
+scope = "current"
+
+# Seconds between automatic refreshes (10 to 3600). Press r to refresh now.
+refresh_secs = 60
+
+# Where the list opens: "overlay" (over the current tab, gone when closed),
+# "split" (next to the focused pane) or "tab" (a tab of its own).
+placement = "overlay"
+
+# Where a split goes: "down" (below the focused pane) or "right".
+split_direction = "down"
+
+# "nerd" needs a Nerd Font in the terminal; "plain" uses ordinary symbols.
+icons = "nerd"
+
+# One line per merge request instead of two (title with project, number,
+# author and branch above it).
+compact = false
+
+# The GitLab host; glab must be logged in there.
+gitlab_host = "gitlab.com"
