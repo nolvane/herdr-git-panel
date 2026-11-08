@@ -6,6 +6,11 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- "Mine" is now the first section, before "To review", and the list opens on
+  it; `1` selects "Mine" and `2` "To review".
+
 ### Fixed
 
 - The "Review" and "CI" dots and their headings start at the left edge of

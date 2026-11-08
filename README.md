@@ -7,7 +7,7 @@ installed and logged in; with both, the lists mix GitLab and GitHub, each row
 with its forge's logo.
 
 ```
-  Merge requests    To review 2   Mine 8                              ⌕ Search   all projects
+  Merge requests    Mine 8   To review 2                              ⌕ Search   all projects
 
      Merge request                         Author   Review  CI  Approvals  Threads       Changes  Opened  Updated
     Add payment notices to the contract    @alex      ●     ●   1/2        –             +48 -9   2d      1h
@@ -110,7 +110,7 @@ scrolls the details panel when the pointer is over it.
 | Key | What it does |
 |---|---|
 | `↑` `↓` or `j` `k` | Move |
-| `Tab` or `1` `2` | Switch between "To review" and "Mine" |
+| `Tab` or `1` `2` | Switch between "Mine" and "To review" |
 | `Enter` or `o` | Open the merge request in the browser |
 | `p` or `Space` | Details panel on or off; `Ctrl+d` `Ctrl+u` scroll it |
 | `d` | Show the changes (diff); `n` `N` next or previous file, `f` file tree, `q` back |
