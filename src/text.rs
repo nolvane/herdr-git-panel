@@ -142,11 +142,18 @@ fn inline(text: &str, base: Style) -> Vec<(Span<'static>, Option<String>)> {
             if let Some(close) = after.find("](") {
                 if let Some(end) = after[close + 2..].find(')') {
                     flush(&mut plain, &mut spans);
-                    let url = after[close + 2..close + 2 + end].to_string();
-                    spans.push((
-                        Span::styled(after[..close].to_string(), link_style),
-                        Some(url),
-                    ));
+                    let url = &after[close + 2..close + 2 + end];
+                    // Only web links can be clicked: a link written by someone
+                    // else must not open a local file, app or other scheme.
+                    let span = if is_web_link(url) {
+                        (
+                            Span::styled(after[..close].to_string(), link_style),
+                            Some(url.to_string()),
+                        )
+                    } else {
+                        (Span::styled(after[..close].to_string(), base), None)
+                    };
+                    spans.push(span);
                     rest = &after[close + 2 + end + 1..];
                     continue;
                 }
@@ -310,6 +317,13 @@ fn add(
     out.extend(lines);
 }
 
+/// Whether the target is an `http` or `https` address the browser may open,
+/// without spaces or control characters that `open` could read differently.
+pub fn is_web_link(url: &str) -> bool {
+    (url.starts_with("https://") || url.starts_with("http://"))
+        && !url.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -341,6 +355,28 @@ mod tests {
             Span::raw("  "),
         );
         assert_eq!(text(&lines), ["> abcd", "  efgh", "  ij"]);
+    }
+
+    #[test]
+    fn only_web_links_can_be_clicked() {
+        let (lines, spots) = markdown_links(
+            "[CI log](file:///System/Applications/Utilities/Terminal.app) \
+             [a](-aCalculator) [b](smb://host/share) [c](/acme/app/-/jobs/1) \
+             [d](https://x.test/ok) [e](https://x.test/a b)",
+            200,
+        );
+        assert_eq!(text(&lines), ["CI log a b c d e"]);
+        assert_eq!(spots, vec![(0, 13, 1, "https://x.test/ok".to_string())]);
+        assert!(is_web_link("http://x.test/1"));
+        for bad in [
+            "file:///etc",
+            "-a",
+            "ssh://x",
+            "https://a b",
+            "https://x\u{1b}]",
+        ] {
+            assert!(!is_web_link(bad), "{bad}");
+        }
     }
 
     #[test]

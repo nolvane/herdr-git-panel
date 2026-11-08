@@ -891,6 +891,10 @@ impl App {
 
     /// Opens a link in the browser.
     fn open_url(&mut self, url: &str) {
+        if !crate::text::is_web_link(url) {
+            self.say("Only web links can be opened");
+            return;
+        }
         let opener = if cfg!(target_os = "macos") {
             "open"
         } else {
