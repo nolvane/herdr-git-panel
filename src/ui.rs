@@ -1962,15 +1962,15 @@ mod tests {
         (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect()
     }
 
-    /// The row with the section tabs, and where "Mine" and "To review" start.
+    /// The row with the section tabs, and the cells where "Mine" and "To
+    /// review" start.
     fn tabs(buf: &Buffer) -> (u16, u16, u16) {
         (0..buf.area.height)
             .find_map(|y| {
-                let text = row_text(buf, y);
-                let mine = text.find(" Mine ")?;
-                let review = text.find(" To review ")?;
-                let col = |byte: usize| text[..byte].chars().count() as u16 + 1;
-                Some((y, col(mine), col(review)))
+                let mine = word_x(buf, y, "Mine")?;
+                let review = word_x(buf, y, "To")?;
+                word_x(buf, y, "review")?;
+                Some((y, mine, review))
             })
             .expect("section tabs")
     }

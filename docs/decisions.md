@@ -283,3 +283,11 @@ review dot two cells into its six-cell column, out of line with every other
 column. They now start at the left edge like the other values and headings.
 Rendering tests check that each dot sits under the first letter of its
 heading, so the centring does not come back.
+
+## 2026-11-08: "Mine" is the first section
+
+The list shows "Mine" first and opens on it, also when it is empty and "To
+review" has entries; `1` selects "Mine" and `2` "To review". Without a second
+reviewer nobody asks for reviews, so opening on "To review" meant switching
+on every open. The order lives in one list, `Section::ORDER` in `src/app.rs`,
+which the header tabs, the starting section and the number keys read.

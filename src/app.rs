@@ -20,8 +20,8 @@ use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Section {
-    Review,
     Mine,
+    Review,
 }
 
 impl Section {
@@ -1128,7 +1128,7 @@ impl App {
             | KeyCode::Right
             | KeyCode::Char('h')
             | KeyCode::Char('l') => self.switch_section(),
-            KeyCode::Char(c) if c.is_ascii_digit() => {
+            KeyCode::Char(c @ '1'..='9') => {
                 if let Some(section) = Section::numbered(c) {
                     self.section = section;
                 }
@@ -1291,13 +1291,16 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
         terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
         let buf = terminal.backend().buffer().clone();
-        // Where a label starts in the row of the tabs.
+        // The cell where a tab's label starts, matched cell by cell.
         let find = |label: &str| {
+            let letters: Vec<String> = label.chars().map(String::from).collect();
             (0..buf.area.height)
                 .find_map(|y| {
-                    let text: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
-                    let byte = text.find(label)?;
-                    Some((text[..byte].chars().count() as u16 + 1, y))
+                    let cells: Vec<&str> =
+                        (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
+                    let x = (0..=cells.len() - letters.len())
+                        .find(|&x| letters.iter().zip(&cells[x..]).all(|(l, c)| l == c))?;
+                    Some((x as u16 + 1, y))
                 })
                 .expect(label)
         };
