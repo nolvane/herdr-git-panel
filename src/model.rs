@@ -160,8 +160,11 @@ pub struct AllList {
     pub of: Option<crate::repo::Project>,
     pub items: Vec<MergeRequest>,
     /// How many are open in all, as the forges count them; more than
-    /// `items` when the list was cut.
+    /// `newest` when the list was cut.
     pub total: u64,
+    /// How many of `items` are the forges' newest; the rest are your own
+    /// and the ones you review from past the cut.
+    pub newest: usize,
     /// A forge that failed to load it.
     pub error: Option<String>,
 }

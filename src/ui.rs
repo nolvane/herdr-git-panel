@@ -803,7 +803,8 @@ fn draw_table(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
     if rows_data.is_empty() {
         let (text, color) = if app.data.is_none() || all_loading {
             match &app.error {
-                Some(e) if app.data.is_none() => (e.clone(), RED),
+                // Nothing loads any more: say why instead of "Loading".
+                Some(e) if app.data.is_none() || !app.loading => (e.clone(), RED),
                 _ => (
                     format!("Loading {}…", app.plural_noun().to_lowercase()),
                     MUTED,
@@ -1658,16 +1659,18 @@ fn draw_footer(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
         .as_ref()
         .map(|k| k.iter().map(|s| s.width() as u16).sum())
         .unwrap_or(0);
-    // "All" cut at what one request per forge loads: say so, in front.
+    // "All" cut at what one request per forge loads: say so, in front,
+    // when it fits next to the status.
     let cut = app
         .all_list()
-        .filter(|all| app.section == Section::All && all.total > all.items.len() as u64)
+        .filter(|all| app.section == Section::All && all.total > all.newest as u64)
         .map(|all| {
             Span::styled(
-                format!("newest {} of {}  ", all.items.len(), all.total),
+                format!("newest {} of {}  ", all.newest, all.total),
                 Style::new().fg(MUTED),
             )
-        });
+        })
+        .filter(|c| c.width() + right.width() + key_width as usize <= area.width as usize);
     let cut_width = cut.as_ref().map(|c| c.width() as u16).unwrap_or(0);
     // The status on the right wins; the key hints take what is left.
     let right_width = (right.width() as u16 + key_width + cut_width).min(area.width);
@@ -2074,6 +2077,7 @@ mod tests {
         app.project = of.clone();
         app.data.as_mut().unwrap().all = Some(AllList {
             of,
+            newest: items.len(),
             items,
             total,
             error: None,
@@ -2171,6 +2175,17 @@ mod tests {
         assert!(rows.iter().any(|r| r.contains(" All … ")), "{rows:#?}");
         app.section = Section::Mine;
         assert!(shown(&mut app, "Add export"), "Mine switches at once");
+        // The refresh for this project failed: "All" says why.
+        app.section = Section::All;
+        app.error = Some("glab: no network".into());
+        let rows = screen(&mut app, 120, 20);
+        // In the table, not only in the footer (the last row).
+        assert!(
+            rows[..19].iter().any(|r| r.contains("glab: no network")),
+            "{rows:#?}"
+        );
+        app.loading = true;
+        assert!(shown(&mut app, "Loading merge requests…"), "trying again");
     }
 
     #[test]
@@ -2181,6 +2196,13 @@ mod tests {
         assert!(!shown(&mut app, "newest 6 of 54"), "only on All");
         let mut app = app_with_all(sample_rows(), 6, None);
         assert!(!shown(&mut app, "newest"), "nothing cut");
+        // Too narrow next to a message: the message wins.
+        let mut app = app_with_all(sample_rows(), 54, None);
+        app.error = Some("All: GitLab: the merge request list could not be loaded".into());
+        let rows = screen(&mut app, 70, 20);
+        let footer = &rows[19];
+        assert!(footer.contains("could not be loaded"), "{footer}");
+        assert!(!footer.contains("newest"), "{footer}");
     }
 
     /// Every row of a frame of this size, as text.

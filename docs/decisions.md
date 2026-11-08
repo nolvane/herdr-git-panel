@@ -363,7 +363,8 @@ once as before.
   active, with only the update times of their open merge requests
   (complexity about 30), then the newest 100 in full through
   `projects(fullPaths) { mergeRequests(updatedAfter) }`, one second before
-  the oldest one picked so ties at the cut stay. Each project in that second
+  the oldest one picked so ties at the cut stay (projects with a tie are
+  asked too). Each project in that second
   request adds about 1.4 to the complexity, so at most 50 go in one request
   (about 205). GitLab's top-level `mergeRequests` query is an experiment
   since 19.3 and needs a filter, so it is not used.
@@ -378,7 +379,12 @@ once as before.
   as variables; single values stay variables.
 - Your own and the ones you review in the covered projects are added from
   the other two lists, so they are in "All" also when they are older than
-  the cut.
+  the cut. "newest N of M" counts only the forges' newest, not these.
+- GitHub answers with errors next to the data the login may see (an
+  organization behind single sign-on, a pull request gone between the two
+  steps); those are left out instead of failing "All".
+- A project whose forge could not be asked at all (its tool missing or not
+  logged in) shows that, not "No open merge requests".
 - With both forges each is cut at its own limit, so "newest 130 of 194" means
   the newest of each. Projects beyond the 100 most active are neither shown
   nor counted.

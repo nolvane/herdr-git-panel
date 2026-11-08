@@ -100,9 +100,14 @@ pub struct MemberPick {
 
 /// The ids of the newest `limit` open pull requests in the first step's
 /// answer, and how many are open in all.
+/// GitHub answers with errors next to the data the token may see, for
+/// example for an organization whose single sign-on the gh login is not
+/// authorized for; those repositories are then simply left out.
 pub fn pick_members(value: &Value, limit: usize) -> Result<MemberPick, String> {
-    if let Some(msg) = cli::graphql_errors(value) {
-        return Err(format!("GitHub: {msg}"));
+    if value.pointer("/data/viewer/repositories/nodes").is_none() {
+        if let Some(msg) = cli::graphql_errors(value) {
+            return Err(format!("GitHub: {msg}"));
+        }
     }
     let mut total = 0;
     let mut found: Vec<(i64, String)> = Vec::new();
@@ -113,6 +118,9 @@ pub fn pick_members(value: &Value, limit: usize) -> Result<MemberPick, String> {
         .into_iter()
         .flatten()
     {
+        if r.is_null() {
+            continue;
+        }
         repos.push(str_of(&r["nameWithOwner"]));
         total += r["pullRequests"]["totalCount"].as_u64().unwrap_or(0);
         for n in r["pullRequests"]["nodes"].as_array().into_iter().flatten() {
@@ -231,8 +239,18 @@ pub fn parse_repo_all(value: &Value) -> Result<AllPart, String> {
 }
 
 /// The second step's answer, with the total from the first.
+/// A pull request that is gone or hidden since the first step comes back
+/// as an error next to the others; it is left out.
 pub fn parse_nodes(value: &Value, total: u64) -> Result<AllPart, String> {
-    let viewer = viewer_of(value)?;
+    let viewer = if value["data"]["nodes"].is_array() {
+        let viewer = str_of(&value["data"]["viewer"]["login"]);
+        if viewer.is_empty() {
+            return Err("GitHub did not return a user: run gh auth login".into());
+        }
+        viewer
+    } else {
+        viewer_of(value)?
+    };
     let nodes = value["data"]["nodes"]
         .as_array()
         .cloned()
@@ -842,6 +860,28 @@ mod tests {
         assert_eq!(pick.ids, ["PR_a", "PR_c"]);
         assert_eq!(pick.total, 41);
         assert_eq!(pick.repos, ["acme/app", "acme/docs", "acme/lib"]);
+    }
+
+    #[test]
+    fn errors_next_to_data_leave_only_those_out() {
+        // An organization behind single sign-on: its repository is null.
+        let v = json!({"data": {"viewer": {"repositories": {"nodes": [
+            {"nameWithOwner": "acme/app", "pullRequests": {"totalCount": 1, "nodes": [
+                {"id": "PR_a", "updatedAt": "2026-11-08T09:00:00Z"}]}},
+            null
+        ]}}}, "errors": [{"type": "FORBIDDEN", "message": "SAML enforcement"}]});
+        let pick = pick_members(&v, 30).unwrap();
+        assert_eq!(pick.ids, ["PR_a"]);
+        assert_eq!(pick.repos, ["acme/app"]);
+        // A pull request deleted between the two steps.
+        let v = json!({"data": {"viewer": {"login": "me"}, "nodes": [pr(3, "alex"), null]},
+                       "errors": [{"type": "NOT_FOUND", "message": "gone"}]});
+        assert_eq!(parse_nodes(&v, 2).unwrap().items.len(), 1);
+        // Without data the error is the answer.
+        let e = pick_members(&json!({"errors": [{"message": "boom"}]}), 30).unwrap_err();
+        assert!(e.contains("boom"));
+        let e = parse_nodes(&json!({"errors": [{"message": "boom"}]}), 0).unwrap_err();
+        assert!(e.contains("boom"));
     }
 
     #[test]

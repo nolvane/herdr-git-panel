@@ -121,13 +121,14 @@ pub fn pick_members(value: &Value, limit: usize) -> Result<MemberPick, String> {
     }
     times.sort_by_key(|a| std::cmp::Reverse(a.0));
     let cut = total > limit as u64 || times.len() > limit;
-    times.truncate(limit);
-    let after = match times.last() {
-        Some((oldest, _)) if cut => Some(time::iso(oldest - 1)),
-        _ => None,
-    };
+    // The update time of the oldest one picked; projects with one as new
+    // (a tie at the cut) are asked too.
+    let oldest = times
+        .get(limit.min(times.len()).saturating_sub(1))
+        .map(|t| t.0);
+    let after = oldest.filter(|_| cut).map(|t| time::iso(t - 1));
     let mut paths: Vec<String> = Vec::new();
-    for (_, path) in times {
+    for (_, path) in times.into_iter().take_while(|t| Some(t.0) >= oldest) {
         if !paths.contains(&path) {
             paths.push(path);
         }
@@ -832,6 +833,14 @@ mod tests {
         // A project with more open than its first page is cut too.
         let v = members(&[("acme/app", 150, &["2026-11-08T09:00:00Z"])]);
         assert!(pick_members(&v, 100).unwrap().after.is_some());
+        // A tie at the cut in a project not otherwise picked.
+        let v = members(&[
+            ("acme/app", 1, &["2026-11-08T09:00:00Z"]),
+            ("acme/lib", 1, &["2026-11-07T09:00:00Z"]),
+            ("acme/web", 1, &["2026-11-07T09:00:00Z"]),
+        ]);
+        let pick = pick_members(&v, 2).unwrap();
+        assert_eq!(pick.paths, ["acme/app", "acme/lib", "acme/web"]);
         let empty = pick_members(&members(&[]), 100).unwrap();
         assert!(empty.paths.is_empty());
     }

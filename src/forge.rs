@@ -106,9 +106,11 @@ fn combine(
     };
     let mut all_errors = Vec::new();
     let mut covered: Vec<String> = Vec::new();
+    let mut answered_all = false;
     for (i, result) in all.into_iter().enumerate() {
         match result {
             Ok(Some(part)) => {
+                answered_all = true;
                 list.items.extend(part.items);
                 list.total += part.total;
                 covered.extend(part.projects);
@@ -123,7 +125,17 @@ fn combine(
             }
         }
     }
+    // A project nobody could be asked about is not "no open merge
+    // requests": say why.
+    if let (Some(p), false, true) = (all_of, answered_all, all_errors.is_empty()) {
+        let tool = if p.host == github::HOST { "gh" } else { "glab" };
+        all_errors.push(format!(
+            "{tool} is not installed or not logged in to {}",
+            p.host
+        ));
+    }
     list.error = (!all_errors.is_empty()).then(|| all_errors.join(" · "));
+    list.newest = list.items.len();
     // Your own and the ones you review in those projects are in "All" too,
     // also when they are older than what one request loads.
     for mr in data.mine.iter().chain(&data.review) {
@@ -287,6 +299,26 @@ mod tests {
         let iids: Vec<u64> = all.items.iter().map(|m| m.iid).collect();
         assert_eq!(iids, [3, 2, 1], "each once, none of another project");
         assert_eq!(all.total, 140);
+        assert_eq!(all.newest, 2, "the forge's newest, without mine");
+    }
+
+    #[test]
+    fn a_project_nobody_was_asked_about_says_why() {
+        // gh only, in a GitLab project.
+        let fetched = combine(
+            Some(&project("gitlab.com")),
+            [Ok(None), Ok(Some(lists()))],
+            [Ok(None), Ok(None)],
+        )
+        .unwrap();
+        let all = fetched.data.all.unwrap();
+        assert_eq!(
+            all.error.as_deref(),
+            Some("glab is not installed or not logged in to gitlab.com")
+        );
+        // Your projects: a forge without its tool is simply left out.
+        let fetched = combine(None, [Ok(None), Ok(Some(lists()))], [Ok(None), Ok(None)]).unwrap();
+        assert_eq!(fetched.data.all.unwrap().error, None);
     }
 
     #[test]

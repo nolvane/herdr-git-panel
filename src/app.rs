@@ -1397,6 +1397,7 @@ mod tests {
                 of: None,
                 items: all_rows(),
                 total: 4,
+                newest: 4,
                 error: None,
             }),
         });
@@ -1605,6 +1606,7 @@ mod tests {
             of: app.project.clone(),
             items: vec![sample_mr(9)],
             total: 1,
+            newest: 1,
             error: None,
         });
         app.tx
@@ -1619,6 +1621,29 @@ mod tests {
             "no second refresh: it fits the scope"
         );
         assert_eq!(iids(&app.rows(Section::All)), [9]);
+    }
+
+    #[test]
+    fn an_answer_for_the_old_scope_loads_again_at_once() {
+        let mut app = app_in_clone(std::path::Path::new("/nowhere"));
+        app.scope = Scope::All;
+        // A refresh for "your projects" runs when `a` switches to this project.
+        app.loading = true;
+        press(&mut app, KeyCode::Char('a'));
+        let data = app.data.clone().unwrap();
+        assert_eq!(data.all.as_ref().unwrap().of, None);
+        app.tx
+            .send(Ok(Fetched {
+                data,
+                warning: None,
+            }))
+            .unwrap();
+        app.receive();
+        assert!(!app.loading);
+        assert!(
+            app.next_refresh <= Instant::now(),
+            "the list for this project loads at once"
+        );
     }
 
     #[test]
