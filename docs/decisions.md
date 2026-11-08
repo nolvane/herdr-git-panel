@@ -275,3 +275,11 @@ did: `glab mr approve --sha`, and on GitHub the REST call
 `commit_id`, because `gh pr review` cannot name a commit. A push after the
 list loaded then makes GitLab refuse the approval, and on GitHub the review
 belongs to the commit that was on screen.
+
+## 2026-11-08: Review and CI dots start at the left edge
+
+The "Review" and "CI" dots and their headings were centred, which put the
+review dot two cells into its six-cell column, out of line with every other
+column. They now start at the left edge like the other values and headings.
+Rendering tests check that each dot sits under the first letter of its
+heading, so the centring does not come back.

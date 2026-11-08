@@ -6,6 +6,11 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- The "Review" and "CI" dots and their headings start at the left edge of
+  their column, like every other column, instead of sitting centred.
+
 ## [1.0.0] - 2026-11-08
 
 ### Added
