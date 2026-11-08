@@ -4,7 +4,7 @@ id = "git-panel"
 name = "Git Panel"
 version = "1.0.0"
 min_herdr_version = "0.9.0"
-description = "Lists the GitLab merge requests and GitHub pull requests to review and your own, with threads, approvals, pipeline and labels"
+description = "Lists the GitLab merge requests and GitHub pull requests to review, your own and all of a project, with threads, approvals, pipeline and labels"
 platforms = ["linux", "macos"]
 
 # Builds the binary into the plugin root (needs cargo).

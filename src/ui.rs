@@ -20,9 +20,9 @@ enum Col {
     State,
     Id,
     Title,
-    /// Author (to review) or reviewers (mine).
+    /// Author (to review, all) or reviewers (mine).
     People,
-    /// Your own review (to review).
+    /// Your own review (to review, and all where you review).
     You,
     Pipeline,
     Approvals,
@@ -327,7 +327,7 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
             "Move",
             &[
                 ("↑ ↓  j k", "move through the list"),
-                ("Tab  1 2", "mine / to review"),
+                ("Tab  1 2 3", "mine / to review / all"),
                 ("g G", "first / last"),
                 ("a", "this project / all projects"),
             ],
@@ -433,7 +433,12 @@ fn draw_header(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
     let mut x = line.x + Line::from(spans.clone()).width() as u16;
     for section in Section::ORDER {
         let name = section.name();
-        let count = app.rows(section).len();
+        let count = if section == Section::All && app.all_list().is_none() {
+            // Still loading for this scope.
+            "…".to_string()
+        } else {
+            app.rows(section).len().to_string()
+        };
         let active = app.section == section;
         let label = format!(" {name} {count} ");
         let style = if active {
@@ -517,7 +522,7 @@ fn columns(app: &App, width: u16, rows: &[&MergeRequest], icons: &Icons) -> Vec<
         cols.push(Col::Id);
     }
     cols.extend([Col::Title, Col::People]);
-    if app.section == Section::Review {
+    if matches!(app.section, Section::Review | Section::All) {
         cols.push(Col::You);
     }
     cols.extend([
@@ -605,7 +610,7 @@ fn heading(c: Col, app: &App, _icons: &Icons) -> String {
         Col::State | Col::Id => String::new(),
         Col::Title => "Merge request".into(),
         Col::People => match app.section {
-            Section::Review => "Author".into(),
+            Section::Review | Section::All => "Author".into(),
             Section::Mine => "Reviewers".into(),
         },
         Col::You => "Review".into(),
@@ -687,7 +692,7 @@ fn cell_line<'a>(c: Col, mr: &'a MergeRequest, app: &App, icons: &Icons) -> Line
             Style::new().fg(TEXT).add_modifier(Modifier::BOLD),
         )),
         Col::People => match app.section {
-            Section::Review => Line::from(Span::styled(
+            Section::Review | Section::All => Line::from(Span::styled(
                 format!("@{}", mr.author),
                 Style::new().fg(MUTED),
             )),
@@ -710,6 +715,11 @@ fn cell_line<'a>(c: Col, mr: &'a MergeRequest, app: &App, icons: &Icons) -> Line
         // Review and pipeline as a coloured dot only, so the title keeps
         // the room; the details panel says it in words.
         Col::You => {
+            // In "All" only where you review: a grey dot would claim a
+            // review nobody asked of you.
+            if app.section == Section::All && !app.reviews(mr) {
+                return Line::from("");
+            }
             let color = match mr.review_of(me) {
                 Some(ReviewState::Approved) => GREEN,
                 Some(ReviewState::ChangesRequested) => RED,
@@ -784,28 +794,39 @@ fn draw_table(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
 
     let rows_data = app.rows(app.section);
     let mixed = app.mixed_forges();
+    let all_failed = match app.all_list() {
+        Some(all) if app.section == Section::All && all.items.is_empty() => all.error.clone(),
+        _ => None,
+    };
+    // "All" of a scope loads after `a` while the other sections switch at once.
+    let all_loading = app.section == Section::All && app.all_list().is_none();
     if rows_data.is_empty() {
-        let (text, color) = if app.data.is_none() {
+        let (text, color) = if app.data.is_none() || all_loading {
             match &app.error {
-                Some(e) => (e.clone(), RED),
-                None => (
+                Some(e) if app.data.is_none() => (e.clone(), RED),
+                _ => (
                     format!("Loading {}…", app.plural_noun().to_lowercase()),
                     MUTED,
                 ),
             }
+        } else if let Some(e) = all_failed {
+            (e, RED)
         } else {
-            let place = match app.scoped_project() {
-                Some(p) => format!(" in {}", p.name()),
-                None => String::new(),
+            let place = match (app.scoped_project(), app.section) {
+                (Some(p), _) => format!(" in {}", p.name()),
+                (None, Section::All) => " in your projects".to_string(),
+                (None, _) => String::new(),
             };
             let hint = if app.scoped_project().is_some() {
                 "  (a shows all projects)"
             } else {
                 ""
             };
+            let noun = app.plural_noun().to_lowercase();
             let what = match app.section {
                 Section::Review => "Nothing to review",
-                Section::Mine => &format!("No open {} of yours", app.plural_noun().to_lowercase()),
+                Section::Mine => &format!("No open {noun} of yours"),
+                Section::All => &format!("No open {noun}"),
             };
             (format!("{what}{place}{hint}"), MUTED)
         };
@@ -852,10 +873,7 @@ fn draw_table(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
         .collect();
     // The selected row gets its colour as the row style, under the cells, so
     // labels keep their own colour across the whole pill.
-    let selected = match app.section {
-        Section::Review => app.review_state.selected(),
-        Section::Mine => app.mine_state.selected(),
-    };
+    let selected = app.table_state(app.section).selected();
     // Rows follow each other directly; the dim first line of each
     // merge request marks where it starts.
     let gap: u16 = 0;
@@ -895,10 +913,7 @@ fn draw_table(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
         .highlight_spacing(HighlightSpacing::Never);
     // Rows borrow the app, so render with a copy of the state and keep the
     // scroll offset it settles on.
-    let mut state = match app.section {
-        Section::Review => app.review_state,
-        Section::Mine => app.mine_state,
-    };
+    let mut state = *app.table_state(app.section);
     frame.render_stateful_widget(table, inner, &mut state);
     *app.state_mut() = state;
 
@@ -1643,17 +1658,34 @@ fn draw_footer(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
         .as_ref()
         .map(|k| k.iter().map(|s| s.width() as u16).sum())
         .unwrap_or(0);
+    // "All" cut at what one request per forge loads: say so, in front.
+    let cut = app
+        .all_list()
+        .filter(|all| app.section == Section::All && all.total > all.items.len() as u64)
+        .map(|all| {
+            Span::styled(
+                format!("newest {} of {}  ", all.items.len(), all.total),
+                Style::new().fg(MUTED),
+            )
+        });
+    let cut_width = cut.as_ref().map(|c| c.width() as u16).unwrap_or(0);
     // The status on the right wins; the key hints take what is left.
-    let right_width = (right.width() as u16 + key_width).min(area.width);
+    let right_width = (right.width() as u16 + key_width + cut_width).min(area.width);
     let [left_area, right_area] =
         Layout::horizontal([Constraint::Fill(1), Constraint::Length(right_width)]).areas(area);
     if key_width > 0 {
         app.hits.push((
-            Rect::new(right_area.x, area.y, key_width.saturating_sub(2), 1),
+            Rect::new(
+                right_area.x + cut_width,
+                area.y,
+                key_width.saturating_sub(2),
+                1,
+            ),
             Hit::Key('r'),
         ));
     }
-    let mut right_spans = refresh_key.unwrap_or_default();
+    let mut right_spans: Vec<Span> = cut.into_iter().collect();
+    right_spans.extend(refresh_key.unwrap_or_default());
     right_spans.push(right);
     let right = Line::from(right_spans);
     // Key hints; the ones with a letter can be clicked.
@@ -1744,7 +1776,8 @@ mod tests {
     }
 
     use crate::config::Config;
-    use crate::model::{Data, Forge, Reviewer};
+    use crate::model::{AllList, Data, Forge, Reviewer};
+    use crate::repo::Project;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
     use ratatui::style::Color;
@@ -1840,7 +1873,11 @@ mod tests {
             ..Config::default()
         };
         let mut app = App::new(config, None, None);
-        app.data = Some(Data { review, mine });
+        app.data = Some(Data {
+            review,
+            mine,
+            all: None,
+        });
         // Not from the shell the tests run in.
         app.herdr = false;
         app
@@ -2020,15 +2057,130 @@ mod tests {
     }
 
     #[test]
-    fn help_names_mine_first() {
+    fn help_names_the_three_sections() {
         let mut app = app_with(vec![], vec![], false);
         app.help = true;
         let buf = render(&mut app, 120);
         let found = (0..buf.area.height).any(|y| {
             let text = row_text(&buf, y);
-            text.contains("Tab  1 2") && text.contains("mine / to review")
+            text.contains("Tab  1 2 3") && text.contains("mine / to review / all")
         });
-        assert!(found, "help line for Tab 1 2");
+        assert!(found, "help line for Tab 1 2 3");
+    }
+
+    /// The list with "All" loaded for `of`, shown on the "All" tab.
+    fn app_with_all(items: Vec<MergeRequest>, total: u64, of: Option<Project>) -> App {
+        let mut app = app_with(sample_rows()[..2].to_vec(), sample_rows(), false);
+        app.project = of.clone();
+        app.data.as_mut().unwrap().all = Some(AllList {
+            of,
+            items,
+            total,
+            error: None,
+        });
+        app.section = Section::All;
+        app
+    }
+
+    fn acme_app() -> Project {
+        Project {
+            host: "gitlab.com".into(),
+            path: "acme/app".into(),
+        }
+    }
+
+    fn shown(app: &mut App, text: &str) -> bool {
+        screen(app, 120, 20).iter().any(|r| r.contains(text))
+    }
+
+    #[test]
+    fn tabs_show_all_third_with_its_count() {
+        let mut app = app_with_all(sample_rows()[..4].to_vec(), 4, None);
+        let buf = render(&mut app, 120);
+        let (y, mine, review) = tabs(&buf);
+        let all = word_x(&buf, y, "All").expect("All tab");
+        assert!(mine < review && review < all, "{mine} {review} {all}");
+        let text = row_text(&buf, y);
+        assert!(text.contains(" All 4 "), "{text}");
+        assert_eq!(buf[(all, y)].bg, SELECTED_BG, "All is the active tab");
+        let h = headings(&buf);
+        assert!(word_x(&buf, h.y, "Author").is_some());
+        assert!(row_text(&buf, h.y + 1).contains("@alex"));
+    }
+
+    #[test]
+    fn all_shows_the_review_dot_only_where_i_review() {
+        let mut mine = sample_mr(9, ReviewState::Unreviewed, Pipeline::None);
+        mine.author = "me".into();
+        mine.reviewers.clear();
+        let mut other = sample_mr(8, ReviewState::Unreviewed, Pipeline::None);
+        other.author = "sam".into();
+        other.reviewers.clear();
+        let approved = sample_mr(7, ReviewState::Approved, Pipeline::None);
+        let asked = sample_mr(6, ReviewState::Unreviewed, Pipeline::None);
+        // A team request: only in "To review", not among the reviewers.
+        let mut team = sample_mr(5, ReviewState::Unreviewed, Pipeline::None);
+        team.reviewers.clear();
+        let mut app = app_with_all(vec![mine, other, approved, asked, team.clone()], 5, None);
+        app.data.as_mut().unwrap().review = vec![team];
+        for compact in [false, true] {
+            app.config.compact = compact;
+            let buf = render(&mut app, 160);
+            let h = headings(&buf);
+            let x = h.review.expect("Review heading");
+            let step = if compact { 1 } else { 2 };
+            let at = |n: u16| cell_at(&buf, x, h.y + 1 + n * step);
+            assert_eq!(at(0).0, " ", "my own: no dot");
+            assert_eq!(at(1).0, " ", "someone else's: no dot");
+            assert_eq!(at(2), ("●".to_string(), GREEN));
+            assert_eq!(at(3), ("●".to_string(), FAINT));
+            assert_eq!(at(4), ("●".to_string(), FAINT), "team request");
+        }
+    }
+
+    #[test]
+    fn empty_all_names_the_project() {
+        let mut app = app_with_all(vec![], 0, Some(acme_app()));
+        assert!(shown(&mut app, "No open merge requests in app"));
+        let mut app = app_with_all(vec![], 0, None);
+        assert!(shown(&mut app, "No open merge requests in your projects"));
+    }
+
+    #[test]
+    fn all_shows_why_it_failed_while_mine_still_lists() {
+        let mut app = app_with_all(vec![], 0, None);
+        app.data.as_mut().unwrap().all.as_mut().unwrap().error = Some("GitLab: boom".into());
+        app.error = Some("All: GitLab: boom".into());
+        assert!(shown(&mut app, "GitLab: boom"));
+        app.section = Section::Mine;
+        assert!(shown(&mut app, "Add export"));
+    }
+
+    #[test]
+    fn all_loads_like_the_other_sections() {
+        // Before the first answer.
+        let mut app = app_with(vec![], vec![], false);
+        app.data = None;
+        app.section = Section::All;
+        assert!(shown(&mut app, "Loading merge requests…"));
+        // Loaded for "your projects" while "this project" is shown.
+        let mut app = app_with_all(sample_rows(), 6, None);
+        app.project = Some(acme_app());
+        let rows = screen(&mut app, 120, 20);
+        assert!(rows.iter().any(|r| r.contains("Loading merge requests…")));
+        assert!(rows.iter().any(|r| r.contains(" All … ")), "{rows:#?}");
+        app.section = Section::Mine;
+        assert!(shown(&mut app, "Add export"), "Mine switches at once");
+    }
+
+    #[test]
+    fn all_says_when_it_is_cut() {
+        let mut app = app_with_all(sample_rows(), 54, None);
+        assert!(shown(&mut app, "newest 6 of 54"));
+        app.section = Section::Mine;
+        assert!(!shown(&mut app, "newest 6 of 54"), "only on All");
+        let mut app = app_with_all(sample_rows(), 6, None);
+        assert!(!shown(&mut app, "newest"), "nothing cut");
     }
 
     /// Every row of a frame of this size, as text.

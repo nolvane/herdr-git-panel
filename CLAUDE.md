@@ -1,7 +1,7 @@
 # Herdr Git Panel
 
 A [Herdr](https://herdr.dev) plugin that lists the GitLab merge requests and
-GitHub pull requests to review and your own. What it does and how users
+GitHub pull requests to review, your own and all of a project. What it does and how users
 install it: [README.md](README.md). Why it is built this way:
 [docs/decisions.md](docs/decisions.md).
 
