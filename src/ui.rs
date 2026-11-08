@@ -442,8 +442,11 @@ fn draw_header(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
     let labels: Vec<(Section, String)> = Section::ORDER
         .iter()
         .map(|&section| {
-            let count = if app.loading_section(section) {
-                // Still loading for this scope.
+            // Still loading for this scope ("All", merged and closed ones;
+            // open ones count from 0 as before).
+            let loading = app.loading_section(section)
+                && (section == Section::All || app.status != Status::Open);
+            let count = if loading {
                 "…".to_string()
             } else {
                 app.rows(section).len().to_string()

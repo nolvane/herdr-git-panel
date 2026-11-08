@@ -114,10 +114,10 @@ a narrow pane). Every section follows it, each row says "Merged" or
 - `/` searches as you type: every word must appear in the number, title,
   project, author, branch or a label. `Enter` keeps the search, `Esc` clears
   it.
-- `f` (open ones only) steps through what is shown: all, needs me (to review: not approved or
-  answered by you yet; mine: open threads, failed pipeline, conflict or
-  rebase; all: your own and the ones you review by those rules, nobody
-  else's), open threads, pipeline failed, ready to merge.
+- `f` (open ones only) steps through what is shown: all, needs me (to
+  review: not approved or answered by you yet; mine: open threads, failed
+  pipeline, conflict or rebase; all: your own and the ones you review by
+  those rules, nobody else's), open threads, pipeline failed, ready to merge.
 - `s` steps through sort orders (updated, opened, open threads, size, project,
   title). Clicking a column heading sorts by it; a second click turns the
   order round.
@@ -176,9 +176,10 @@ action.
 ## Mouse
 
 Click a row to select it, double-click to open it in the browser. Click a tab,
-the title (open / merged / closed), the project name (this project / all), a column heading (sort), a part of the
-second header line or a key hint in the footer. The wheel moves through the list, or
-scrolls the details panel when the pointer is over it.
+the title (open / merged / closed), the project name (this project / all), a
+column heading (sort), a part of the second header line or a key hint in the
+footer. The wheel moves through the list, or scrolls the details panel when
+the pointer is over it.
 
 ## Keys
 
