@@ -714,17 +714,17 @@ fn cell_line<'a>(c: Col, mr: &'a MergeRequest, app: &App, icons: &Icons) -> Line
                 Some(ReviewState::Reviewed) | Some(ReviewState::Started) => YELLOW,
                 _ => FAINT,
             };
-            Line::from(Span::styled("●", Style::new().fg(color))).alignment(Alignment::Center)
+            Line::from(Span::styled("●", Style::new().fg(color)))
         }
         Col::Pipeline => {
             let color = match mr.pipeline {
-                Pipeline::None => return dim("–").alignment(Alignment::Center),
+                Pipeline::None => return dim("–"),
                 Pipeline::Success => GREEN,
                 Pipeline::Failed => RED,
                 Pipeline::Running => YELLOW,
                 Pipeline::Canceled | Pipeline::Manual => FAINT,
             };
-            Line::from(Span::styled("●", Style::new().fg(color))).alignment(Alignment::Center)
+            Line::from(Span::styled("●", Style::new().fg(color)))
         }
         Col::Approvals => {
             // Given of needed (0/2) when the forge says how many are needed.
@@ -825,15 +825,7 @@ fn draw_table(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
     let widths: Vec<Constraint> = sized.iter().map(|(_, w)| *w).collect();
     let header = Row::new(
         cols.iter()
-            .map(|c| {
-                let line = Line::from(heading(*c, app, icons));
-                // The dot columns are centred under their heading.
-                Cell::from(if matches!(c, Col::You | Col::Pipeline) {
-                    line.alignment(Alignment::Center)
-                } else {
-                    line
-                })
-            })
+            .map(|c| Cell::from(heading(*c, app, icons)))
             .collect::<Vec<_>>(),
     )
     // The headings on a bar of their own, like the header of a table in an
@@ -1743,5 +1735,221 @@ mod tests {
         assert_eq!(clean_title("Add export"), "Add export");
         assert_eq!(cut("abcdef", 4), "abc…");
         assert_eq!(cut("abc", 4), "abc");
+    }
+
+    use crate::config::Config;
+    use crate::model::{Data, Forge, Reviewer};
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+    use ratatui::style::Color;
+    use ratatui::Terminal;
+
+    /// A made-up merge request; `me` gave the review `review`.
+    fn sample_mr(iid: u64, review: ReviewState, pipeline: Pipeline) -> MergeRequest {
+        MergeRequest {
+            forge: Forge::GitLab,
+            host: "gitlab.com".into(),
+            viewer: "me".into(),
+            iid,
+            title: "Add export".into(),
+            description: String::new(),
+            url: String::new(),
+            project: "acme/app".into(),
+            author: "alex".into(),
+            source_branch: "add-export".into(),
+            head_sha: "abc123".into(),
+            target_branch: "main".into(),
+            created: Some(0),
+            updated: Some(iid as i64),
+            merge_state: MergeState::Blocked,
+            approvals_given: 0,
+            approvals_required: None,
+            approved_by: vec![],
+            approved: false,
+            pending_rules: vec![],
+            reviewers: vec![Reviewer {
+                username: "me".into(),
+                state: review,
+            }],
+            threads_total: 0,
+            threads_open: 0,
+            labels: vec![],
+            pipeline,
+            additions: Some(3),
+            deletions: Some(1),
+            merge_method: String::new(),
+        }
+    }
+
+    /// Draws the whole list into a test terminal.
+    fn render(app: &mut App, width: u16) -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(width, 20)).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    /// Where `word` starts in row `y`, as a whole word.
+    fn word_x(buf: &Buffer, y: u16, word: &str) -> Option<u16> {
+        let cells: Vec<&str> = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
+        let letters: Vec<String> = word.chars().map(String::from).collect();
+        (0..=cells.len().checked_sub(letters.len())?).find_map(|x| {
+            let fits = letters.iter().zip(&cells[x..]).all(|(l, c)| l == c);
+            // A whole word: blank (or the edge) before and after.
+            let before = x == 0 || cells[x - 1] == " ";
+            let after = cells.get(x + letters.len()).is_none_or(|c| *c == " ");
+            (fits && before && after).then_some(x as u16)
+        })
+    }
+
+    /// The heading bar: the row on the bar colour that says "Updated" (a
+    /// column narrow panes keep), and where "Review" and "CI" start in it.
+    struct Headings {
+        y: u16,
+        review: Option<u16>,
+        ci: Option<u16>,
+    }
+
+    fn headings(buf: &Buffer) -> Headings {
+        let y = (0..buf.area.height)
+            .find(|&y| word_x(buf, y, "Updated").is_some_and(|x| buf[(x, y)].bg == BAR_BG))
+            .expect("heading bar");
+        Headings {
+            y,
+            review: word_x(buf, y, "Review"),
+            ci: word_x(buf, y, "CI"),
+        }
+    }
+
+    /// The symbol and colour at column `x` of terminal row `y`.
+    fn cell_at(buf: &Buffer, x: u16, y: u16) -> (String, Color) {
+        let cell = &buf[(x, y)];
+        (cell.symbol().to_string(), cell.fg)
+    }
+
+    fn app_with(review: Vec<MergeRequest>, mine: Vec<MergeRequest>, compact: bool) -> App {
+        let config = Config {
+            compact,
+            icons_chosen: true,
+            ..Config::default()
+        };
+        let mut app = App::new(config, None, None);
+        app.data = Some(Data { review, mine });
+        app
+    }
+
+    /// A made-up merge request per review and pipeline state, newest first
+    /// (the list's order), with the review dot and the CI cell it shows.
+    fn samples() -> Vec<(MergeRequest, Color, (&'static str, Color))> {
+        vec![
+            (
+                sample_mr(6, ReviewState::Reviewed, Pipeline::Canceled),
+                YELLOW,
+                ("●", FAINT),
+            ),
+            (
+                sample_mr(5, ReviewState::Unreviewed, Pipeline::Manual),
+                FAINT,
+                ("●", FAINT),
+            ),
+            (
+                sample_mr(4, ReviewState::Approved, Pipeline::Success),
+                GREEN,
+                ("●", GREEN),
+            ),
+            (
+                sample_mr(3, ReviewState::ChangesRequested, Pipeline::Failed),
+                RED,
+                ("●", RED),
+            ),
+            (
+                sample_mr(2, ReviewState::Started, Pipeline::Running),
+                YELLOW,
+                ("●", YELLOW),
+            ),
+            (
+                sample_mr(1, ReviewState::Unreviewed, Pipeline::None),
+                FAINT,
+                ("–", FAINT),
+            ),
+        ]
+    }
+
+    fn sample_rows() -> Vec<MergeRequest> {
+        samples().into_iter().map(|(mr, _, _)| mr).collect()
+    }
+
+    /// Checks every row of the shown section at one width: the review dot
+    /// (to review only) and the CI dot or dash sit under the first letter
+    /// of their heading, in the expected colour.
+    fn assert_dots_aligned(app: &mut App, width: u16, ci_shown: bool) {
+        let buf = render(app, width);
+        let h = headings(&buf);
+        let step = if app.config.compact { 1 } else { 2 };
+        let expected = samples();
+        let shown: Vec<u64> = app.rows(app.section).iter().map(|mr| mr.iid).collect();
+        let order: Vec<u64> = expected.iter().map(|(mr, _, _)| mr.iid).collect();
+        assert_eq!(shown, order);
+        if !ci_shown {
+            assert_eq!(h.ci, None, "CI dropped at width {width}");
+        }
+        for (n, (_, review, ci)) in expected.into_iter().enumerate() {
+            let y = h.y + 1 + n as u16 * step;
+            if app.section == Section::Review {
+                let x = h.review.expect("Review heading");
+                assert_eq!(
+                    cell_at(&buf, x, y),
+                    ("●".to_string(), review),
+                    "review dot of row {n} at width {width}"
+                );
+            }
+            if ci_shown {
+                let x = h.ci.expect("CI heading");
+                assert_eq!(
+                    cell_at(&buf, x, y),
+                    (ci.0.to_string(), ci.1),
+                    "CI of row {n} at width {width}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dots_start_under_their_heading_to_review() {
+        for compact in [false, true] {
+            let mut app = app_with(sample_rows(), vec![], compact);
+            // Wide (3 cells between columns) and narrow (1 cell).
+            assert_dots_aligned(&mut app, 160, true);
+            assert_dots_aligned(&mut app, 79, true);
+        }
+    }
+
+    #[test]
+    fn dots_start_under_their_heading_mine() {
+        for compact in [false, true] {
+            let mut app = app_with(vec![], sample_rows(), compact);
+            app.section = Section::Mine;
+            assert_dots_aligned(&mut app, 160, true);
+            assert_dots_aligned(&mut app, 79, true);
+        }
+    }
+
+    #[test]
+    fn review_dot_stays_under_its_heading_when_ci_is_dropped() {
+        for compact in [false, true] {
+            let mut app = app_with(sample_rows(), vec![], compact);
+            assert_dots_aligned(&mut app, 50, false);
+        }
+    }
+
+    #[test]
+    fn selected_row_keeps_its_dot_in_place() {
+        for compact in [false, true] {
+            let mut app = app_with(sample_rows(), vec![], compact);
+            app.review_state.select(Some(0));
+            assert_dots_aligned(&mut app, 160, true);
+            let buf = render(&mut app, 160);
+            let h = headings(&buf);
+            assert_eq!(buf[(h.review.unwrap(), h.y + 1)].bg, SELECTED_BG);
+        }
     }
 }
