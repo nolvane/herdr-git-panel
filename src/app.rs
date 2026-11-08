@@ -24,6 +24,26 @@ pub enum Section {
     Mine,
 }
 
+impl Section {
+    /// The sections in the order of their tabs; the list opens on the first,
+    /// and the number keys pick them by position (`1` is the first).
+    pub const ORDER: [Section; 2] = [Section::Mine, Section::Review];
+
+    /// The name on its tab.
+    pub fn name(self) -> &'static str {
+        match self {
+            Section::Mine => "Mine",
+            Section::Review => "To review",
+        }
+    }
+
+    /// The section a number key picks, by its position in [`Section::ORDER`].
+    pub fn numbered(key: char) -> Option<Section> {
+        let index = key.to_digit(10)?.checked_sub(1)?;
+        Section::ORDER.get(index as usize).copied()
+    }
+}
+
 /// Something on screen a mouse click or the wheel acts on, recorded while
 /// drawing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -262,7 +282,7 @@ impl App {
             config,
             project,
             scope,
-            section: Section::Review,
+            section: Section::ORDER[0],
             review_state: TableState::default(),
             mine_state: TableState::default(),
             data: None,
@@ -839,7 +859,7 @@ impl App {
 
     /// Keeps each section's selection inside its list.
     fn clamp_selection(&mut self) {
-        for section in [Section::Review, Section::Mine] {
+        for section in Section::ORDER {
             let len = self.rows(section).len();
             let state = match section {
                 Section::Review => &mut self.review_state,
@@ -1108,8 +1128,11 @@ impl App {
             | KeyCode::Right
             | KeyCode::Char('h')
             | KeyCode::Char('l') => self.switch_section(),
-            KeyCode::Char('1') => self.section = Section::Review,
-            KeyCode::Char('2') => self.section = Section::Mine,
+            KeyCode::Char(c) if c.is_ascii_digit() => {
+                if let Some(section) = Section::numbered(c) {
+                    self.section = section;
+                }
+            }
             KeyCode::Enter | KeyCode::Char('o') => self.open_selected(),
             KeyCode::Char('y') => self.copy_selected(),
             KeyCode::Char('r') => {
@@ -1153,5 +1176,154 @@ impl App {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Pipeline, ReviewState};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    /// A made-up merge request.
+    fn sample_mr(iid: u64) -> MergeRequest {
+        MergeRequest {
+            forge: Forge::GitLab,
+            host: "gitlab.com".into(),
+            viewer: "me".into(),
+            iid,
+            title: format!("Change {iid}"),
+            description: String::new(),
+            url: String::new(),
+            project: "acme/app".into(),
+            author: "alex".into(),
+            source_branch: format!("change-{iid}"),
+            head_sha: "abc123".into(),
+            target_branch: "main".into(),
+            created: Some(0),
+            updated: Some(iid as i64),
+            merge_state: MergeState::Blocked,
+            approvals_given: 0,
+            approvals_required: None,
+            approved_by: vec![],
+            approved: false,
+            pending_rules: vec![],
+            reviewers: vec![crate::model::Reviewer {
+                username: "me".into(),
+                state: ReviewState::Unreviewed,
+            }],
+            threads_total: 0,
+            threads_open: 0,
+            labels: vec![],
+            pipeline: Pipeline::None,
+            additions: Some(1),
+            deletions: Some(1),
+            merge_method: String::new(),
+        }
+    }
+
+    /// An open list with three merge requests in each section.
+    fn app() -> App {
+        let config = Config {
+            icons_chosen: true,
+            ..Config::default()
+        };
+        let mut app = App::new(config, None, None);
+        app.data = Some(Data {
+            review: (1..=3).map(sample_mr).collect(),
+            mine: (4..=6).map(sample_mr).collect(),
+        });
+        app.clamp_selection();
+        app
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        app.key(code, KeyModifiers::NONE);
+    }
+
+    fn click(app: &mut App, x: u16, y: u16) {
+        app.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        });
+    }
+
+    #[test]
+    fn number_keys_follow_the_tab_order() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('2'));
+        assert_eq!(app.section, Section::Review);
+        press(&mut app, KeyCode::Char('1'));
+        assert_eq!(app.section, Section::Mine);
+        press(&mut app, KeyCode::Char('2'));
+        assert_eq!(app.section, Section::Review);
+        // Other digits change nothing.
+        press(&mut app, KeyCode::Char('3'));
+        assert_eq!(app.section, Section::Review);
+    }
+
+    #[test]
+    fn switch_keys_toggle_between_the_sections() {
+        let keys = [
+            KeyCode::Tab,
+            KeyCode::BackTab,
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Char('h'),
+            KeyCode::Char('l'),
+        ];
+        for key in keys {
+            let mut app = app();
+            assert_eq!(app.section, Section::Mine);
+            press(&mut app, key);
+            assert_eq!(app.section, Section::Review, "{key:?}");
+            press(&mut app, key);
+            assert_eq!(app.section, Section::Mine, "{key:?}");
+        }
+    }
+
+    #[test]
+    fn clicking_a_tab_selects_its_section() {
+        let mut app = app();
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        // Where a label starts in the row of the tabs.
+        let find = |label: &str| {
+            (0..buf.area.height)
+                .find_map(|y| {
+                    let text: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
+                    let byte = text.find(label)?;
+                    Some((text[..byte].chars().count() as u16 + 1, y))
+                })
+                .expect(label)
+        };
+        let (mine_x, mine_y) = find(" Mine 3 ");
+        let (review_x, review_y) = find(" To review 3 ");
+        assert!(mine_x < review_x);
+        click(&mut app, review_x, review_y);
+        assert_eq!(app.section, Section::Review);
+        click(&mut app, mine_x, mine_y);
+        assert_eq!(app.section, Section::Mine);
+    }
+
+    #[test]
+    fn each_section_keeps_its_selection() {
+        let mut app = app();
+        assert_eq!(app.section, Section::Mine);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.mine_state.selected(), Some(2));
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.section, Section::Review);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.review_state.selected(), Some(1));
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.mine_state.selected(), Some(2));
+        press(&mut app, KeyCode::Char('2'));
+        assert_eq!(app.review_state.selected(), Some(1));
     }
 }

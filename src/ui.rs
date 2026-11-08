@@ -327,7 +327,7 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
             "Move",
             &[
                 ("↑ ↓  j k", "move through the list"),
-                ("Tab  1 2", "to review / mine"),
+                ("Tab  1 2", "mine / to review"),
                 ("g G", "first / last"),
                 ("a", "this project / all projects"),
             ],
@@ -430,7 +430,8 @@ fn draw_header(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
         Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
     )];
     let mut x = line.x + Line::from(spans.clone()).width() as u16;
-    for (section, name) in [(Section::Review, "To review"), (Section::Mine, "Mine")] {
+    for section in Section::ORDER {
+        let name = section.name();
         let count = app.rows(section).len();
         let active = app.section == section;
         let label = format!(" {name} {count} ");
@@ -1917,6 +1918,7 @@ mod tests {
     fn dots_start_under_their_heading_to_review() {
         for compact in [false, true] {
             let mut app = app_with(sample_rows(), vec![], compact);
+            app.section = Section::Review;
             // Wide (3 cells between columns) and narrow (1 cell).
             assert_dots_aligned(&mut app, 160, true);
             assert_dots_aligned(&mut app, 79, true);
@@ -1937,6 +1939,7 @@ mod tests {
     fn review_dot_stays_under_its_heading_when_ci_is_dropped() {
         for compact in [false, true] {
             let mut app = app_with(sample_rows(), vec![], compact);
+            app.section = Section::Review;
             assert_dots_aligned(&mut app, 50, false);
         }
     }
@@ -1945,11 +1948,78 @@ mod tests {
     fn selected_row_keeps_its_dot_in_place() {
         for compact in [false, true] {
             let mut app = app_with(sample_rows(), vec![], compact);
+            app.section = Section::Review;
             app.review_state.select(Some(0));
             assert_dots_aligned(&mut app, 160, true);
             let buf = render(&mut app, 160);
             let h = headings(&buf);
             assert_eq!(buf[(h.review.unwrap(), h.y + 1)].bg, SELECTED_BG);
         }
+    }
+
+    /// The text of terminal row `y`.
+    fn row_text(buf: &Buffer, y: u16) -> String {
+        (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect()
+    }
+
+    /// The row with the section tabs, and where "Mine" and "To review" start.
+    fn tabs(buf: &Buffer) -> (u16, u16, u16) {
+        (0..buf.area.height)
+            .find_map(|y| {
+                let text = row_text(buf, y);
+                let mine = text.find(" Mine ")?;
+                let review = text.find(" To review ")?;
+                let col = |byte: usize| text[..byte].chars().count() as u16 + 1;
+                Some((y, col(mine), col(review)))
+            })
+            .expect("section tabs")
+    }
+
+    #[test]
+    fn tabs_show_mine_first_with_counts() {
+        let mut app = app_with(sample_rows()[..2].to_vec(), sample_rows(), false);
+        let buf = render(&mut app, 120);
+        let (y, mine, review) = tabs(&buf);
+        assert!(mine < review, "Mine at {mine}, To review at {review}");
+        let text = row_text(&buf, y);
+        assert!(text.contains(" Mine 6 "), "{text}");
+        assert!(text.contains(" To review 2 "), "{text}");
+    }
+
+    #[test]
+    fn list_opens_on_mine() {
+        let mut app = app_with(vec![], sample_rows(), false);
+        assert_eq!(app.section, Section::Mine);
+        let buf = render(&mut app, 120);
+        let (y, mine, review) = tabs(&buf);
+        assert_eq!(buf[(mine, y)].bg, SELECTED_BG, "Mine is the active tab");
+        assert_ne!(buf[(review, y)].bg, SELECTED_BG);
+        // My own rows are listed under the heading bar.
+        let h = headings(&buf);
+        assert!(row_text(&buf, h.y + 1).contains("Add export"));
+        assert!(word_x(&buf, h.y, "Reviewers").is_some());
+    }
+
+    #[test]
+    fn list_opens_on_mine_when_mine_is_empty() {
+        let mut app = app_with(sample_rows(), vec![], false);
+        let buf = render(&mut app, 120);
+        let (y, mine, _) = tabs(&buf);
+        assert_eq!(buf[(mine, y)].bg, SELECTED_BG, "Mine is the active tab");
+        let shown = (0..buf.area.height)
+            .any(|y| row_text(&buf, y).contains("No open merge requests of yours"));
+        assert!(shown, "empty message for my own list");
+    }
+
+    #[test]
+    fn help_names_mine_first() {
+        let mut app = app_with(vec![], vec![], false);
+        app.help = true;
+        let buf = render(&mut app, 120);
+        let found = (0..buf.area.height).any(|y| {
+            let text = row_text(&buf, y);
+            text.contains("Tab  1 2") && text.contains("mine / to review")
+        });
+        assert!(found, "help line for Tab 1 2");
     }
 }
