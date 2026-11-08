@@ -58,31 +58,75 @@ fn git_common_dir(start: &Path) -> Option<PathBuf> {
     None
 }
 
-fn remote_url(config: &str) -> Option<String> {
+/// Every remote in a git config, as (name, url), in the order they appear.
+fn remotes(config: &str) -> Vec<(String, String)> {
     let mut section = String::new();
-    let mut first = None;
+    let mut found = Vec::new();
     for raw in config.lines() {
         let line = raw.trim();
         if line.starts_with('[') {
             section = line.to_string();
             continue;
         }
-        if !section.starts_with("[remote ") {
+        let Some(name) = section
+            .strip_prefix("[remote \"")
+            .and_then(|s| s.strip_suffix("\"]"))
+        else {
             continue;
-        }
+        };
         let Some((key, value)) = line.split_once('=') else {
             continue;
         };
-        if key.trim() != "url" {
-            continue;
+        if key.trim() == "url" {
+            found.push((name.to_string(), value.trim().to_string()));
         }
-        let url = value.trim().to_string();
-        if section == "[remote \"origin\"]" {
-            return Some(url);
-        }
-        first.get_or_insert(url);
     }
-    first
+    found
+}
+
+fn remote_url(config: &str) -> Option<String> {
+    let all = remotes(config);
+    all.iter()
+        .find(|(name, _)| name == "origin")
+        .or_else(|| all.first())
+        .map(|(_, url)| url.clone())
+}
+
+/// A remote of the clone and the project it points at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Remote {
+    /// Its name in the clone, such as `origin` or `upstream`.
+    pub name: String,
+    pub project: Project,
+}
+
+impl Remote {
+    /// Whether it points at `host`/`path`. GitHub and GitLab ignore case in
+    /// both, so a clone made from `Acme/App` matches `acme/app`.
+    pub fn points_at(&self, host: &str, path: &str) -> bool {
+        self.project.host.eq_ignore_ascii_case(host) && self.project.path.eq_ignore_ascii_case(path)
+    }
+}
+
+/// Every remote of the repository that contains `dir` whose URL names a
+/// project.
+pub fn remotes_of(dir: &Path) -> Vec<Remote> {
+    git_common_dir(dir)
+        .and_then(|c| std::fs::read_to_string(c.join("config")).ok())
+        .map(|text| project_remotes(&text))
+        .unwrap_or_default()
+}
+
+fn project_remotes(config: &str) -> Vec<Remote> {
+    remotes(config)
+        .into_iter()
+        .filter_map(|(name, url)| {
+            Some(Remote {
+                name,
+                project: parse_remote(&url)?,
+            })
+        })
+        .collect()
 }
 
 /// Understands `git@host:group/project.git`, `ssh://git@host:22/group/project`
@@ -139,6 +183,21 @@ mod tests {
     fn origin_wins() {
         let cfg = "[core]\n\tbare = false\n[remote \"upstream\"]\n\turl = git@a.com:x/y.git\n[remote \"origin\"]\n\turl = git@b.com:p/q.git\n";
         assert_eq!(remote_url(cfg).as_deref(), Some("git@b.com:p/q.git"));
+    }
+
+    #[test]
+    fn remotes_with_their_projects() {
+        let cfg = "[remote \"origin\"]\n\turl = git@github.com:alex/app.git\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n[branch \"main\"]\n\tremote = origin\n[remote \"upstream\"]\n\turl = https://github.com/Acme/App.git\n[remote \"local\"]\n\turl = /srv/app.git\n";
+        let all = project_remotes(cfg);
+        let names: Vec<&str> = all.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["origin", "upstream"], "a path names no project");
+        assert!(
+            all[1].points_at("github.com", "acme/app"),
+            "case does not count"
+        );
+        assert!(all[0].points_at("GitHub.com", "alex/app"));
+        assert!(!all[0].points_at("gitlab.com", "alex/app"));
+        assert!(!all[0].points_at("github.com", "alex/app2"));
     }
 
     #[test]

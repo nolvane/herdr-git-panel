@@ -6,6 +6,13 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `b` fetches the branch of the selected merge request or pull request and
+  opens it in a new Herdr workspace (a git worktree Herdr creates), without
+  touching the current checkout; forks open through the merge request's own
+  ref (#9).
+
 ### Changed
 
 - "Mine" is now the first section, before "To review", and the list opens on

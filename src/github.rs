@@ -25,7 +25,7 @@ query {
   KEY: search(query: "is:open is:pr archived:false TERMS", type: ISSUE, first: 30) { nodes { ...pr } }
 }
 fragment pr on PullRequest {
-  number title body url isDraft createdAt updatedAt headRefName baseRefName headRefOid
+  number title body url isDraft createdAt updatedAt headRefName baseRefName headRefOid isCrossRepository
   repository { nameWithOwner viewerDefaultMergeMethod }
   author { login }
   reviewDecision mergeable mergeStateStatus
@@ -282,6 +282,9 @@ fn parse_pr(n: &Value, viewer: &str) -> Option<MergeRequest> {
         project: str_of(&n["repository"]["nameWithOwner"]),
         author,
         source_branch: str_of(&n["headRefName"]),
+        // Unknown counts as a fork: its branch is then fetched through the
+        // pull request's own ref, which is right either way.
+        from_fork: n["isCrossRepository"].as_bool().unwrap_or(true),
         head_sha: str_of(&n["headRefOid"]),
         target_branch: str_of(&n["baseRefName"]),
         created: n["createdAt"].as_str().and_then(time::parse_iso),
@@ -522,6 +525,7 @@ mod tests {
             "number": number, "title": "Add export", "body": "Why", "url": format!("https://github.com/acme/app/pull/{number}"),
             "isDraft": false, "createdAt": "2026-11-01T08:00:00Z", "updatedAt": format!("2026-11-0{number}T08:00:00Z"),
             "headRefName": "export", "baseRefName": "main", "headRefOid": "abc",
+            "isCrossRepository": number == 5,
             "repository": {"nameWithOwner": "acme/app", "viewerDefaultMergeMethod": "SQUASH"},
             "author": {"login": author},
             "reviewDecision": "REVIEW_REQUIRED", "mergeable": "MERGEABLE", "mergeStateStatus": "BLOCKED",
@@ -570,6 +574,8 @@ mod tests {
         assert_eq!(r.labels[0].color, "#d73a4a");
         assert_eq!(r.merge_method, "squash");
         assert_eq!(d.mine[0].iid, 4);
+        assert!(!r.from_fork);
+        assert!(d.review[0].from_fork, "#5 comes from a fork");
     }
 
     #[test]

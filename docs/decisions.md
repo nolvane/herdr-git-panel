@@ -291,3 +291,57 @@ review" has entries; `1` selects "Mine" and `2` "To review". Without a second
 reviewer nobody asks for reviews, so opening on "To review" meant switching
 on every open. The order lives in one list, `Section::ORDER` in `src/app.rs`,
 which the header tabs, the starting section and the number keys read.
+
+## 2026-11-08: `b` opens the branch through Herdr's worktrees
+
+`b` fetches the selected merge request's branch and opens it with
+`herdr worktree create --branch` (or `herdr worktree open --path` when the
+branch has its own folder already), so Herdr picks the folder, groups it with
+the repository in the sidebar and removes it with its own action; the plugin
+keeps no state of its own (only the local branch and its upstream in the
+clone) and needs no setting. No agent starts: Herdr starts one with
+a key in any pane. It works only in the clone the list opened in, on rows of
+any project its remotes point at. No `y` first: it writes nothing to the
+forge and never touches the current checkout.
+
+- A branch of the same repository is fetched into its remote-tracking ref and
+  gets a local branch of the same name whose upstream is set through
+  `branch.<name>.remote/merge` (only when it has none and no commits of its
+  own), which works whatever the remote's fetch refspec. A fork's branch is
+  fetched through the forge's own ref (`refs/pull/<n>/head`,
+  `refs/merge-requests/<iid>/head`) into `pr-<n>` / `mr-<iid>`, so a fork's
+  `main` is never mixed up with the repository's own. The fetched commit is
+  read from the ref the fetch wrote (for a fork a ref of the plugin's own,
+  `refs/herdr-git-panel/…`, removed again at the end), not from the shared
+  `FETCH_HEAD`, which another fetch could overwrite in between.
+- Remotes match the merge request's project ignoring case, as GitHub and
+  GitLab do.
+  Whether it is a fork comes from GitHub's `isCrossRepository` and GitLab's
+  `sourceProjectId`/`targetProjectId`; unknown counts as a fork, which is
+  fetched correctly either way.
+- An existing local branch only moves forward on a fast-forward; one with
+  commits of its own is kept and the list says so. A branch checked out in
+  the main checkout or in the list's own folder is refused before anything is
+  fetched. If Herdr refuses, a branch created in the same run is deleted
+  again and a moved one put back, but only while no folder has it checked
+  out: Herdr may have made the folder before failing.
+- `--focus` takes the user to the new workspace, so the list is out of sight
+  when the answer comes. A note (the branch differs, is behind, could not be
+  set to track) is therefore also shown with `herdr notification show`.
+- `herdr worktree create` gets two minutes, since it checks out the whole
+  branch; the fetch keeps the 30 s of every other call. On a timeout the
+  tool is stopped with its process group, so the ssh that git started goes
+  too.
+- git runs without a terminal: `GIT_TERMINAL_PROMPT=0`,
+  `GCM_INTERACTIVE=never`, and ssh's askpass forced to `false`
+  (`SSH_ASKPASS_REQUIRE=force`), so a passphrase or new host key fails at once
+  instead of writing over the list. That keeps the user's own ssh command and
+  agent, unlike overriding `GIT_SSH_COMMAND`. ssh older than 8.4 ignores
+  `SSH_ASKPASS_REQUIRE`; there a prompt stops ssh in its own process group
+  until the 30 s limit, the same limit `glab` and `gh` have.
+- `herdr worktree create/open` with `--cwd`, `--branch`, `--path` and
+  `--focus` are documented the same way in Herdr 0.9.0, so
+  `min_herdr_version` stays.
+- Branch names from the forge go to `git` and `herdr` as arguments without a
+  shell; names git would not accept, above all ones starting with `-`, are
+  refused first.

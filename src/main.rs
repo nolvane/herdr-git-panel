@@ -6,6 +6,7 @@
 //! plugin pane, or closes it when it is already open.
 
 mod app;
+mod branch;
 mod cli;
 mod config;
 mod diff;
@@ -35,11 +36,14 @@ fn config_dir() -> Option<PathBuf> {
 fn list() -> std::io::Result<()> {
     let dir = config_dir();
     let config = Config::load(dir.as_deref());
-    let project = std::env::current_dir()
-        .ok()
-        .and_then(|d| repo::detect(&d))
+    let here = std::env::current_dir().ok();
+    let project = here
+        .as_deref()
+        .and_then(repo::detect)
         .filter(|p| p.host == config.gitlab_host || p.host == github::HOST);
-    let app = app::App::new(config, project, dir);
+    let mut app = app::App::new(config, project, dir);
+    app.remotes = here.as_deref().map(repo::remotes_of).unwrap_or_default();
+    app.workdir = here;
     let mut terminal = ratatui::init();
     let _ = ratatui::crossterm::execute!(
         std::io::stdout(),

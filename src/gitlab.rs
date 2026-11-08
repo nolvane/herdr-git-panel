@@ -17,6 +17,7 @@ query {
 }
 fragment mr on MergeRequest {
   iid title description webUrl draft createdAt updatedAt sourceBranch targetBranch diffHeadSha
+  sourceProjectId targetProjectId
   project { fullPath }
   author { username }
   approved approvalsRequired approvalsLeft
@@ -277,6 +278,16 @@ fn num_of(v: &Value) -> u64 {
     v.as_u64().unwrap_or(0)
 }
 
+/// Whether the merge request's branch lives in another project (a fork).
+/// An unknown source project counts as a fork: the branch is then fetched
+/// through the merge request's own ref, which is right either way.
+fn from_fork(n: &Value) -> bool {
+    match (n["sourceProjectId"].as_u64(), n["targetProjectId"].as_u64()) {
+        (Some(source), Some(target)) => source != target,
+        _ => true,
+    }
+}
+
 fn parse_mr(n: &Value, host: &str, viewer: &str) -> Option<MergeRequest> {
     let iid = n["iid"]
         .as_str()
@@ -370,6 +381,7 @@ fn parse_mr(n: &Value, host: &str, viewer: &str) -> Option<MergeRequest> {
         project: str_of(&n["project"]["fullPath"]),
         author: str_of(&n["author"]["username"]),
         source_branch: str_of(&n["sourceBranch"]),
+        from_fork: from_fork(n),
         head_sha: str_of(&n["diffHeadSha"]),
         target_branch: str_of(&n["targetBranch"]),
         created: n["createdAt"].as_str().and_then(time::parse_iso),
@@ -417,6 +429,7 @@ mod tests {
                 "iid": "42", "title": "Add export", "webUrl": "https://gitlab.com/acme/app/-/merge_requests/42",
                 "draft": false, "updatedAt": "2026-11-08T08:00:00Z",
                 "sourceBranch": "abc-1-export", "targetBranch": "main",
+                "sourceProjectId": 11, "targetProjectId": 11,
                 "project": {"fullPath": "acme/app"}, "author": {"username": "alex"},
                 "approved": false, "approvalsRequired": 1, "approvalsLeft": 1,
                 "approvedBy": {"nodes": []},
@@ -440,6 +453,7 @@ mod tests {
                  "resolvableDiscussionsCount": 0, "resolvedDiscussionsCount": 0,
                  "labels": {"nodes": []}, "headPipeline": null, "diffStatsSummary": null},
                 {"iid": "9", "title": "New", "webUrl": "u9", "draft": false, "updatedAt": "2026-11-07T08:00:00Z",
+                 "sourceProjectId": 12, "targetProjectId": 11,
                  "project": {"fullPath": "acme/lib"}, "author": {"username": "me"},
                  "approved": true, "approvalsRequired": 2, "approvalsLeft": 0, "approvedBy": {"nodes": [{"username": "alex"}]},
                  "reviewers": {"nodes": [{"username": "alex", "mergeRequestInteraction": {"reviewState": "APPROVED"}}]},
@@ -475,6 +489,9 @@ mod tests {
         assert_eq!(d.mine[1].merge_state, MergeState::Draft);
         assert!(!d.mine[1].approved, "no approval rule and nobody approved");
         assert_eq!(d.mine[1].pipeline, Pipeline::None);
+        assert!(!d.review[0].from_fork, "same project");
+        assert!(d.mine[0].from_fork, "from another project");
+        assert!(d.mine[1].from_fork, "source unknown: the safe side");
     }
 
     #[test]

@@ -166,6 +166,7 @@ mod tests {
             project: "acme/app".into(),
             author: "alex".into(),
             source_branch: "abc-1-thing".into(),
+            from_fork: false,
             head_sha: "abc123".into(),
             target_branch: "main".into(),
             created: Some(updated - 100),
