@@ -11,6 +11,9 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+/// How long `herdr worktree create` may take.
+pub const CREATE_LIMIT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Runs one `herdr` command with these arguments and returns its JSON
 /// answer. Passed in, so tests can stand in for Herdr.
 pub type Herdr<'a> = &'a dyn Fn(&[String]) -> Result<Value, String>;
@@ -28,17 +31,46 @@ pub fn local_branch(mr: &MergeRequest) -> String {
     }
 }
 
-/// What `git fetch` asks the remote for: the branch itself in the same
-/// repository (into its remote-tracking ref), else the forge's own ref of
-/// the merge request, which the target project keeps for forks too.
-pub fn refspec(mr: &MergeRequest, remote: &str) -> String {
-    if !mr.from_fork {
-        let b = &mr.source_branch;
-        return format!("+refs/heads/{b}:refs/remotes/{remote}/{b}");
+/// Where the fetched commit lands: the branch's remote-tracking ref in the
+/// same repository, else a ref of the plugin's own that `open` removes
+/// again once the local branch holds the commit.
+pub fn fetched_ref(mr: &MergeRequest, remote: &str) -> String {
+    if mr.from_fork {
+        format!("refs/herdr-git-panel/{}", local_branch(mr))
+    } else {
+        format!("refs/remotes/{remote}/{}", mr.source_branch)
     }
-    match mr.forge {
-        Forge::GitHub => format!("refs/pull/{}/head", mr.iid),
-        Forge::GitLab => format!("refs/merge-requests/{}/head", mr.iid),
+}
+
+/// What `git fetch` asks the remote for, into [`fetched_ref`]: the branch
+/// itself in the same repository, else the forge's own ref of the merge
+/// request, which the target project keeps for forks too. A ref of its own
+/// (not the shared `FETCH_HEAD`) so another fetch at the same time cannot
+/// change which commit opens.
+pub fn refspec(mr: &MergeRequest, remote: &str) -> String {
+    let from = if mr.from_fork {
+        match mr.forge {
+            Forge::GitHub => format!("refs/pull/{}/head", mr.iid),
+            Forge::GitLab => format!("refs/merge-requests/{}/head", mr.iid),
+        }
+    } else {
+        format!("refs/heads/{}", mr.source_branch)
+    };
+    format!("+{from}:{}", fetched_ref(mr, remote))
+}
+
+/// Removes the plugin's own fetch ref of a fork when `open` ends, whichever
+/// way it ends.
+struct DropRef<'a> {
+    dir: &'a Path,
+    name: Option<String>,
+}
+
+impl Drop for DropRef<'_> {
+    fn drop(&mut self) {
+        if let Some(name) = &self.name {
+            let _ = git(self.dir, &["update-ref", "-d", name], "git");
+        }
     }
 }
 
@@ -55,6 +87,7 @@ pub fn valid_branch(name: &str) -> bool {
         && !name.contains("/.")
         && !name.contains("@{")
         && name != "@"
+        && name != "HEAD"
         && !name
             .chars()
             .any(|c| c.is_control() || c.is_whitespace() || "~^:?*[\\".contains(c))
@@ -139,11 +172,17 @@ pub fn herdr_error(stderr: &str) -> String {
     format!("Herdr could not open the folder: {line}")
 }
 
-/// Runs the real `herdr`.
+/// Runs the real `herdr`. Creating a worktree checks out the whole branch,
+/// which takes a while in a large repository, so it gets two minutes.
 pub fn run_herdr(args: &[String]) -> Result<Value, String> {
     let mut cmd = Command::new(crate::pane::herdr());
     cmd.args(args).stdin(Stdio::null());
-    let out = cli::run("herdr", cmd, "Herdr")?;
+    let limit = if args.get(1).map(String::as_str) == Some("create") {
+        CREATE_LIMIT
+    } else {
+        cli::TIMEOUT
+    };
+    let out = cli::run_for("herdr", cmd, "Herdr", limit)?;
     if !out.success {
         return Err(herdr_error(&out.stderr));
     }
@@ -252,6 +291,15 @@ fn fetch_failure(mr: &MergeRequest, stderr: &str) -> String {
     format!("Could not fetch {}: {}", mr.reference(), reason(stderr))
 }
 
+/// Whether two paths name the same folder (git may give one through a
+/// symlink, such as `/private/var` for `/var` on macOS).
+fn same_folder(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
 /// Shortens a path under the home folder to `~/…`.
 fn tilde(path: &Path) -> String {
     let shown = path.display().to_string();
@@ -295,11 +343,17 @@ pub fn open(mr: &MergeRequest, dir: &Path, remote: &str, herdr: Herdr) -> Result
     let branch = local_branch(mr);
     let noun = mr.forge.noun();
 
-    // Before fetching: a branch checked out in the main working tree stays
-    // as it is, also its remote-tracking ref.
+    // Before fetching: a branch checked out in the main working tree or in
+    // the list's own folder stays as it is, also its remote-tracking ref.
     let worktrees = git_ok(dir, &["worktree", "list", "--porcelain"])?;
     let checkout = checked_out(&worktrees, &branch);
     if let Some(at) = &checkout {
+        let here = git_ok(dir, &["rev-parse", "--show-toplevel"])?;
+        if same_folder(&at.path, Path::new(&here)) {
+            return Err(format!(
+                "{branch} is checked out in this folder already: work here"
+            ));
+        }
         if at.main {
             return Err(format!(
                 "{branch} is checked out in {} already: work there, or switch that folder to another branch",
@@ -314,13 +368,14 @@ pub fn open(mr: &MergeRequest, dir: &Path, remote: &str, herdr: Herdr) -> Result
         }
     }
 
-    // Write FETCH_HEAD also when the user's config turns it off: the fetched
-    // commit is read from it.
+    let fetched = fetched_ref(mr, remote);
+    let _cleanup = DropRef {
+        dir,
+        name: mr.from_fork.then(|| fetched.clone()),
+    };
     let out = git(
         dir,
         &[
-            "-c",
-            "fetch.writeFetchHead=true",
             "fetch",
             "--no-tags",
             "--recurse-submodules=no",
@@ -333,12 +388,8 @@ pub fn open(mr: &MergeRequest, dir: &Path, remote: &str, herdr: Herdr) -> Result
     if !out.success {
         return Err(fetch_failure(mr, &out.stderr));
     }
-    let tip = commit_of(dir, "FETCH_HEAD")?.ok_or_else(|| {
-        format!(
-            "Could not fetch {}: git wrote no FETCH_HEAD",
-            mr.reference()
-        )
-    })?;
+    let tip = commit_of(dir, &fetched)?
+        .ok_or_else(|| format!("Could not fetch {}: no commit arrived", mr.reference()))?;
 
     let existing = commit_of(dir, &format!("refs/heads/{branch}"))?;
     let relation = match &existing {
@@ -351,11 +402,15 @@ pub fn open(mr: &MergeRequest, dir: &Path, remote: &str, herdr: Herdr) -> Result
     if let Some(at) = checkout {
         herdr(&open_args(dir, &at.path))?;
         let note = match relation {
-            Some(Relation::Behind) => format!("; it is behind the {noun}"),
-            Some(Relation::Differs) => format!("; its branch differs from the {noun}"),
+            Some(Relation::Behind) => format!("its branch is behind the {noun}"),
+            Some(Relation::Differs) => format!("its branch differs from the {noun}"),
             _ => String::new(),
         };
-        return Ok(format!("Opened {} again{note}", tilde(&at.path)));
+        return Ok(finish(
+            herdr,
+            format!("Opened {} again", tilde(&at.path)),
+            &note,
+        ));
     }
 
     // The branch is checked out nowhere: create it, or move it forward.
@@ -380,7 +435,12 @@ pub fn open(mr: &MergeRequest, dir: &Path, remote: &str, herdr: Herdr) -> Result
     let answer = match herdr(&create_args(dir, &branch)) {
         Ok(answer) => answer,
         Err(e) => {
-            if let Some(args) = undo {
+            // Undo only while the branch is checked out nowhere: Herdr may
+            // have made the folder before it failed (or ran out of time), and
+            // moving a checked-out branch would leave that folder broken.
+            let still_free = git_ok(dir, &["worktree", "list", "--porcelain"])
+                .is_ok_and(|list| checked_out(&list, &branch).is_none());
+            if let (Some(args), true) = (undo, still_free) {
                 let args: Vec<&str> = args.iter().map(String::as_str).collect();
                 let _ = git_ok(dir, &args);
             }
@@ -389,37 +449,70 @@ pub fn open(mr: &MergeRequest, dir: &Path, remote: &str, herdr: Herdr) -> Result
     };
 
     // Track the merge request's branch, so `git push` there updates it. Set
-    // through the config, which works whatever the remote's fetch refspec.
+    // through the config, which works whatever the remote's fetch refspec,
+    // and only on a branch that has no upstream and no commits of its own.
     let mut note = String::new();
-    if !mr.from_fork {
-        let merge_key = format!("branch.{branch}.merge");
-        let has_upstream = git(dir, &["config", "--get", &merge_key], "git")?.success;
-        if !has_upstream {
-            let set = git_ok(dir, &["config", &format!("branch.{branch}.remote"), remote])
-                .and_then(|_| {
-                    git_ok(
-                        dir,
-                        &[
-                            "config",
-                            &merge_key,
-                            &format!("refs/heads/{}", mr.source_branch),
-                        ],
-                    )
-                });
-            if set.is_err() {
-                note = format!("; could not make it track {remote}/{}", mr.source_branch);
-            }
-        }
-    }
     if relation == Some(Relation::Differs) {
-        note =
-            format!("; the local branch {branch} differs from the {noun}, kept it as it is{note}");
+        note = format!("the local branch {branch} differs from the {noun}, kept it as it is");
+        if mr.from_fork {
+            note.push_str(" (delete it to open the current version)");
+        }
+    } else if !mr.from_fork && !has_upstream(dir, &branch) {
+        let set =
+            git_ok(dir, &["config", &format!("branch.{branch}.remote"), remote]).and_then(|_| {
+                git_ok(
+                    dir,
+                    &[
+                        "config",
+                        &format!("branch.{branch}.merge"),
+                        &format!("refs/heads/{}", mr.source_branch),
+                    ],
+                )
+            });
+        if set.is_err() {
+            note = format!(
+                "could not make {branch} track {remote}/{}",
+                mr.source_branch
+            );
+        }
     }
     let place = answer["result"]["worktree"]["path"]
         .as_str()
         .map(|p| tilde(Path::new(p)))
         .unwrap_or_else(|| "a new workspace".to_string());
-    Ok(format!("Opened {branch} in {place}{note}"))
+    Ok(finish(herdr, format!("Opened {branch} in {place}"), &note))
+}
+
+/// Whether the local branch has an upstream already.
+fn has_upstream(dir: &Path, branch: &str) -> bool {
+    git(
+        dir,
+        &["config", "--get", &format!("branch.{branch}.merge")],
+        "git",
+    )
+    .is_ok_and(|out| out.success)
+}
+
+/// The message for the list, with the note after it. Herdr has just
+/// switched to the workspace, so the list is out of sight: a note is also
+/// shown as a Herdr notification there.
+fn finish(herdr: Herdr, message: String, note: &str) -> String {
+    if note.is_empty() {
+        return message;
+    }
+    let _ = herdr(&notify_args(&message, note));
+    format!("{message}; {note}")
+}
+
+/// `herdr notification show`: a toast in the workspace that is in front.
+pub fn notify_args(title: &str, body: &str) -> Vec<String> {
+    vec![
+        "notification".into(),
+        "show".into(),
+        title.into(),
+        "--body".into(),
+        body.into(),
+    ]
 }
 
 #[cfg(test)]
@@ -552,6 +645,8 @@ mod tests {
         calls: RefCell<Vec<Vec<String>>>,
         root: PathBuf,
         refuse: bool,
+        /// Makes the folder, then fails (as when Herdr runs out of time).
+        fail_after_create: bool,
     }
 
     impl FakeHerdr {
@@ -560,7 +655,18 @@ mod tests {
                 calls: RefCell::new(Vec::new()),
                 root: s.root.clone(),
                 refuse: false,
+                fail_after_create: false,
             }
+        }
+
+        /// The notifications shown, as (title, body).
+        fn notifications(&self) -> Vec<(String, String)> {
+            self.calls
+                .borrow()
+                .iter()
+                .filter(|c| c[0] == "notification")
+                .map(|c| (c[2].clone(), c[4].clone()))
+                .collect()
         }
 
         fn run(&self, args: &[String]) -> Result<Value, String> {
@@ -576,6 +682,9 @@ mod tests {
                     &dir,
                     &["worktree", "add", "-q", path.to_str().unwrap(), branch],
                 );
+                if self.fail_after_create {
+                    return Err("Herdr did not answer within 120 s".into());
+                }
                 return Ok(serde_json::json!({"result": {"worktree": {"path": path}}}));
             }
             Ok(serde_json::json!({"result": {}}))
@@ -668,16 +777,46 @@ mod tests {
             .output()
             .unwrap();
         assert!(!upstream.status.success(), "a fork's branch tracks nothing");
+        assert_eq!(
+            commit_of(&s.clone, "refs/herdr-git-panel/pr-7").unwrap(),
+            None,
+            "the plugin's own fetch ref is gone again"
+        );
+    }
+
+    #[test]
+    fn the_commit_comes_from_the_fetch_not_from_fetch_head() {
+        let s = Setup::new("fetch-head");
+        let head = s.commit(Some(&s.base), "export");
+        s.remote_ref("refs/heads/export", &head);
+        // Another fetch's FETCH_HEAD, written before ours reads it.
+        std::fs::write(
+            s.clone.join(".git/FETCH_HEAD"),
+            format!("{}\t\tbranch 'main' of x\n", s.base),
+        )
+        .unwrap();
+        sh(&s.clone, &["config", "fetch.writeFetchHead", "false"]);
+        let herdr = FakeHerdr::new(&s);
+
+        open_with(&s, &mr(Forge::GitHub, 3, "export", false), &herdr).unwrap();
+
+        assert_eq!(s.local("export"), Some(head));
     }
 
     #[test]
     fn forks_use_the_forges_own_ref() {
         let gh = mr(Forge::GitHub, 7, "main", true);
         assert_eq!(local_branch(&gh), "pr-7");
-        assert_eq!(refspec(&gh, "origin"), "refs/pull/7/head");
+        assert_eq!(
+            refspec(&gh, "origin"),
+            "+refs/pull/7/head:refs/herdr-git-panel/pr-7"
+        );
         let gl = mr(Forge::GitLab, 42, "main", true);
         assert_eq!(local_branch(&gl), "mr-42");
-        assert_eq!(refspec(&gl, "origin"), "refs/merge-requests/42/head");
+        assert_eq!(
+            refspec(&gl, "origin"),
+            "+refs/merge-requests/42/head:refs/herdr-git-panel/mr-42"
+        );
         let same = mr(Forge::GitLab, 42, "fix/login", false);
         assert_eq!(local_branch(&same), "fix/login");
         assert_eq!(
@@ -700,6 +839,49 @@ mod tests {
 
         assert!(msg.contains("differs"), "{msg}");
         assert_eq!(s.local("export"), Some(mine));
+        assert!(!has_upstream(&s.clone, "export"), "its config is kept too");
+        // The list is out of sight now: Herdr shows the note.
+        let shown = herdr.notifications();
+        assert_eq!(shown.len(), 1);
+        assert!(shown[0].1.contains("differs"), "{shown:?}");
+    }
+
+    #[test]
+    fn a_rebased_fork_says_how_to_get_the_current_version() {
+        let s = Setup::new("rebased");
+        let first = s.commit(None, "fork work");
+        s.remote_ref("refs/pull/7/head", &first);
+        let herdr = FakeHerdr::new(&s);
+        let m = mr(Forge::GitHub, 7, "main", true);
+        open_with(&s, &m, &herdr).unwrap();
+        sh(
+            &s.clone,
+            &[
+                "worktree",
+                "remove",
+                s.root.join("wt-pr-7").to_str().unwrap(),
+            ],
+        );
+        let rebased = s.commit(None, "fork work, rebased");
+        s.remote_ref("refs/pull/7/head", &rebased);
+
+        let msg = open_with(&s, &m, &herdr).unwrap();
+
+        assert!(
+            msg.contains("delete it to open the current version"),
+            "{msg}"
+        );
+        assert_eq!(s.local("pr-7"), Some(first));
+    }
+
+    #[test]
+    fn a_plain_open_shows_no_notification() {
+        let s = Setup::new("quiet");
+        let head = s.commit(Some(&s.base), "export");
+        s.remote_ref("refs/heads/export", &head);
+        let herdr = FakeHerdr::new(&s);
+        open_with(&s, &mr(Forge::GitHub, 3, "export", false), &herdr).unwrap();
+        assert!(herdr.notifications().is_empty());
     }
 
     #[test]
@@ -728,11 +910,21 @@ mod tests {
         let newer = s.commit(Some(&head), "more");
         s.remote_ref("refs/heads/export", &newer);
         let herdr = FakeHerdr::new(&s);
+        let m = mr(Forge::GitHub, 3, "export", false);
+        // The list runs in another folder of the same repository.
+        let side = s.root.join("side");
+        sh(
+            &s.clone,
+            &["worktree", "add", "-q", "--detach", side.to_str().unwrap()],
+        );
 
-        let e = open_with(&s, &mr(Forge::GitHub, 3, "export", false), &herdr).unwrap_err();
+        let e = open(&m, &side, "origin", &|a: &[String]| herdr.run(a)).unwrap_err();
 
         assert!(e.contains("is checked out in"), "{e}");
         assert!(e.contains("clone"), "names the folder: {e}");
+        // The list runs in the main checkout itself.
+        let e = open_with(&s, &m, &herdr).unwrap_err();
+        assert_eq!(e, "export is checked out in this folder already: work here");
         assert!(herdr.calls.borrow().is_empty());
         assert_eq!(s.local("export"), before);
         assert_eq!(sh(&s.clone, &["branch", "--show-current"]), "export");
@@ -809,6 +1001,38 @@ mod tests {
     }
 
     #[test]
+    fn a_folder_herdr_made_before_failing_keeps_its_branch() {
+        let s = Setup::new("late");
+        let head = s.commit(Some(&s.base), "export");
+        s.remote_ref("refs/heads/export", &head);
+        s.remote_ref("refs/heads/later", &head);
+        sh(&s.clone, &["branch", "later", &s.base]);
+        let mut herdr = FakeHerdr::new(&s);
+        herdr.fail_after_create = true;
+
+        let e = open_with(&s, &mr(Forge::GitHub, 3, "export", false), &herdr).unwrap_err();
+        assert!(e.contains("did not answer"), "{e}");
+        assert_eq!(
+            s.local("export"),
+            Some(head.clone()),
+            "not deleted under the folder"
+        );
+
+        open_with(&s, &mr(Forge::GitHub, 4, "later", false), &herdr).unwrap_err();
+        assert_eq!(
+            s.local("later"),
+            Some(head.clone()),
+            "not moved back under the folder"
+        );
+        let folder = s.root.join("wt-later");
+        assert_eq!(
+            sh(&folder, &["status", "--porcelain"]),
+            "",
+            "the folder is clean"
+        );
+    }
+
+    #[test]
     fn worktree_list_names_where_a_branch_is() {
         let list = "worktree /src/app\nHEAD 1111\nbranch refs/heads/main\n\n\
                     worktree /wt/app/export\nHEAD 2222\nbranch refs/heads/export\n\n\
@@ -854,6 +1078,7 @@ mod tests {
             "x.lock",
             "a/.b",
             "@",
+            "HEAD",
             "a@{1}",
         ] {
             assert!(!valid_branch(bad), "{bad:?}");

@@ -42,10 +42,7 @@ fn list() -> std::io::Result<()> {
         .and_then(repo::detect)
         .filter(|p| p.host == config.gitlab_host || p.host == github::HOST);
     let mut app = app::App::new(config, project, dir);
-    app.clone_projects = here
-        .as_deref()
-        .map(repo::remote_projects)
-        .unwrap_or_default();
+    app.remotes = here.as_deref().map(repo::remotes_of).unwrap_or_default();
     app.workdir = here;
     let mut terminal = ratatui::init();
     let _ = ratatui::crossterm::execute!(

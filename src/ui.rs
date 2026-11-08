@@ -1204,7 +1204,7 @@ fn draw_details(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
         Span::styled("d", key),
         Span::styled(" changes   ", Style::new().fg(FAINT)),
     ];
-    if app.has_clone_of(mr) {
+    if app.herdr && app.remote_of(mr).is_some() {
         actions.push(Span::styled("b", key));
         actions.push(Span::styled(" branch   ", Style::new().fg(FAINT)));
     }
@@ -1841,6 +1841,8 @@ mod tests {
         };
         let mut app = App::new(config, None, None);
         app.data = Some(Data { review, mine });
+        // Not from the shell the tests run in.
+        app.herdr = false;
         app
     }
 
@@ -2061,10 +2063,15 @@ mod tests {
         };
         assert!(!offered(&mut app), "no clone of acme/app here");
         app.workdir = Some(std::path::PathBuf::from("/src/app"));
-        app.clone_projects = vec![crate::repo::Project {
-            host: "gitlab.com".into(),
-            path: "acme/app".into(),
+        app.remotes = vec![crate::repo::Remote {
+            name: "upstream".into(),
+            project: crate::repo::Project {
+                host: "gitlab.com".into(),
+                path: "Acme/App".into(),
+            },
         }];
+        assert!(!offered(&mut app), "not inside Herdr");
+        app.herdr = true;
         assert!(offered(&mut app));
     }
 }

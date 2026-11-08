@@ -7,7 +7,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// Longest wait for a server before the attempt counts as failed.
-const TIMEOUT: Duration = Duration::from_secs(30);
+pub const TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A tool from PATH, else from the usual install places (Herdr may start the
 /// plugin with a short PATH).
@@ -50,9 +50,21 @@ pub struct Output {
     pub stderr: String,
 }
 
-/// Runs the command with a time limit. `host` only names the server in
-/// messages.
-pub fn run(name: &str, mut cmd: Command, host: &str) -> Result<Output, String> {
+/// Runs the command with the usual time limit. `host` only names the server
+/// in messages.
+pub fn run(name: &str, cmd: Command, host: &str) -> Result<Output, String> {
+    run_for(name, cmd, host, TIMEOUT)
+}
+
+/// Runs the command with this time limit. When it runs out, the tool is
+/// stopped together with its process group, if it leads one (git with the
+/// ssh it started).
+pub fn run_for(
+    name: &str,
+    mut cmd: Command,
+    host: &str,
+    limit: Duration,
+) -> Result<Output, String> {
     let mut child = cmd
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -81,10 +93,22 @@ pub fn run(name: &str, mut cmd: Command, host: &str) -> Result<Output, String> {
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
-            Ok(None) if started.elapsed() > TIMEOUT => {
+            Ok(None) if started.elapsed() > limit => {
+                // A group with the child's id exists only when the child
+                // leads it; otherwise this finds no process and does nothing.
+                #[cfg(unix)]
+                let _ = Command::new("kill")
+                    .args(["-s", "KILL", "--", &format!("-{}", child.id())])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(format!("{host} did not answer within 30 s"));
+                return Err(format!(
+                    "{host} did not answer within {} s",
+                    limit.as_secs()
+                ));
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(50)),
             Err(e) => return Err(format!("{name}: {e}")),
@@ -143,6 +167,33 @@ pub fn graphql_errors(value: &serde_json::Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_tool_out_of_time_is_stopped_with_its_group() {
+        use std::os::unix::process::CommandExt;
+        let pidfile =
+            std::env::temp_dir().join(format!("herdr-git-panel-pid-{}", std::process::id()));
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg(format!("sleep 30 & echo $! > {}; wait", pidfile.display()))
+            .process_group(0);
+        let started = Instant::now();
+        let e = run_for("sh", cmd, "example.org", Duration::from_millis(300))
+            .err()
+            .unwrap();
+        assert_eq!(e, "example.org did not answer within 0 s");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let pid = std::fs::read_to_string(&pidfile).unwrap();
+        std::fs::remove_file(&pidfile).ok();
+        let alive = Command::new("kill")
+            .args(["-0", pid.trim()])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        assert!(!alive, "the sleep it started is gone too");
+    }
 
     #[test]
     fn failures_are_explained() {

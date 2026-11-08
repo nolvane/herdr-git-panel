@@ -256,9 +256,9 @@ pub struct App {
     act_rx: Receiver<Result<String, String>>,
     /// The folder the list runs in; `b` fetches into its clone.
     pub workdir: Option<std::path::PathBuf>,
-    /// The projects the remotes of that clone point at (`origin` and, say,
-    /// `upstream`).
-    pub clone_projects: Vec<Project>,
+    /// The remotes of that clone with the projects they point at (`origin`
+    /// and, say, `upstream`).
+    pub remotes: Vec<crate::repo::Remote>,
     /// The list runs inside Herdr, which `b` needs to open a workspace.
     pub herdr: bool,
     /// `b` is fetching and opening a branch.
@@ -332,7 +332,7 @@ impl App {
             act_tx,
             act_rx,
             workdir: None,
-            clone_projects: Vec::new(),
+            remotes: Vec::new(),
             herdr: std::env::var("HERDR_ENV").is_ok_and(|v| v == "1"),
             opening_branch: false,
             branch_tx,
@@ -556,14 +556,14 @@ impl App {
         });
     }
 
-    /// Whether the merge request belongs to the project of the clone the
-    /// list runs in, so `b` can fetch its branch there.
-    pub fn has_clone_of(&self, mr: &MergeRequest) -> bool {
-        self.workdir.is_some()
-            && self
-                .clone_projects
-                .iter()
-                .any(|p| p.host == mr.host && p.path == mr.project)
+    /// The remote of the clone the list runs in that points at the merge
+    /// request's project, so `b` can fetch its branch from there.
+    pub fn remote_of(&self, mr: &MergeRequest) -> Option<&str> {
+        self.workdir.as_ref()?;
+        self.remotes
+            .iter()
+            .find(|r| r.points_at(&mr.host, &mr.project))
+            .map(|r| r.name.as_str())
     }
 
     /// Fetches the selected merge request's branch and opens it in a new
@@ -581,7 +581,10 @@ impl App {
             self.say("Opening the branch only works inside Herdr");
             return;
         }
-        let Some(dir) = self.workdir.clone().filter(|_| self.has_clone_of(&mr)) else {
+        let (Some(dir), Some(remote)) = (
+            self.workdir.clone(),
+            self.remote_of(&mr).map(str::to_string),
+        ) else {
             self.say(format!(
                 "No local clone of {} here: open the list in its folder",
                 mr.project
@@ -596,17 +599,18 @@ impl App {
             return;
         }
         self.opening_branch = true;
-        // Shown until the answer comes: the fetch and Herdr have 30 s each.
+        // Shown until the answer comes: the fetch has 30 s, Herdr two minutes.
         self.flash = Some((
             format!("Fetching {branch}…"),
-            Instant::now() + Duration::from_secs(70),
+            Instant::now() + Duration::from_secs(180),
         ));
         let tx = self.branch_tx.clone();
         std::thread::spawn(move || {
-            let result = match crate::repo::remote_for(&dir, &mr.host, &mr.project) {
-                Some(remote) => crate::branch::open(&mr, &dir, &remote, &crate::branch::run_herdr),
-                None => Err(format!("No git remote for {} in this clone", mr.project)),
-            };
+            // A panic still answers, so `b` does not stay blocked.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::branch::open(&mr, &dir, &remote, &crate::branch::run_herdr)
+            }))
+            .unwrap_or_else(|_| Err(format!("Opening {branch} failed")));
             let _ = tx.send(result);
         });
     }
@@ -1346,7 +1350,10 @@ mod tests {
             path: "acme/app".into(),
         };
         app.project = Some(project.clone());
-        app.clone_projects = vec![project];
+        app.remotes = vec![crate::repo::Remote {
+            name: "origin".into(),
+            project,
+        }];
         app.workdir = Some(dir.to_path_buf());
         app.herdr = true;
         app
@@ -1416,11 +1423,15 @@ mod tests {
         assert_eq!(flash(&app), Some("Still opening a branch"));
         press(&mut app, KeyCode::Down);
         assert_eq!(app.mine_state.selected(), Some(1), "keys still work");
-        let result = app.branch_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-        assert_eq!(
-            result.unwrap_err(),
-            "No git remote for acme/app in this clone"
-        );
+        // The answer ends the fetching state and shows why it failed.
+        let until = Instant::now() + Duration::from_secs(10);
+        while app.opening_branch && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+            app.receive_branch();
+        }
+        assert!(!app.opening_branch);
+        let shown = flash(&app).unwrap();
+        assert!(shown.starts_with("git worktree failed: "), "{shown}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

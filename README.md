@@ -113,13 +113,16 @@ action.
 - Your current checkout, its branch and its uncommitted changes stay as they
   are.
 - A branch of the same repository gets a local branch of the same name that
-  tracks it, so `git push` there updates the merge request. A fork's branch is
+  tracks it, so `git push` there updates the merge request (a local branch
+  that already tracks something keeps its upstream). A fork's branch is
   fetched through the merge request's own ref and opens as `pr-<n>` (GitHub)
   or `mr-<iid>` (GitLab), without upstream.
 - A second `b` opens the existing folder again. A local branch that has
-  commits of its own is kept as it is, and the list says it differs. A branch
-  checked out in the main checkout already is not opened a second time: the
-  list says where it is.
+  commits of its own is kept as it is, and the list says it differs (for a
+  fork's `pr-<n>` after a rebase: delete it to open the current version).
+  Since Herdr switches to the new workspace, such a note also shows there as
+  a Herdr notification. A branch checked out in the main checkout or in the
+  list's own folder is not opened a second time: the list says where it is.
 - When the branch can't be fetched (no network, branch deleted, no login for
   the remote), the list says why and changes nothing. git never asks for a
   password or passphrase here; it uses the logins and ssh keys you already
@@ -243,8 +246,8 @@ Comments load when a merge request's activity tab is open. The list only
 writes what you asked for: an approval or taking one back, a merge (both
 after confirming), and resolving a thread or opening it again. `b` runs
 `git fetch` against the clone's remote, creates or moves forward a local
-branch that is not checked out anywhere, and asks Herdr to create the
-folder. Nothing else is stored and nothing else is contacted. The list only
+branch that is not checked out anywhere, sets its upstream when it has
+none, and asks Herdr to create the folder. Nothing else is stored and nothing else is contacted. The list only
 runs while it is open.
 
 ## Development
