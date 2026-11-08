@@ -298,7 +298,8 @@ which the header tabs, the starting section and the number keys read.
 `herdr worktree create --branch` (or `herdr worktree open --path` when the
 branch has its own folder already), so Herdr picks the folder, groups it with
 the repository in the sidebar and removes it with its own action; the plugin
-stores nothing and needs no setting. No agent starts: Herdr starts one with
+keeps no state of its own (only the local branch and its upstream in the
+clone) and needs no setting. No agent starts: Herdr starts one with
 a key in any pane. It works only in the clone the list opened in, on rows of
 any project its remotes point at. No `y` first: it writes nothing to the
 forge and never touches the current checkout.

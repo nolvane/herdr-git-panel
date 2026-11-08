@@ -247,8 +247,8 @@ writes what you asked for: an approval or taking one back, a merge (both
 after confirming), and resolving a thread or opening it again. `b` runs
 `git fetch` against the clone's remote, creates or moves forward a local
 branch that is not checked out anywhere, sets its upstream when it has
-none, and asks Herdr to create the folder. Nothing else is stored and nothing else is contacted. The list only
-runs while it is open.
+none, and asks Herdr to create the folder. Nothing else is stored and
+nothing else is contacted. The list only runs while it is open.
 
 ## Development
 
