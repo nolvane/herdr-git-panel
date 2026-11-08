@@ -257,3 +257,21 @@ given.
 --draft/--ready`, `gh pr ready [--undo]`). Only your own: changing someone
 else's state from a list is too easy to do by accident. No confirmation,
 because the same key undoes it.
+
+## 2026-11-08: Only web links open, approvals pinned to the shown head
+
+Descriptions and comments are written by other people, and the panel shows a
+Markdown link's text, not its target. A link could therefore point a click at
+a local file, an app, a network share or another URL scheme, which `open` and
+`xdg-open` happily follow. Only `http` and `https` targets without spaces or
+control characters are clickable now; other links show as plain text, and
+`open_url` refuses anything else as a second guard. Relative links (such as
+`/group/project/-/jobs/1` on GitLab) no longer open; they are rare in
+descriptions and would need the forge's host to be resolved safely.
+
+Approving now names the head commit the list showed, like merging already
+did: `glab mr approve --sha`, and on GitHub the REST call
+`POST /repos/{owner}/{repo}/pulls/{n}/reviews` with `event=APPROVE` and
+`commit_id`, because `gh pr review` cannot name a commit. A push after the
+list loaded then makes GitLab refuse the approval, and on GitHub the review
+belongs to the commit that was on screen.

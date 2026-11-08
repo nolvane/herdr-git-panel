@@ -443,8 +443,7 @@ pub fn merge(mr: &MergeRequest) -> Result<(), String> {
     pr_command(mr, &args).map(|_| ())
 }
 
-/// Approves the pull request. GitHub has no way to take an approval back
-/// other than a dismissal by a maintainer.
+/// Marks the pull request as draft, or as ready for review.
 pub fn set_draft(mr: &MergeRequest, draft: bool) -> Result<(), String> {
     let args: &[&str] = if draft {
         &["ready", "--undo"]
@@ -454,8 +453,37 @@ pub fn set_draft(mr: &MergeRequest, draft: bool) -> Result<(), String> {
     pr_command(mr, args).map(|_| ())
 }
 
+/// Approves the pull request at the head the list showed (`commit_id`), so
+/// the review belongs to the code that was on screen; `gh pr review` has no
+/// way to name the commit.
 pub fn approve(mr: &MergeRequest) -> Result<(), String> {
-    pr_command(mr, &["review", "--approve"]).map(|_| ())
+    let mut cmd = cli::command("gh");
+    cmd.args(approve_args(&mr.project, mr.iid, &mr.head_sha));
+    let out = cli::run("gh", cmd, HOST)?;
+    if out.success {
+        Ok(())
+    } else {
+        Err(cli::explain_failure("gh", HOST, &out.stderr))
+    }
+}
+
+fn approve_args(project: &str, iid: u64, head_sha: &str) -> Vec<String> {
+    let mut args: Vec<String> = [
+        "api",
+        "--hostname",
+        HOST,
+        "--method",
+        "POST",
+        &format!("repos/{project}/pulls/{iid}/reviews"),
+        "-f",
+        "event=APPROVE",
+    ]
+    .map(String::from)
+    .to_vec();
+    if !head_sha.is_empty() {
+        args.extend(["-f".to_string(), format!("commit_id={head_sha}")]);
+    }
+    args
 }
 
 /// The pull request's changes as a unified diff, without colours.
@@ -468,6 +496,26 @@ pub fn fetch_diff(mr: &MergeRequest) -> Result<String, String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn approval_is_pinned_to_the_shown_head() {
+        assert_eq!(
+            approve_args("acme/app", 7, "abc123"),
+            [
+                "api",
+                "--hostname",
+                "github.com",
+                "--method",
+                "POST",
+                "repos/acme/app/pulls/7/reviews",
+                "-f",
+                "event=APPROVE",
+                "-f",
+                "commit_id=abc123",
+            ]
+        );
+        assert_eq!(approve_args("acme/app", 7, "").len(), 8);
+    }
 
     fn pr(number: u64, author: &str) -> Value {
         json!({

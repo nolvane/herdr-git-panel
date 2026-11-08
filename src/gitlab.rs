@@ -220,8 +220,20 @@ pub fn set_draft(mr: &MergeRequest, draft: bool) -> Result<(), String> {
 }
 
 /// Approves the merge request, or takes your approval back (`revoke`).
+/// An approval is pinned to the head the list showed, so a push after it
+/// loaded makes GitLab refuse the approval instead of approving unseen code.
 pub fn set_approval(mr: &MergeRequest, revoke: bool) -> Result<(), String> {
-    mr_command(mr, &[if revoke { "revoke" } else { "approve" }]).map(|_| ())
+    mr_command(mr, &approval_args(revoke, &mr.head_sha)).map(|_| ())
+}
+
+fn approval_args(revoke: bool, head_sha: &str) -> Vec<&str> {
+    if revoke {
+        vec!["revoke"]
+    } else if head_sha.is_empty() {
+        vec!["approve"]
+    } else {
+        vec!["approve", "--sha", head_sha]
+    }
 }
 
 /// The merge request's changes as a unified diff, without colours.
@@ -385,6 +397,16 @@ fn parse_mr(n: &Value, host: &str, viewer: &str) -> Option<MergeRequest> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn approval_is_pinned_to_the_shown_head() {
+        assert_eq!(
+            approval_args(false, "abc123"),
+            ["approve", "--sha", "abc123"]
+        );
+        assert_eq!(approval_args(false, ""), ["approve"]);
+        assert_eq!(approval_args(true, "abc123"), ["revoke"]);
+    }
+
     use super::*;
     use serde_json::json;
 
