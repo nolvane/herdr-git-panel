@@ -3,7 +3,7 @@
 
 use crate::config::{Config, Scope};
 use crate::forge::{self, Fetched};
-use crate::model::{Data, Forge, MergeRequest, MergeState};
+use crate::model::{AllList, Data, Forge, MergeRequest, MergeState};
 use crate::repo::Project;
 use crate::ui;
 use crate::view::{self, Show, SortKey};
@@ -22,19 +22,33 @@ use std::time::{Duration, Instant};
 pub enum Section {
     Mine,
     Review,
+    /// Every open merge request of the project, or of your projects.
+    All,
 }
 
 impl Section {
     /// The sections in the order of their tabs; the list opens on the first,
     /// and the number keys pick them by position (`1` is the first).
-    pub const ORDER: [Section; 2] = [Section::Mine, Section::Review];
+    pub const ORDER: [Section; 3] = [Section::Mine, Section::Review, Section::All];
 
     /// The name on its tab.
     pub fn name(self) -> &'static str {
         match self {
             Section::Mine => "Mine",
             Section::Review => "To review",
+            Section::All => "All",
         }
+    }
+
+    /// The next tab (`forward`) or the previous one, round at the ends.
+    pub fn step(self, forward: bool) -> Section {
+        let n = Section::ORDER.len();
+        let i = Section::ORDER.iter().position(|s| *s == self).unwrap_or(0);
+        Section::ORDER[if forward {
+            (i + 1) % n
+        } else {
+            (i + n - 1) % n
+        }]
     }
 
     /// The section a number key picks, by its position in [`Section::ORDER`].
@@ -204,6 +218,7 @@ pub struct App {
     pub section: Section,
     pub review_state: TableState,
     pub mine_state: TableState,
+    pub all_state: TableState,
     pub data: Option<Data>,
     pub error: Option<String>,
     pub loading: bool,
@@ -297,6 +312,7 @@ impl App {
             section: Section::ORDER[0],
             review_state: TableState::default(),
             mine_state: TableState::default(),
+            all_state: TableState::default(),
             data: None,
             error: None,
             loading: false,
@@ -349,7 +365,12 @@ impl App {
         let github = match self.scoped_project() {
             Some(p) => p.host == crate::github::HOST,
             None => self.data.as_ref().is_some_and(|d| {
-                let mut all = d.review.iter().chain(d.mine.iter()).peekable();
+                let mut all = d
+                    .review
+                    .iter()
+                    .chain(&d.mine)
+                    .chain(self.all_items())
+                    .peekable();
                 all.peek().is_some() && all.all(|mr| mr.forge == Forge::GitHub)
             }),
         };
@@ -367,7 +388,8 @@ impl App {
                 let all: Vec<Forge> = d
                     .review
                     .iter()
-                    .chain(d.mine.iter())
+                    .chain(&d.mine)
+                    .chain(self.all_items())
                     .map(|m| m.forge)
                     .collect();
                 all.contains(&Forge::GitLab) && all.contains(&Forge::GitHub)
@@ -382,24 +404,54 @@ impl App {
         }
     }
 
+    /// "All" as loaded for the scope shown now; `None` while the list for
+    /// this scope is still loading (the first time, or after `a`).
+    pub fn all_list(&self) -> Option<&AllList> {
+        self.data
+            .as_ref()?
+            .all
+            .as_ref()
+            .filter(|all| all.of.as_ref() == self.scoped_project())
+    }
+
+    /// Whether you review this merge request: you are among its reviewers,
+    /// or it is in "To review" (on GitHub also through a team you are in).
+    pub fn reviews(&self, mr: &MergeRequest) -> bool {
+        mr.review_of(&mr.viewer).is_some()
+            || self.data.as_ref().is_some_and(|d| {
+                d.review
+                    .iter()
+                    .any(|r| r.iid == mr.iid && r.project == mr.project && r.host == mr.host)
+            })
+    }
+
+    fn all_items(&self) -> impl Iterator<Item = &MergeRequest> {
+        self.all_list().into_iter().flat_map(|all| &all.items)
+    }
+
     /// The merge requests of a section as shown: scope, quick filter and
     /// typed filter applied, then sorted.
     pub fn rows(&self, section: Section) -> Vec<&MergeRequest> {
         let Some(data) = &self.data else {
             return Vec::new();
         };
-        let list = match section {
-            Section::Review => &data.review,
-            Section::Mine => &data.mine,
+        let list: Vec<&MergeRequest> = match section {
+            Section::Review => data.review.iter().collect(),
+            Section::Mine => data.mine.iter().collect(),
+            // Loaded for this scope already, so no project to filter by.
+            Section::All => self.all_items().collect(),
         };
-        let reviewing = section == Section::Review;
         let mut rows: Vec<&MergeRequest> = list
-            .iter()
+            .into_iter()
             .filter(|mr| match self.scoped_project() {
-                Some(p) => mr.project == p.path && mr.host == p.host,
-                None => true,
+                Some(p) if section != Section::All => mr.project == p.path && mr.host == p.host,
+                _ => true,
             })
-            .filter(|mr| self.show.keeps(mr, &mr.viewer, reviewing))
+            .filter(|mr| match section {
+                Section::Review => self.show.keeps(mr, &mr.viewer, true),
+                Section::Mine => self.show.keeps(mr, &mr.viewer, false),
+                Section::All => self.show.keeps_in_all(mr, &mr.viewer, self.reviews(mr)),
+            })
             .filter(|mr| view::matches(mr, &self.filter))
             .collect();
         view::sort(&mut rows, self.sort, self.descending);
@@ -423,28 +475,41 @@ impl App {
 
     /// After sorting or filtering: back to the top of each list.
     fn after_view_change(&mut self) {
-        self.review_state.select(Some(0));
-        self.mine_state.select(Some(0));
-        *self.review_state.offset_mut() = 0;
-        *self.mine_state.offset_mut() = 0;
+        for section in Section::ORDER {
+            let state = self.table_state_mut(section);
+            state.select(Some(0));
+            *state.offset_mut() = 0;
+        }
         self.details_scroll = 0;
         self.clamp_selection();
     }
 
-    pub fn state_mut(&mut self) -> &mut TableState {
-        match self.section {
-            Section::Review => &mut self.review_state,
-            Section::Mine => &mut self.mine_state,
+    /// Where a section's list is scrolled to and which row is selected.
+    pub fn table_state(&self, section: Section) -> &TableState {
+        match section {
+            Section::Review => &self.review_state,
+            Section::Mine => &self.mine_state,
+            Section::All => &self.all_state,
         }
     }
 
+    pub fn table_state_mut(&mut self, section: Section) -> &mut TableState {
+        match section {
+            Section::Review => &mut self.review_state,
+            Section::Mine => &mut self.mine_state,
+            Section::All => &mut self.all_state,
+        }
+    }
+
+    pub fn state_mut(&mut self) -> &mut TableState {
+        self.table_state_mut(self.section)
+    }
+
     pub fn selected(&self) -> Option<&MergeRequest> {
-        let state = match self.section {
-            Section::Review => &self.review_state,
-            Section::Mine => &self.mine_state,
-        };
         let rows = self.rows(self.section);
-        state.selected().and_then(|i| rows.get(i).copied())
+        self.table_state(self.section)
+            .selected()
+            .and_then(|i| rows.get(i).copied())
     }
 
     fn refresh(&mut self) {
@@ -454,8 +519,9 @@ impl App {
         self.loading = true;
         let tx = self.tx.clone();
         let host = self.config.gitlab_host.clone();
+        let all_of = self.scoped_project().cloned();
         std::thread::spawn(move || {
-            let _ = tx.send(forge::fetch_all(&host));
+            let _ = tx.send(forge::fetch_all(&host, all_of.as_ref()));
         });
     }
 
@@ -937,6 +1003,12 @@ impl App {
                     self.error = fetched.warning;
                     self.updated_at = Some(Instant::now());
                     self.clamp_selection();
+                    // `a` was pressed while loading: "All" is for the other
+                    // scope. Only after an answer, so a failing forge is not
+                    // asked again at once, over and over.
+                    if self.all_list().is_none() {
+                        self.next_refresh = Instant::now();
+                    }
                 }
                 Err(e) => self.error = Some(e),
             }
@@ -947,10 +1019,7 @@ impl App {
     fn clamp_selection(&mut self) {
         for section in Section::ORDER {
             let len = self.rows(section).len();
-            let state = match section {
-                Section::Review => &mut self.review_state,
-                Section::Mine => &mut self.mine_state,
-            };
+            let state = self.table_state_mut(section);
             match (len, state.selected()) {
                 (0, _) => state.select(None),
                 (_, None) => state.select(Some(0)),
@@ -977,11 +1046,8 @@ impl App {
         self.select(if to_end { len - 1 } else { 0 });
     }
 
-    fn switch_section(&mut self) {
-        self.section = match self.section {
-            Section::Review => Section::Mine,
-            Section::Mine => Section::Review,
-        };
+    fn switch_section(&mut self, forward: bool) {
+        self.section = self.section.step(forward);
     }
 
     fn say(&mut self, text: impl Into<String>) {
@@ -1059,9 +1125,15 @@ impl App {
             Scope::Current => Scope::All,
             Scope::All => Scope::Current,
         };
-        self.review_state.select(Some(0));
-        self.mine_state.select(Some(0));
+        for section in Section::ORDER {
+            self.table_state_mut(section).select(Some(0));
+        }
         self.clamp_selection();
+        // "All" lists other merge requests per scope: load them now (the
+        // main loop starts it; one already running is followed by another).
+        if self.all_list().is_none() {
+            self.next_refresh = Instant::now();
+        }
     }
 
     /// Switches between Nerd Font icons and plain symbols, and keeps the
@@ -1209,12 +1281,8 @@ impl App {
             KeyCode::PageUp => self.move_by(-10),
             KeyCode::Home | KeyCode::Char('g') => self.jump(false),
             KeyCode::End | KeyCode::Char('G') => self.jump(true),
-            KeyCode::Tab
-            | KeyCode::BackTab
-            | KeyCode::Left
-            | KeyCode::Right
-            | KeyCode::Char('h')
-            | KeyCode::Char('l') => self.switch_section(),
+            KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => self.switch_section(true),
+            KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => self.switch_section(false),
             KeyCode::Char(c @ '1'..='9') => {
                 if let Some(section) = Section::numbered(c) {
                     self.section = section;
@@ -1271,6 +1339,7 @@ impl App {
 mod tests {
     use super::*;
     use crate::model::{Pipeline, ReviewState};
+    use crate::view::SortKey;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -1324,9 +1393,36 @@ mod tests {
         app.data = Some(Data {
             review: (1..=3).map(sample_mr).collect(),
             mine: (4..=6).map(sample_mr).collect(),
+            all: Some(AllList {
+                of: None,
+                items: all_rows(),
+                total: 4,
+                newest: 4,
+                error: None,
+            }),
         });
         app.clamp_selection();
         app
+    }
+
+    /// "All" of `acme/app`, newest first: someone else's that I do not
+    /// review (8), mine (7), one I review (1) and one I approved (2).
+    fn all_rows() -> Vec<MergeRequest> {
+        let mut other = sample_mr(8);
+        other.author = "sam".into();
+        other.reviewers.clear();
+        let mut own = sample_mr(7);
+        own.author = "me".into();
+        own.reviewers.clear();
+        own.threads_open = 1;
+        let mut approved = sample_mr(2);
+        approved.reviewers[0].state = ReviewState::Approved;
+        approved.approved_by = vec!["me".into()];
+        vec![other, own, approved, sample_mr(1)]
+    }
+
+    fn iids(rows: &[&MergeRequest]) -> Vec<u64> {
+        rows.iter().map(|mr| mr.iid).collect()
     }
 
     fn press(app: &mut App, code: KeyCode) {
@@ -1444,29 +1540,182 @@ mod tests {
         assert_eq!(app.section, Section::Mine);
         press(&mut app, KeyCode::Char('2'));
         assert_eq!(app.section, Section::Review);
-        // Other digits change nothing.
         press(&mut app, KeyCode::Char('3'));
-        assert_eq!(app.section, Section::Review);
+        assert_eq!(app.section, Section::All);
+        // Other digits change nothing.
+        press(&mut app, KeyCode::Char('4'));
+        assert_eq!(app.section, Section::All);
     }
 
     #[test]
-    fn switch_keys_toggle_between_the_sections() {
-        let keys = [
-            KeyCode::Tab,
-            KeyCode::BackTab,
-            KeyCode::Left,
-            KeyCode::Right,
-            KeyCode::Char('h'),
-            KeyCode::Char('l'),
-        ];
-        for key in keys {
+    fn switch_keys_step_through_the_sections_and_wrap() {
+        for key in [KeyCode::Tab, KeyCode::Right, KeyCode::Char('l')] {
             let mut app = app();
             assert_eq!(app.section, Section::Mine);
-            press(&mut app, key);
-            assert_eq!(app.section, Section::Review, "{key:?}");
-            press(&mut app, key);
-            assert_eq!(app.section, Section::Mine, "{key:?}");
+            let mut seen = Vec::new();
+            for _ in 0..3 {
+                press(&mut app, key);
+                seen.push(app.section);
+            }
+            assert_eq!(
+                seen,
+                [Section::Review, Section::All, Section::Mine],
+                "{key:?}"
+            );
         }
+        for key in [KeyCode::BackTab, KeyCode::Left, KeyCode::Char('h')] {
+            let mut app = app();
+            let mut seen = Vec::new();
+            for _ in 0..3 {
+                press(&mut app, key);
+                seen.push(app.section);
+            }
+            assert_eq!(
+                seen,
+                [Section::All, Section::Review, Section::Mine],
+                "{key:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn all_lists_everyones_including_mine_and_the_ones_i_review() {
+        let app = app();
+        assert_eq!(iids(&app.rows(Section::All)), [8, 7, 2, 1]);
+    }
+
+    #[test]
+    fn all_is_shown_only_for_the_scope_it_was_loaded_for() {
+        let mut app = app_in_clone(std::path::Path::new("/nowhere"));
+        // Loaded for "your projects", shown is "this project".
+        assert!(app.all_list().is_none());
+        assert!(app.rows(Section::All).is_empty());
+        // A refresh is running; `a` asks for the next one at once.
+        app.loading = true;
+        app.next_refresh = Instant::now() + Duration::from_secs(60);
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(app.scope, Scope::All);
+        assert_eq!(iids(&app.rows(Section::All)), [8, 7, 2, 1]);
+        assert!(app.next_refresh > Instant::now(), "loaded for this scope");
+        press(&mut app, KeyCode::Char('a'));
+        assert!(app.all_list().is_none(), "this project needs its own list");
+        assert!(app.next_refresh <= Instant::now(), "refresh at once");
+        // The answer for this project arrives.
+        let mut data = app.data.clone().unwrap();
+        data.all = Some(AllList {
+            of: app.project.clone(),
+            items: vec![sample_mr(9)],
+            total: 1,
+            newest: 1,
+            error: None,
+        });
+        app.tx
+            .send(Ok(Fetched {
+                data,
+                warning: None,
+            }))
+            .unwrap();
+        app.receive();
+        assert!(
+            app.next_refresh > Instant::now(),
+            "no second refresh: it fits the scope"
+        );
+        assert_eq!(iids(&app.rows(Section::All)), [9]);
+    }
+
+    #[test]
+    fn an_answer_for_the_old_scope_loads_again_at_once() {
+        let mut app = app_in_clone(std::path::Path::new("/nowhere"));
+        app.scope = Scope::All;
+        // A refresh for "your projects" runs when `a` switches to this project.
+        app.loading = true;
+        press(&mut app, KeyCode::Char('a'));
+        let data = app.data.clone().unwrap();
+        assert_eq!(data.all.as_ref().unwrap().of, None);
+        app.tx
+            .send(Ok(Fetched {
+                data,
+                warning: None,
+            }))
+            .unwrap();
+        app.receive();
+        assert!(!app.loading);
+        assert!(
+            app.next_refresh <= Instant::now(),
+            "the list for this project loads at once"
+        );
+    }
+
+    #[test]
+    fn a_failed_refresh_after_a_does_not_retry_at_once() {
+        let mut app = app_in_clone(std::path::Path::new("/nowhere"));
+        assert!(app.all_list().is_none(), "All is for the other scope");
+        app.loading = true;
+        app.tx.send(Err("glab: no network".into())).unwrap();
+        app.receive();
+        assert!(
+            app.next_refresh > Instant::now(),
+            "waits for the next refresh"
+        );
+        assert_eq!(app.error.as_deref(), Some("glab: no network"));
+    }
+
+    #[test]
+    fn all_follows_search_filter_sort_and_clear() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('3'));
+        // Search.
+        app.filter = "change 7".into();
+        assert_eq!(iids(&app.rows(Section::All)), [7]);
+        press(&mut app, KeyCode::Char('x'));
+        assert_eq!(iids(&app.rows(Section::All)), [8, 7, 2, 1]);
+        // Quick filter: needs me keeps mine with a thread and the one I
+        // have not reviewed yet.
+        press(&mut app, KeyCode::Char('f'));
+        assert_eq!(app.show, Show::NeedsMe);
+        assert_eq!(iids(&app.rows(Section::All)), [7, 1]);
+        press(&mut app, KeyCode::Char('x'));
+        // Sort by number, by clicking its heading the same way `s` does.
+        app.sort_by(SortKey::Number);
+        assert_eq!(iids(&app.rows(Section::All)), [8, 7, 2, 1]);
+        app.sort_by(SortKey::Number);
+        assert_eq!(iids(&app.rows(Section::All)), [1, 2, 7, 8]);
+        // The selection and the details panel act on the row shown.
+        app.select(1);
+        assert_eq!(app.selected().map(|mr| mr.iid), Some(2));
+        press(&mut app, KeyCode::Char('p'));
+        assert!(app.details);
+    }
+
+    #[test]
+    fn actions_in_all_keep_their_rules() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('3'));
+        // 8 is someone else's: approving asks first, draft is refused.
+        press(&mut app, KeyCode::Char('w'));
+        assert_eq!(
+            flash(&app),
+            Some("Only your own merge requests can be set to draft or ready here")
+        );
+        press(&mut app, KeyCode::Char('v'));
+        assert_eq!(
+            app.confirm.as_ref().map(|c| c.action),
+            Some(Action::Approve)
+        );
+        press(&mut app, KeyCode::Char('n'));
+        assert!(app.confirm.is_none());
+        // Merging waits for the forge.
+        press(&mut app, KeyCode::Char('m'));
+        assert!(flash(&app).unwrap().starts_with("Cannot merge !8"));
+        assert!(app.confirm.is_none());
+        // 7 is my own: no approval.
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Char('v'));
+        assert_eq!(
+            flash(&app),
+            Some("You cannot approve your own merge request")
+        );
+        assert!(app.confirm.is_none());
     }
 
     #[test]
@@ -1490,9 +1739,12 @@ mod tests {
         };
         let (mine_x, mine_y) = find(" Mine 3 ");
         let (review_x, review_y) = find(" To review 3 ");
-        assert!(mine_x < review_x);
+        let (all_x, all_y) = find(" All 4 ");
+        assert!(mine_x < review_x && review_x < all_x);
         click(&mut app, review_x, review_y);
         assert_eq!(app.section, Section::Review);
+        click(&mut app, all_x, all_y);
+        assert_eq!(app.section, Section::All);
         click(&mut app, mine_x, mine_y);
         assert_eq!(app.section, Section::Mine);
     }

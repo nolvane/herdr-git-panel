@@ -8,6 +8,12 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- A third section "All" lists every open merge request or pull request of
+  the project, also other people's where you are not a reviewer; with "all
+  projects" those of the projects you are a member of. `3` selects it, and
+  `Tab` `→` `l` and `Shift+Tab` `←` `h` now step forward and back through
+  the three sections (#6).
+
 - `b` fetches the branch of the selected merge request or pull request and
   opens it in a new Herdr workspace (a git worktree Herdr creates), without
   touching the current checkout; forks open through the merge request's own

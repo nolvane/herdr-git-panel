@@ -18,12 +18,11 @@ const SEARCHES: [(&str, &str); 3] = [
     ("mine", "author:@me"),
 ];
 
-/// `KEY` and `TERMS` are replaced per search.
-const QUERY: &str = r#"
-query {
-  viewer { login }
-  KEY: search(query: "is:open is:pr archived:false TERMS", type: ISSUE, first: 30) { nodes { ...pr } }
-}
+/// The fields the list shows of a pull request, for every query that loads
+/// pull requests.
+macro_rules! pr_fragment {
+    () => {
+        r#"
 fragment pr on PullRequest {
   number title body url isDraft createdAt updatedAt headRefName baseRefName headRefOid isCrossRepository
   repository { nameWithOwner viewerDefaultMergeMethod }
@@ -37,7 +36,227 @@ fragment pr on PullRequest {
   commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
   additions deletions
 }
+"#
+    };
+}
+
+/// `KEY` and `TERMS` are replaced per search.
+const QUERY: &str = concat!(
+    r#"
+query {
+  viewer { login }
+  KEY: search(query: "is:open is:pr archived:false TERMS", type: ISSUE, first: 30) { nodes { ...pr } }
+}
+"#,
+    pr_fragment!()
+);
+
+/// How many pull requests "All" loads, newest first: as many as one search
+/// above, since GitHub works out mergeability for each.
+pub const ALL_LIMIT: usize = 30;
+
+/// "All" in one repository: its open pull requests, newest first, with the
+/// number open in all.
+const REPO_ALL: &str = concat!(
+    r#"
+query($owner: String!, $name: String!) {
+  viewer { login }
+  repository(owner: $owner, name: $name) {
+    nameWithOwner
+    pullRequests(states: OPEN, first: 30, orderBy: {field: UPDATED_AT, direction: DESC}) { totalCount nodes { ...pr } }
+  }
+}
+"#,
+    pr_fragment!()
+);
+
+/// "All" in your repositories, first step: the ones you own, collaborate on
+/// or that belong to an organization you are a member of, most recently
+/// pushed first, with the ids and update times of their newest open pull
+/// requests but none of their details.
+const MEMBER_REPOS: &str = r#"
+query {
+  viewer {
+    repositories(first: 100, affiliations: [OWNER, COLLABORATOR, ORGANIZATION_MEMBER], ownerAffiliations: [OWNER, COLLABORATOR, ORGANIZATION_MEMBER], isArchived: false, orderBy: {field: PUSHED_AT, direction: DESC}) {
+      nodes {
+        nameWithOwner
+        pullRequests(states: OPEN, first: 30, orderBy: {field: UPDATED_AT, direction: DESC}) { totalCount nodes { id updatedAt } }
+      }
+    }
+  }
+}
 "#;
+
+/// What the second step of "All" in your repositories loads.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemberPick {
+    /// The newest [`ALL_LIMIT`] open pull requests.
+    pub ids: Vec<String>,
+    /// Open pull requests in all those repositories.
+    pub total: u64,
+    /// Every repository of the answer (`owner/name`).
+    pub repos: Vec<String>,
+}
+
+/// The ids of the newest `limit` open pull requests in the first step's
+/// answer, and how many are open in all.
+/// GitHub answers with errors next to the data the token may see, for
+/// example for an organization whose single sign-on the gh login is not
+/// authorized for; those repositories are then simply left out.
+pub fn pick_members(value: &Value, limit: usize) -> Result<MemberPick, String> {
+    if value.pointer("/data/viewer/repositories/nodes").is_none() {
+        if let Some(msg) = cli::graphql_errors(value) {
+            return Err(format!("GitHub: {msg}"));
+        }
+    }
+    let mut total = 0;
+    let mut found: Vec<(i64, String)> = Vec::new();
+    let mut repos = Vec::new();
+    for r in value
+        .pointer("/data/viewer/repositories/nodes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if r.is_null() {
+            continue;
+        }
+        repos.push(str_of(&r["nameWithOwner"]));
+        total += r["pullRequests"]["totalCount"].as_u64().unwrap_or(0);
+        for n in r["pullRequests"]["nodes"].as_array().into_iter().flatten() {
+            let id = str_of(&n["id"]);
+            if !id.is_empty() {
+                let at = n["updatedAt"].as_str().and_then(time::parse_iso);
+                found.push((at.unwrap_or(0), id));
+            }
+        }
+    }
+    found.sort_by_key(|a| std::cmp::Reverse(a.0));
+    found.truncate(limit);
+    Ok(MemberPick {
+        ids: found.into_iter().map(|(_, id)| id).collect(),
+        total,
+        repos,
+    })
+}
+
+/// The second step: these pull requests in full. The ids come from GitHub's
+/// own answer and go in as JSON strings, which are valid GraphQL strings.
+pub fn nodes_query(ids: &[String]) -> String {
+    let list = ids
+        .iter()
+        .map(|id| serde_json::to_string(id).unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "query {{ viewer {{ login }} nodes(ids: [{list}]) {{ ...pr }} }}\n{}",
+        pr_fragment!()
+    )
+}
+
+/// "All": every open pull request of `repo` (`owner/name`), or of your
+/// repositories when it is `None`, newest first, at most [`ALL_LIMIT`].
+/// `Ok(None)` when gh is not logged in.
+pub fn fetch_all_of(repo: Option<&str>) -> Result<Option<AllPart>, String> {
+    let fetched = match repo {
+        Some(repo) => fetch_repo_all(repo),
+        None => fetch_member_all(),
+    };
+    match fetched {
+        Ok(part) => Ok(Some(part)),
+        Err(Failure::NotLoggedIn) => Ok(None),
+        Err(Failure::Other(e)) => Err(e),
+    }
+}
+
+fn fetch_repo_all(repo: &str) -> Result<AllPart, Failure> {
+    let (owner, name) = repo
+        .split_once('/')
+        .ok_or_else(|| Failure::Other("not a GitHub repository".into()))?;
+    let value = graphql(REPO_ALL, &[("owner", owner), ("name", name)])?;
+    Ok(parse_repo_all(&value)?)
+}
+
+/// Two steps: which of your repositories have the newest open pull
+/// requests, then those pull requests in full.
+fn fetch_member_all() -> Result<AllPart, Failure> {
+    let pick = pick_members(&graphql(MEMBER_REPOS, &[])?, ALL_LIMIT)?;
+    let mut part = if pick.ids.is_empty() {
+        AllPart::default()
+    } else {
+        parse_nodes(&graphql(&nodes_query(&pick.ids), &[])?, pick.total)?
+    };
+    part.projects = pick.repos.iter().map(|r| format!("{HOST}/{r}")).collect();
+    Ok(part)
+}
+
+fn viewer_of(value: &Value) -> Result<String, String> {
+    if let Some(msg) = cli::graphql_errors(value) {
+        return Err(format!("GitHub: {msg}"));
+    }
+    let viewer = str_of(&value["data"]["viewer"]["login"]);
+    if viewer.is_empty() {
+        return Err("GitHub did not return a user: run gh auth login".into());
+    }
+    Ok(viewer)
+}
+
+/// Newest first, each pull request once, at most [`ALL_LIMIT`].
+fn newest(nodes: &[Value], viewer: &str, total: u64) -> AllPart {
+    let mut items: Vec<MergeRequest> = Vec::new();
+    for n in nodes {
+        if let Some(pr) = parse_pr(n, viewer) {
+            if !items.iter().any(|p| p.key() == pr.key()) {
+                items.push(pr);
+            }
+        }
+    }
+    items.sort_by_key(|m| std::cmp::Reverse(m.updated));
+    items.truncate(ALL_LIMIT);
+    let total = total.max(items.len() as u64);
+    AllPart {
+        items,
+        total,
+        projects: Vec::new(),
+    }
+}
+
+pub fn parse_repo_all(value: &Value) -> Result<AllPart, String> {
+    let viewer = viewer_of(value)?;
+    let list = &value["data"]["repository"]["pullRequests"];
+    if list.is_null() {
+        return Err(
+            "GitHub did not return the repository: deleted, renamed or not visible to you".into(),
+        );
+    }
+    let nodes = list["nodes"].as_array().cloned().unwrap_or_default();
+    let mut part = newest(&nodes, &viewer, list["totalCount"].as_u64().unwrap_or(0));
+    part.projects = vec![format!(
+        "{HOST}/{}",
+        str_of(&value["data"]["repository"]["nameWithOwner"])
+    )];
+    Ok(part)
+}
+
+/// The second step's answer, with the total from the first.
+/// A pull request that is gone or hidden since the first step comes back
+/// as an error next to the others; it is left out.
+pub fn parse_nodes(value: &Value, total: u64) -> Result<AllPart, String> {
+    let viewer = if value["data"]["nodes"].is_array() {
+        let viewer = str_of(&value["data"]["viewer"]["login"]);
+        if viewer.is_empty() {
+            return Err("GitHub did not return a user: run gh auth login".into());
+        }
+        viewer
+    } else {
+        viewer_of(value)?
+    };
+    let nodes = value["data"]["nodes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    Ok(newest(&nodes, &viewer, total))
+}
 
 /// Whether gh is installed at all; without it GitHub is left out quietly.
 pub fn available() -> bool {
@@ -86,6 +305,12 @@ pub fn fetch() -> Result<Option<Data>, String> {
 enum Failure {
     NotLoggedIn,
     Other(String),
+}
+
+impl From<String> for Failure {
+    fn from(e: String) -> Failure {
+        Failure::Other(e)
+    }
 }
 
 impl From<Failure> for String {
@@ -173,6 +398,7 @@ pub fn parse(value: &Value) -> Result<Data, String> {
     Ok(Data {
         review: list(&["requested", "reviewed"]),
         mine: list(&["mine"]),
+        all: None,
     })
 }
 
@@ -597,6 +823,80 @@ mod tests {
         assert!(a[1].resolvable);
         assert_eq!(a[1].place.as_deref(), Some("src/a.rs:7"));
         assert!(!a[2].resolvable);
+    }
+
+    #[test]
+    fn repo_all_has_everyones_once_with_the_total() {
+        let v = json!({"data": {"viewer": {"login": "me"}, "repository": {"nameWithOwner": "acme/app", "pullRequests": {
+            "totalCount": 54,
+            "nodes": [pr(3, "alex"), pr(4, "me"), pr(5, "sam"), pr(3, "alex")]
+        }}}});
+        let part = parse_repo_all(&v).unwrap();
+        let numbers: Vec<u64> = part.items.iter().map(|m| m.iid).collect();
+        assert_eq!(numbers, [5, 4, 3], "newest first, each once");
+        assert_eq!(part.total, 54);
+        assert!(part.items.iter().all(|m| m.viewer == "me"));
+        assert_eq!(part.projects, ["github.com/acme/app"]);
+    }
+
+    #[test]
+    fn repo_all_without_the_repository_says_so() {
+        let v = json!({"data": {"viewer": {"login": "me"}, "repository": null}});
+        let e = parse_repo_all(&v).unwrap_err();
+        assert!(e.contains("did not return the repository"), "{e}");
+    }
+
+    #[test]
+    fn member_pick_takes_the_newest_ids() {
+        let v = json!({"data": {"viewer": {"repositories": {"nodes": [
+            {"nameWithOwner": "acme/app", "pullRequests": {"totalCount": 40, "nodes": [
+                {"id": "PR_a", "updatedAt": "2026-11-08T09:00:00Z"},
+                {"id": "PR_b", "updatedAt": "2026-11-01T09:00:00Z"}]}},
+            {"nameWithOwner": "acme/docs", "pullRequests": {"totalCount": 0, "nodes": []}},
+            {"nameWithOwner": "acme/lib", "pullRequests": {"totalCount": 1, "nodes": [
+                {"id": "PR_c", "updatedAt": "2026-11-07T09:00:00Z"}]}}
+        ]}}}});
+        let pick = pick_members(&v, 2).unwrap();
+        assert_eq!(pick.ids, ["PR_a", "PR_c"]);
+        assert_eq!(pick.total, 41);
+        assert_eq!(pick.repos, ["acme/app", "acme/docs", "acme/lib"]);
+    }
+
+    #[test]
+    fn errors_next_to_data_leave_only_those_out() {
+        // An organization behind single sign-on: its repository is null.
+        let v = json!({"data": {"viewer": {"repositories": {"nodes": [
+            {"nameWithOwner": "acme/app", "pullRequests": {"totalCount": 1, "nodes": [
+                {"id": "PR_a", "updatedAt": "2026-11-08T09:00:00Z"}]}},
+            null
+        ]}}}, "errors": [{"type": "FORBIDDEN", "message": "SAML enforcement"}]});
+        let pick = pick_members(&v, 30).unwrap();
+        assert_eq!(pick.ids, ["PR_a"]);
+        assert_eq!(pick.repos, ["acme/app"]);
+        // A pull request deleted between the two steps.
+        let v = json!({"data": {"viewer": {"login": "me"}, "nodes": [pr(3, "alex"), null]},
+                       "errors": [{"type": "NOT_FOUND", "message": "gone"}]});
+        assert_eq!(parse_nodes(&v, 2).unwrap().items.len(), 1);
+        // Without data the error is the answer.
+        let e = pick_members(&json!({"errors": [{"message": "boom"}]}), 30).unwrap_err();
+        assert!(e.contains("boom"));
+        let e = parse_nodes(&json!({"errors": [{"message": "boom"}]}), 0).unwrap_err();
+        assert!(e.contains("boom"));
+    }
+
+    #[test]
+    fn nodes_query_names_ids_as_strings() {
+        let q = nodes_query(&["PR_a".to_string(), "PR_\"b".to_string()]);
+        assert!(q.contains(r#"nodes(ids: ["PR_a", "PR_\"b"])"#), "{q}");
+        assert!(q.contains("fragment pr on PullRequest"));
+    }
+
+    #[test]
+    fn nodes_keep_the_first_steps_total() {
+        let v = json!({"data": {"viewer": {"login": "me"}, "nodes": [pr(3, "alex"), {}]}});
+        let part = parse_nodes(&v, 41).unwrap();
+        assert_eq!(part.items.len(), 1);
+        assert_eq!(part.total, 41);
     }
 
     #[test]

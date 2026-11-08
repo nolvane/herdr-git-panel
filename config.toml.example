@@ -4,7 +4,8 @@
 
 # Which merge requests to show: "current" = only the project of the directory
 # the list is opened from (all projects when it is not a GitLab repository),
-# "all" = every project. Press a in the list to switch.
+# "all" = every project ("All" then lists the projects you are a member of).
+# Press a in the list to switch.
 scope = "current"
 
 # Seconds between automatic refreshes (10 to 3600). Press r to refresh now.

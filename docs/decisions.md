@@ -345,3 +345,51 @@ forge and never touches the current checkout.
 - Branch names from the forge go to `git` and `herdr` as arguments without a
   shell; names git would not accept, above all ones starting with `-`, are
   refused first.
+
+## 2026-11-08: "All" loads per scope, in at most two small steps
+
+The third section "All" lists every open merge request of the current
+project, or with "all projects" (and outside a project) those of the
+projects you are a member of (the owner's decision on #6). It is loaded with
+the other lists, for the scope shown only; `a` loads it again for the other
+scope instead of loading both every minute. The other two sections switch at
+once as before.
+
+- This project: one request to the forge the project lives on,
+  `project(fullPath) { mergeRequests }` on GitLab (complexity about 140 of
+  250) and `repository { pullRequests }` on GitHub, newest first, with the
+  forge's own count for "newest 30 of 54" in the footer.
+- Your projects, GitLab: `projects(membership: true)`, the 100 most recently
+  active, with only the update times of their open merge requests
+  (complexity about 30), then the newest 100 in full through
+  `projects(fullPaths) { mergeRequests(updatedAfter) }`, one second before
+  the oldest one picked so ties at the cut stay (projects with a tie are
+  asked too). Each project in that second
+  request adds about 1.4 to the complexity, so at most 50 go in one request
+  (about 205). GitLab's top-level `mergeRequests` query is an experiment
+  since 19.3 and needs a filter, so it is not used.
+- Your repositories, GitHub: `viewer.repositories` with the affiliations
+  owner, collaborator and organization member, the 100 most recently pushed,
+  with ids and update times of their newest open pull requests, then the
+  newest 30 in full through `nodes(ids)`. 30 like every other GitHub list:
+  more in one request makes GitHub answer 502. A search with `repo:`
+  qualifiers is limited to 256 characters, a handful of repositories.
+- The lists of ids and paths go into the second query as JSON strings, which
+  are valid GraphQL strings, because `glab -f` and `gh -f` only send strings
+  as variables; single values stay variables.
+- Your own and the ones you review in the covered projects are added from
+  the other two lists, so they are in "All" also when they are older than
+  the cut. "newest N of M" counts only the forges' newest, not these.
+- GitHub answers with errors next to the data the login may see (an
+  organization behind single sign-on, a pull request gone between the two
+  steps); those are left out instead of failing "All".
+- A project whose forge could not be asked at all (its tool missing or not
+  logged in) shows that, not "No open merge requests".
+- With both forges each is cut at its own limit, so "newest 130 of 194" means
+  the newest of each. Projects beyond the 100 most active are neither shown
+  nor counted.
+- "All" failing leaves the other lists: the footer says "All: …" and the
+  section shows the error.
+- One or two more small read requests per forge a minute through the
+  official APIs under the user's own login is ordinary use under GitLab's
+  and GitHub's terms, as for the other lists.

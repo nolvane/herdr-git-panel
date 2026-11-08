@@ -6,15 +6,11 @@ use crate::model::*;
 use crate::time;
 use serde_json::Value;
 
-/// One list per request: both in one query exceed GitLab's complexity limit
-/// (250). `LIST` is replaced by the list's field name.
-const QUERY: &str = r#"
-query {
-  currentUser {
-    username
-    LIST(state: opened, first: 100) { nodes { ...mr } }
-  }
-}
+/// The fields the list shows of a merge request, for every query that loads
+/// merge requests.
+macro_rules! mr_fragment {
+    () => {
+        r#"
 fragment mr on MergeRequest {
   iid title description webUrl draft createdAt updatedAt sourceBranch targetBranch diffHeadSha
   sourceProjectId targetProjectId
@@ -30,7 +26,237 @@ fragment mr on MergeRequest {
   headPipeline { status }
   diffStatsSummary { additions deletions }
 }
+"#
+    };
+}
+
+/// One list per request: both in one query exceed GitLab's complexity limit
+/// (250). `LIST` is replaced by the list's field name.
+const QUERY: &str = concat!(
+    r#"
+query {
+  currentUser {
+    username
+    LIST(state: opened, first: 100) { nodes { ...mr } }
+  }
+}
+"#,
+    mr_fragment!()
+);
+
+/// How many merge requests "All" loads, newest first: GitLab's largest page.
+pub const ALL_LIMIT: usize = 100;
+
+/// "All" in one project: its open merge requests, newest first, with the
+/// number open in all. Complexity about 140 of 250.
+const PROJECT_ALL: &str = concat!(
+    r#"
+query($project: ID!) {
+  currentUser { username }
+  project(fullPath: $project) {
+    fullPath
+    mergeRequests(state: opened, first: 100, sort: UPDATED_DESC) { count nodes { ...mr } }
+  }
+}
+"#,
+    mr_fragment!()
+);
+
+/// "All" in your projects, first step: the projects you are a member of,
+/// most recently active first, with when their open merge requests were
+/// updated, but none of their details (complexity about 30).
+const MEMBER_PROJECTS: &str = r#"
+query {
+  projects(membership: true, archived: EXCLUDE, withMergeRequestsEnabled: true, sort: "latest_activity_desc", first: 100) {
+    nodes {
+      fullPath
+      mergeRequests(state: opened, first: 100, sort: UPDATED_DESC) { count nodes { updatedAt } }
+    }
+  }
+}
 "#;
+
+/// Projects per request in the second step: each one adds about 1.4 to the
+/// complexity, 50 come to about 205 of 250.
+const PROJECTS_PER_REQUEST: usize = 50;
+
+/// What the second step of "All" in your projects loads.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemberPick {
+    /// The projects that hold the newest [`ALL_LIMIT`] open merge requests.
+    pub paths: Vec<String>,
+    /// Load only merge requests updated after this (ISO 8601), when there
+    /// are more than the limit: one second before the oldest one picked, so
+    /// ties at the cut are not lost.
+    pub after: Option<String>,
+    /// Open merge requests in all those projects.
+    pub total: u64,
+    /// Every project of the answer, also those without open merge requests.
+    pub members: Vec<String>,
+}
+
+/// Picks the newest `limit` open merge requests from the first step's
+/// answer.
+pub fn pick_members(value: &Value, limit: usize) -> Result<MemberPick, String> {
+    if let Some(msg) = cli::graphql_errors(value) {
+        return Err(format!("GitLab: {msg}"));
+    }
+    let mut total = 0;
+    let mut times: Vec<(i64, String)> = Vec::new();
+    let mut members = Vec::new();
+    for p in value
+        .pointer("/data/projects/nodes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let path = str_of(&p["fullPath"]);
+        members.push(path.clone());
+        total += num_of(&p["mergeRequests"]["count"]);
+        for n in p["mergeRequests"]["nodes"].as_array().into_iter().flatten() {
+            if let Some(t) = n["updatedAt"].as_str().and_then(time::parse_iso) {
+                times.push((t, path.clone()));
+            }
+        }
+    }
+    times.sort_by_key(|a| std::cmp::Reverse(a.0));
+    let cut = total > limit as u64 || times.len() > limit;
+    // The update time of the oldest one picked; projects with one as new
+    // (a tie at the cut) are asked too.
+    let oldest = times
+        .get(limit.min(times.len()).saturating_sub(1))
+        .map(|t| t.0);
+    let after = oldest.filter(|_| cut).map(|t| time::iso(t - 1));
+    let mut paths: Vec<String> = Vec::new();
+    for (_, path) in times.into_iter().take_while(|t| Some(t.0) >= oldest) {
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+    Ok(MemberPick {
+        paths,
+        after,
+        total,
+        members,
+    })
+}
+
+/// The second step: the merge requests of these projects, from `after` on.
+/// Paths and time come from GitLab's own answer and go in as JSON strings,
+/// which are valid GraphQL strings.
+pub fn member_query(paths: &[String], after: Option<&str>) -> String {
+    let list = paths
+        .iter()
+        .map(|p| serde_json::to_string(p).unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let after = after
+        .map(|t| {
+            format!(
+                ", updatedAfter: {}",
+                serde_json::to_string(t).unwrap_or_default()
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        "query {{ currentUser {{ username }} projects(fullPaths: [{list}], first: {}) {{ nodes {{ mergeRequests(state: opened{after}, first: 100, sort: UPDATED_DESC) {{ nodes {{ ...mr }} }} }} }} }}\n{}",
+        paths.len(),
+        mr_fragment!()
+    )
+}
+
+/// "All": every open merge request of `project`, or of the projects you are
+/// a member of when it is `None`, newest first, at most [`ALL_LIMIT`].
+pub fn fetch_all_of(host: &str, project: Option<&str>) -> Result<AllPart, String> {
+    if let Some(path) = project {
+        let value = graphql(host, PROJECT_ALL, &[("project", path)])?;
+        return parse_project_all(&value, host);
+    }
+    let pick = pick_members(&graphql(host, MEMBER_PROJECTS, &[])?, ALL_LIMIT)?;
+    let answers: Vec<Result<Value, String>> = std::thread::scope(|scope| {
+        let runs: Vec<_> = pick
+            .paths
+            .chunks(PROJECTS_PER_REQUEST)
+            .map(|chunk| {
+                let query = member_query(chunk, pick.after.as_deref());
+                scope.spawn(move || graphql(host, &query, &[]))
+            })
+            .collect();
+        runs.into_iter()
+            .map(|r| r.join().unwrap_or_else(|_| Err("glab crashed".into())))
+            .collect()
+    });
+    let mut items = Vec::new();
+    for answer in answers {
+        items.extend(parse_members(&answer?, host)?);
+    }
+    let mut part = newest(items, pick.total, ALL_LIMIT);
+    part.projects = pick.members.iter().map(|p| format!("{host}/{p}")).collect();
+    Ok(part)
+}
+
+/// Newest first, each merge request once, at most `limit`.
+fn newest(mut items: Vec<MergeRequest>, total: u64, limit: usize) -> AllPart {
+    items.sort_by_key(|m| std::cmp::Reverse(m.updated));
+    let mut seen = std::collections::HashSet::new();
+    items.retain(|m| seen.insert(m.key()));
+    items.truncate(limit);
+    let total = total.max(items.len() as u64);
+    AllPart {
+        items,
+        total,
+        projects: Vec::new(),
+    }
+}
+
+fn viewer_of(value: &Value) -> Result<String, String> {
+    let viewer = str_of(&value["data"]["currentUser"]["username"]);
+    if viewer.is_empty() {
+        return Err("GitLab did not return a user: run glab auth login".into());
+    }
+    Ok(viewer)
+}
+
+pub fn parse_project_all(value: &Value, host: &str) -> Result<AllPart, String> {
+    if let Some(msg) = cli::graphql_errors(value) {
+        return Err(format!("GitLab: {msg}"));
+    }
+    let viewer = viewer_of(value)?;
+    let list = &value["data"]["project"]["mergeRequests"];
+    if list.is_null() {
+        return Err(
+            "GitLab did not return the project: deleted, renamed or not visible to you".into(),
+        );
+    }
+    let items = list["nodes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|n| parse_mr(n, host, &viewer))
+        .collect();
+    let mut part = newest(items, num_of(&list["count"]), ALL_LIMIT);
+    part.projects = vec![format!(
+        "{host}/{}",
+        str_of(&value["data"]["project"]["fullPath"])
+    )];
+    Ok(part)
+}
+
+/// The merge requests of the second step's answer.
+pub fn parse_members(value: &Value, host: &str) -> Result<Vec<MergeRequest>, String> {
+    if let Some(msg) = cli::graphql_errors(value) {
+        return Err(format!("GitLab: {msg}"));
+    }
+    let viewer = viewer_of(value)?;
+    Ok(value
+        .pointer("/data/projects/nodes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .flat_map(|p| p["mergeRequests"]["nodes"].as_array().into_iter().flatten())
+        .filter_map(|n| parse_mr(n, host, &viewer))
+        .collect())
+}
 
 pub fn fetch(host: &str) -> Result<Data, String> {
     // Both lists at the same time.
@@ -267,6 +493,7 @@ pub fn parse(value: &Value, host: &str) -> Result<Data, String> {
     Ok(Data {
         review: list("reviewRequestedMergeRequests"),
         mine: list("authoredMergeRequests"),
+        all: None,
     })
 }
 
@@ -513,6 +740,136 @@ mod tests {
         assert_eq!(a[0].id, "gid://gitlab/Discussion/abc");
         assert_eq!(a[0].notes.len(), 2);
         assert!(a[1].notes[0].system);
+    }
+
+    /// A merge request node of `project` by `author`, updated at `at`.
+    fn node(iid: u64, project: &str, author: &str, reviewer: Option<&str>, at: &str) -> Value {
+        let reviewers: Vec<Value> = reviewer
+            .map(|r| json!({"username": r, "mergeRequestInteraction": {"reviewState": "UNREVIEWED"}}))
+            .into_iter()
+            .collect();
+        json!({"iid": iid.to_string(), "title": format!("Change {iid}"), "webUrl": format!("https://gitlab.com/{project}/-/merge_requests/{iid}"),
+               "draft": false, "updatedAt": at, "project": {"fullPath": project}, "author": {"username": author},
+               "approved": false, "approvalsRequired": 0, "approvedBy": {"nodes": []},
+               "reviewers": {"nodes": reviewers}, "detailedMergeStatus": "NOT_APPROVED",
+               "resolvableDiscussionsCount": 0, "resolvedDiscussionsCount": 0,
+               "labels": {"nodes": []}, "headPipeline": null, "diffStatsSummary": null})
+    }
+
+    #[test]
+    fn project_all_has_everyones_once_with_the_total() {
+        let v = json!({"data": {"currentUser": {"username": "me"}, "project": {"fullPath": "acme/app", "mergeRequests": {"count": 154, "nodes": [
+            node(3, "acme/app", "sam", None, "2026-11-08T07:00:00Z"),
+            node(5, "acme/app", "me", Some("alex"), "2026-11-08T09:00:00Z"),
+            node(4, "acme/app", "alex", Some("me"), "2026-11-08T08:00:00Z"),
+            node(3, "acme/app", "sam", None, "2026-11-08T07:00:00Z")
+        ]}}}});
+        let part = parse_project_all(&v, "gitlab.com").unwrap();
+        let iids: Vec<u64> = part.items.iter().map(|m| m.iid).collect();
+        assert_eq!(iids, [5, 4, 3], "newest first, each once");
+        assert_eq!(part.total, 154, "GitLab's own count");
+        assert_eq!(part.projects, ["gitlab.com/acme/app"]);
+        assert!(part.items.iter().all(|m| m.viewer == "me"));
+        assert_eq!(part.items[1].review_of("me"), Some(ReviewState::Unreviewed));
+    }
+
+    #[test]
+    fn project_all_without_the_project_says_so() {
+        let v = json!({"data": {"currentUser": {"username": "me"}, "project": null}});
+        let e = parse_project_all(&v, "gitlab.com").unwrap_err();
+        assert!(e.contains("did not return the project"), "{e}");
+        let e =
+            parse_project_all(&json!({"errors": [{"message": "boom"}]}), "gitlab.com").unwrap_err();
+        assert!(e.contains("boom"));
+    }
+
+    /// The first step's answer: projects with the update times of their
+    /// open merge requests.
+    fn members(projects: &[(&str, u64, &[&str])]) -> Value {
+        let nodes: Vec<Value> = projects
+            .iter()
+            .map(|(path, count, times)| {
+                let mrs: Vec<Value> = times.iter().map(|t| json!({"updatedAt": t})).collect();
+                json!({"fullPath": path, "mergeRequests": {"count": count, "nodes": mrs}})
+            })
+            .collect();
+        json!({"data": {"projects": {"nodes": nodes}}})
+    }
+
+    #[test]
+    fn member_pick_takes_the_newest_across_projects() {
+        let v = members(&[
+            (
+                "acme/app",
+                2,
+                &["2026-11-08T09:00:00Z", "2026-11-01T09:00:00Z"],
+            ),
+            ("acme/lib", 1, &["2026-11-07T09:00:00Z"]),
+            ("acme/docs", 0, &[]),
+            ("acme/web", 1, &["2026-11-05T09:00:00Z"]),
+        ]);
+        let pick = pick_members(&v, 3).unwrap();
+        assert_eq!(pick.paths, ["acme/app", "acme/lib", "acme/web"]);
+        assert_eq!(pick.total, 4);
+        assert_eq!(
+            pick.members,
+            ["acme/app", "acme/lib", "acme/docs", "acme/web"]
+        );
+        // One second before the oldest picked, so ties are kept.
+        assert_eq!(pick.after.as_deref(), Some("2026-11-05T08:59:59Z"));
+    }
+
+    #[test]
+    fn member_pick_loads_everything_under_the_limit() {
+        let v = members(&[(
+            "acme/app",
+            2,
+            &["2026-11-08T09:00:00Z", "2026-11-01T09:00:00Z"],
+        )]);
+        let pick = pick_members(&v, 100).unwrap();
+        assert_eq!(pick.paths, ["acme/app"]);
+        assert_eq!(pick.after, None);
+        assert_eq!(pick.total, 2);
+        // A project with more open than its first page is cut too.
+        let v = members(&[("acme/app", 150, &["2026-11-08T09:00:00Z"])]);
+        assert!(pick_members(&v, 100).unwrap().after.is_some());
+        // A tie at the cut in a project not otherwise picked.
+        let v = members(&[
+            ("acme/app", 1, &["2026-11-08T09:00:00Z"]),
+            ("acme/lib", 1, &["2026-11-07T09:00:00Z"]),
+            ("acme/web", 1, &["2026-11-07T09:00:00Z"]),
+        ]);
+        let pick = pick_members(&v, 2).unwrap();
+        assert_eq!(pick.paths, ["acme/app", "acme/lib", "acme/web"]);
+        let empty = pick_members(&members(&[]), 100).unwrap();
+        assert!(empty.paths.is_empty());
+    }
+
+    #[test]
+    fn member_query_names_projects_and_time_as_strings() {
+        let paths = vec!["acme/app".to_string(), "acme/\"lib".to_string()];
+        let q = member_query(&paths, Some("2026-11-05T08:59:59Z"));
+        assert!(
+            q.contains(r#"fullPaths: ["acme/app", "acme/\"lib"], first: 2"#),
+            "{q}"
+        );
+        assert!(q.contains(r#"updatedAfter: "2026-11-05T08:59:59Z""#), "{q}");
+        assert!(q.contains("fragment mr on MergeRequest"));
+        assert!(!member_query(&paths, None).contains("updatedAfter"));
+    }
+
+    #[test]
+    fn members_parse_from_every_project() {
+        let v = json!({"data": {"currentUser": {"username": "me"}, "projects": {"nodes": [
+            {"mergeRequests": {"nodes": [node(1, "acme/app", "sam", None, "2026-11-08T09:00:00Z")]}},
+            {"mergeRequests": {"nodes": [node(1, "acme/lib", "alex", Some("me"), "2026-11-08T10:00:00Z")]}}
+        ]}}});
+        let items = parse_members(&v, "gitlab.com").unwrap();
+        let projects: Vec<&str> = items.iter().map(|m| m.project.as_str()).collect();
+        assert_eq!(projects, ["acme/app", "acme/lib"]);
+        let part = newest(items, 5, 1);
+        assert_eq!(part.items[0].project, "acme/lib", "newest first, cut");
+        assert_eq!(part.total, 5);
     }
 
     #[test]

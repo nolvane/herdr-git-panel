@@ -148,6 +148,36 @@ impl MergeRequest {
 pub struct Data {
     pub review: Vec<MergeRequest>,
     pub mine: Vec<MergeRequest>,
+    /// The "All" section; `None` until it is loaded.
+    pub all: Option<AllList>,
+}
+
+/// Every open merge request of one project, or of the projects you are a
+/// member of, newest first, as far as one request per forge loads them.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AllList {
+    /// The project it was loaded for; `None` for your projects.
+    pub of: Option<crate::repo::Project>,
+    pub items: Vec<MergeRequest>,
+    /// How many are open in all, as the forges count them; more than
+    /// `newest` when the list was cut.
+    pub total: u64,
+    /// How many of `items` are the forges' newest; the rest are your own
+    /// and the ones you review from past the cut.
+    pub newest: usize,
+    /// A forge that failed to load it.
+    pub error: Option<String>,
+}
+
+/// One forge's part of the "All" list.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AllPart {
+    pub items: Vec<MergeRequest>,
+    pub total: u64,
+    /// The projects it covers, as `host/path` (the first part of
+    /// [`MergeRequest::key`]), so your own and the ones you review there
+    /// can be added when they fall past the cut.
+    pub projects: Vec<String>,
 }
 
 /// One note in a discussion.

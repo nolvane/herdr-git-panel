@@ -55,7 +55,7 @@ impl SortKey {
 pub enum Show {
     All,
     /// To review: not approved by you yet. Mine: something to do (threads,
-    /// failed pipeline, conflict, rebase).
+    /// failed pipeline, conflict, rebase). All: either rule, by row.
     NeedsMe,
     OpenThreads,
     Failing,
@@ -101,6 +101,19 @@ impl Show {
             Show::OpenThreads => mr.threads_open > 0,
             Show::Failing => mr.pipeline == Pipeline::Failed,
             Show::Ready => mr.merge_state == MergeState::Ready,
+        }
+    }
+
+    /// The same in "All", which mixes everyone's: your own by the rule of
+    /// "Mine", ones you review (`reviewing`) by the rule of "To review";
+    /// "needs me" hides everyone else's.
+    pub fn keeps_in_all(self, mr: &MergeRequest, me: &str, reviewing: bool) -> bool {
+        if mr.author == me {
+            self.keeps(mr, me, false)
+        } else if reviewing {
+            self.keeps(mr, me, true)
+        } else {
+            self != Show::NeedsMe && self.keeps(mr, me, false)
         }
     }
 }
@@ -150,7 +163,7 @@ pub fn sort(rows: &mut [&MergeRequest], key: SortKey, descending: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Label, MergeState, Pipeline};
+    use crate::model::{Label, MergeState, Pipeline, ReviewState};
 
     fn mr(iid: u64, title: &str, updated: i64, threads: u64) -> MergeRequest {
         MergeRequest {
@@ -221,5 +234,36 @@ mod tests {
         );
         assert!(!Show::Ready.keeps(&m, "me", false));
         assert_eq!(Show::Ready.next(), Show::All);
+    }
+
+    #[test]
+    fn needs_me_in_all() {
+        use crate::model::Reviewer;
+        let reviewer = |state| Reviewer {
+            username: "me".into(),
+            state,
+        };
+        // Mine with an open thread, mine with nothing to do.
+        let mut own = mr(1, "x", 0, 1);
+        own.author = "me".into();
+        let mut own_done = mr(2, "x", 0, 0);
+        own_done.author = "me".into();
+        // I review: not yet, and approved.
+        let mut asked = mr(3, "x", 0, 0);
+        asked.reviewers = vec![reviewer(ReviewState::Unreviewed)];
+        let mut approved = mr(4, "x", 0, 1);
+        approved.reviewers = vec![reviewer(ReviewState::Approved)];
+        // Someone else's, with an open thread.
+        let other = mr(5, "x", 0, 1);
+        let keeps = |show: Show| -> Vec<u64> {
+            [&own, &own_done, &asked, &approved, &other]
+                .into_iter()
+                .filter(|m| show.keeps_in_all(m, "me", m.review_of("me").is_some()))
+                .map(|m| m.iid)
+                .collect()
+        };
+        assert_eq!(keeps(Show::NeedsMe), [1, 3]);
+        assert_eq!(keeps(Show::All), [1, 2, 3, 4, 5]);
+        assert_eq!(keeps(Show::OpenThreads), [1, 4, 5]);
     }
 }

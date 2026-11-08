@@ -1,13 +1,13 @@
 # Herdr Git Panel
 
 A [Herdr](https://herdr.dev) plugin, written in Rust, that lists your GitLab
-merge requests and GitHub pull requests in a pane: the ones you have to
-review and your own open ones. It uses whichever of `glab` and `gh` is
-installed and logged in; with both, the lists mix GitLab and GitHub, each row
-with its forge's logo.
+merge requests and GitHub pull requests in a pane: your own open ones, the
+ones you have to review, and all open ones of the project. It uses whichever
+of `glab` and `gh` is installed and logged in; with both, the lists mix
+GitLab and GitHub, each row with its forge's logo.
 
 ```
-  Merge requests    Mine 8   To review 2                              ⌕ Search   all projects
+  Merge requests    Mine 8   To review 2   All 14                     ⌕ Search   all projects
 
      Merge request                         Author   Review  CI  Approvals  Threads       Changes  Opened  Updated
     Add payment notices to the contract    @alex      ●     ●   1/2        –             +48 -9   2d      1h
@@ -24,8 +24,8 @@ waiting for approval). The columns:
 
 | Column | Meaning |
 |---|---|
-| Author / Reviewers | Who wrote it (to review), or who reviews it (mine) |
-| Review | Your own review as a dot (to review only): green approved, red changes requested, yellow commented or started, grey not yet |
+| Author / Reviewers | Who wrote it (to review, all), or who reviews it (mine) |
+| Review | Your own review as a dot (to review, and in all only where you review): green approved, red changes requested, yellow commented or started, grey not yet |
 | CI | The pipeline (GitLab) or the checks (GitHub) of the newest commit as a dot: green passed, red failed, yellow running, grey canceled or manual |
 | Approvals | Approvals given of needed (`1/2`); only the number when the forge does not say how many are needed; a check mark once it is approved |
 | Threads | Open threads, or how many were resolved |
@@ -65,6 +65,25 @@ list last refreshed; `?` shows all keys.
 other key keeps it). `Esc` never closes it: it only closes the panel, the
 search or a filter.
 
+## The three sections
+
+- **Mine**: your own open merge requests. The list opens here.
+- **To review**: the ones you are asked to review (on GitHub also the ones
+  you reviewed already).
+- **All**: every open merge request of the project the list was opened in,
+  whoever wrote it and whoever reviews it, your own and the ones you review
+  included. With "all projects" (`a`), or outside a project, it lists the
+  open ones of the projects you are a member of instead: on GitLab the ones
+  you are a member of, on GitHub your own repositories, the ones you
+  collaborate on and those of your organizations.
+
+"All" loads the newest open ones up to what one request gives (100 on
+GitLab, 30 on GitHub, the limits the other lists use); when there are more,
+the footer says how many it shows ("newest 30 of 54"). With "all projects"
+it looks at your 100 most recently active projects on each forge. Since
+"All" lists other merge requests per scope, `a` loads it again, and it shows
+"Loading" for a moment while "Mine" and "To review" switch at once.
+
 ## Search and sort
 
 - `/` searches as you type: every word must appear in the number, title,
@@ -72,7 +91,8 @@ search or a filter.
   it.
 - `f` steps through what is shown: all, needs me (to review: not approved or
   answered by you yet; mine: open threads, failed pipeline, conflict or
-  rebase), open threads, pipeline failed, ready to merge.
+  rebase; all: your own and the ones you review by those rules, nobody
+  else's), open threads, pipeline failed, ready to merge.
 - `s` steps through sort orders (updated, opened, open threads, size, project,
   title). Clicking a column heading sorts by it; a second click turns the
   order round.
@@ -140,7 +160,7 @@ scrolls the details panel when the pointer is over it.
 | Key | What it does |
 |---|---|
 | `↑` `↓` or `j` `k` | Move |
-| `Tab` or `1` `2` | Switch between "Mine" and "To review" |
+| `Tab` `Shift+Tab`, `←` `→`, `h` `l` or `1` `2` `3` | Switch between "Mine", "To review" and "All" |
 | `Enter` or `o` | Open the merge request in the browser |
 | `p` or `Space` | Details panel on or off; `Ctrl+d` `Ctrl+u` scroll it |
 | `d` | Show the changes (diff); `n` `N` next or previous file, `f` file tree, `q` back |
@@ -221,7 +241,7 @@ Changes apply the next time the list opens.
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `scope` | `current` | `current`: only the GitLab project or GitHub repository of the directory the list opens in; `all`: everything |
+| `scope` | `current` | `current`: only the GitLab project or GitHub repository of the directory the list opens in; `all`: everything ("All": your projects) |
 | `refresh_secs` | `60` | Seconds between automatic refreshes |
 | `placement` | `overlay` | `overlay` over the tab, `split` next to the focused pane, or `tab` |
 | `split_direction` | `down` | Where a split goes: `down` (below) or `right` |
@@ -240,7 +260,11 @@ When the list opens, it reads the git remote of its directory from
   for your review, the ones you already reviewed (GitHub drops the review
   request once you review, GitLab keeps you as reviewer) and your own, one
   search each, at the same time (in one request GitHub takes too long to work
-  out mergeability and gives up).
+  out mergeability and gives up);
+- for "All", at the same time: in a project, one request to the forge it
+  lives on for its open merge requests; with "all projects", two small
+  requests per forge, first which of your projects have the newest open
+  ones (only their update times), then those in full.
 
 Comments load when a merge request's activity tab is open. The list only
 writes what you asked for: an approval or taking one back, a merge (both
