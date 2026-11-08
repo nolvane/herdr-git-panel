@@ -1,5 +1,5 @@
-//! GitHub: open pull requests, their review threads, approve, merge and
-//! changes, through the `gh` CLI.
+//! GitHub: open, merged and closed pull requests, their review threads,
+//! approve, merge and changes, through the `gh` CLI.
 
 use crate::cli;
 use crate::model::*;
@@ -24,7 +24,7 @@ macro_rules! pr_fragment {
     () => {
         r#"
 fragment pr on PullRequest {
-  number title body url isDraft createdAt updatedAt headRefName baseRefName headRefOid isCrossRepository
+  number title body url isDraft state createdAt updatedAt headRefName baseRefName headRefOid isCrossRepository
   repository { nameWithOwner viewerDefaultMergeMethod }
   author { login }
   reviewDecision mergeable mergeStateStatus
@@ -40,30 +40,68 @@ fragment pr on PullRequest {
     };
 }
 
-/// `KEY` and `TERMS` are replaced per search.
+/// `KEY` is replaced per search; the search itself goes in as `$q`.
 const QUERY: &str = concat!(
     r#"
-query {
+query($q: String!) {
   viewer { login }
-  KEY: search(query: "is:open is:pr archived:false TERMS", type: ISSUE, first: 30) { nodes { ...pr } }
+  KEY: search(query: $q, type: ISSUE, first: 30) { nodes { ...pr } }
 }
 "#,
     pr_fragment!()
 );
 
+/// What one search asks GitHub: the state, one of [`SEARCHES`]' terms and,
+/// for merged and closed ones of one repository, that repository. Merged and
+/// closed ones come newest updated first, since GitHub's own "best match"
+/// would pick arbitrary old ones among hundreds.
+pub fn search_terms(status: Status, terms: &str, repo: Option<&str>) -> String {
+    let state = match status {
+        Status::Open => "is:open",
+        Status::Merged => "is:merged sort:updated-desc",
+        Status::Closed => "is:closed is:unmerged sort:updated-desc",
+    };
+    let mut search = format!("{state} is:pr archived:false {terms}");
+    if let Some(repo) = repo {
+        search.push_str(&format!(" repo:{repo}"));
+    }
+    search
+}
+
+/// Whether `repo` is a plain `owner/name`, so it cannot add search terms of
+/// its own.
+pub fn plain_repo(repo: &str) -> bool {
+    let ok = |s: &str| {
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    };
+    matches!(repo.split_once('/'), Some((owner, name)) if ok(owner) && ok(name))
+}
+
+/// GitHub's word for the state in `pullRequests(states: …)`.
+fn pr_states(status: Status) -> &'static str {
+    match status {
+        Status::Open => "OPEN",
+        Status::Merged => "MERGED",
+        // GitHub's CLOSED is closed without merging.
+        Status::Closed => "CLOSED",
+    }
+}
+
 /// How many pull requests "All" loads, newest first: as many as one search
 /// above, since GitHub works out mergeability for each.
 pub const ALL_LIMIT: usize = 30;
 
-/// "All" in one repository: its open pull requests, newest first, with the
-/// number open in all.
+/// "All" in one repository: its pull requests in one state (`STATES`),
+/// newest first, with the number in that state in all.
 const REPO_ALL: &str = concat!(
     r#"
 query($owner: String!, $name: String!) {
   viewer { login }
   repository(owner: $owner, name: $name) {
     nameWithOwner
-    pullRequests(states: OPEN, first: 30, orderBy: {field: UPDATED_AT, direction: DESC}) { totalCount nodes { ...pr } }
+    pullRequests(states: STATES, first: 30, orderBy: {field: UPDATED_AT, direction: DESC}) { totalCount nodes { ...pr } }
   }
 }
 "#,
@@ -72,15 +110,15 @@ query($owner: String!, $name: String!) {
 
 /// "All" in your repositories, first step: the ones you own, collaborate on
 /// or that belong to an organization you are a member of, most recently
-/// pushed first, with the ids and update times of their newest open pull
-/// requests but none of their details.
+/// pushed first, with the ids and update times of their newest pull
+/// requests in one state (`STATES`) but none of their details.
 const MEMBER_REPOS: &str = r#"
 query {
   viewer {
     repositories(first: 100, affiliations: [OWNER, COLLABORATOR, ORGANIZATION_MEMBER], ownerAffiliations: [OWNER, COLLABORATOR, ORGANIZATION_MEMBER], isArchived: false, orderBy: {field: PUSHED_AT, direction: DESC}) {
       nodes {
         nameWithOwner
-        pullRequests(states: OPEN, first: 30, orderBy: {field: UPDATED_AT, direction: DESC}) { totalCount nodes { id updatedAt } }
+        pullRequests(states: STATES, first: 30, orderBy: {field: UPDATED_AT, direction: DESC}) { totalCount nodes { id updatedAt } }
       }
     }
   }
@@ -154,13 +192,13 @@ pub fn nodes_query(ids: &[String]) -> String {
     )
 }
 
-/// "All": every open pull request of `repo` (`owner/name`), or of your
-/// repositories when it is `None`, newest first, at most [`ALL_LIMIT`].
-/// `Ok(None)` when gh is not logged in.
-pub fn fetch_all_of(repo: Option<&str>) -> Result<Option<AllPart>, String> {
+/// "All": every pull request in `status` of `repo` (`owner/name`), or of
+/// your repositories when it is `None`, newest first, at most
+/// [`ALL_LIMIT`]. `Ok(None)` when gh is not logged in.
+pub fn fetch_all_of(status: Status, repo: Option<&str>) -> Result<Option<AllPart>, String> {
     let fetched = match repo {
-        Some(repo) => fetch_repo_all(repo),
-        None => fetch_member_all(),
+        Some(repo) => fetch_repo_all(status, repo),
+        None => fetch_member_all(status),
     };
     match fetched {
         Ok(part) => Ok(Some(part)),
@@ -169,18 +207,20 @@ pub fn fetch_all_of(repo: Option<&str>) -> Result<Option<AllPart>, String> {
     }
 }
 
-fn fetch_repo_all(repo: &str) -> Result<AllPart, Failure> {
+fn fetch_repo_all(status: Status, repo: &str) -> Result<AllPart, Failure> {
     let (owner, name) = repo
         .split_once('/')
         .ok_or_else(|| Failure::Other("not a GitHub repository".into()))?;
-    let value = graphql(REPO_ALL, &[("owner", owner), ("name", name)])?;
+    let query = REPO_ALL.replace("STATES", pr_states(status));
+    let value = graphql(&query, &[("owner", owner), ("name", name)])?;
     Ok(parse_repo_all(&value)?)
 }
 
 /// Two steps: which of your repositories have the newest open pull
 /// requests, then those pull requests in full.
-fn fetch_member_all() -> Result<AllPart, Failure> {
-    let pick = pick_members(&graphql(MEMBER_REPOS, &[])?, ALL_LIMIT)?;
+fn fetch_member_all(status: Status) -> Result<AllPart, Failure> {
+    let query = MEMBER_REPOS.replace("STATES", pr_states(status));
+    let pick = pick_members(&graphql(&query, &[])?, ALL_LIMIT)?;
     let mut part = if pick.ids.is_empty() {
         AllPart::default()
     } else {
@@ -263,15 +303,19 @@ pub fn available() -> bool {
     cli::find("gh").is_some()
 }
 
-/// Your pull requests and those you review. `Ok(None)` when gh is not logged
-/// in: then GitHub is simply not used.
-pub fn fetch() -> Result<Option<Data>, String> {
+/// Your pull requests and those you review in `status`, of `repo` only when
+/// it is given. `Ok(None)` when gh is not logged in: then GitHub is simply
+/// not used.
+pub fn fetch(status: Status, repo: Option<&str>) -> Result<Option<Data>, String> {
+    if let Some(repo) = repo.filter(|r| !plain_repo(r)) {
+        return Err(format!("{repo} is not a GitHub repository name"));
+    }
     let answers: Vec<Result<Value, Failure>> = std::thread::scope(|scope| {
         let runs: Vec<_> = SEARCHES
             .iter()
             .map(|(key, terms)| {
-                scope
-                    .spawn(move || graphql(&QUERY.replace("KEY", key).replace("TERMS", terms), &[]))
+                let search = search_terms(status, terms, repo);
+                scope.spawn(move || graphql(&QUERY.replace("KEY", key), &[("q", &search)]))
             })
             .collect();
         runs.into_iter()
@@ -398,6 +442,7 @@ pub fn parse(value: &Value) -> Result<Data, String> {
     Ok(Data {
         review: list(&["requested", "reviewed"]),
         mine: list(&["mine"]),
+        of: None,
         all: None,
     })
 }
@@ -516,6 +561,11 @@ fn parse_pr(n: &Value, viewer: &str) -> Option<MergeRequest> {
         created: n["createdAt"].as_str().and_then(time::parse_iso),
         updated: n["updatedAt"].as_str().and_then(time::parse_iso),
         merge_state,
+        status: match n["state"].as_str() {
+            Some("MERGED") => Status::Merged,
+            Some("CLOSED") => Status::Closed,
+            _ => Status::Open,
+        },
         approvals_given: approved_by.len() as u64,
         approvals_required: n["baseRef"]["branchProtectionRule"]["requiredApprovingReviewCount"]
             .as_u64(),
@@ -802,6 +852,73 @@ mod tests {
         assert_eq!(d.mine[0].iid, 4);
         assert!(!r.from_fork);
         assert!(d.review[0].from_fork, "#5 comes from a fork");
+    }
+
+    #[test]
+    fn reads_whether_a_pull_request_is_open_merged_or_closed() {
+        let with = |state: &str| {
+            let mut n = pr(3, "alex");
+            n["state"] = json!(state);
+            n
+        };
+        let v = json!({"data": {
+            "viewer": {"login": "me"},
+            "mine": {"nodes": [with("MERGED"), with("CLOSED"), with("OPEN"), pr(4, "me")]}
+        }});
+        let d = parse(&v).unwrap();
+        // Each pull request once: the first answer counts.
+        assert_eq!(d.mine[1].status, Status::Merged);
+        assert_eq!(d.mine[0].status, Status::Open, "no state: open");
+        let v = json!({"data": {"viewer": {"login": "me"}, "mine": {"nodes": [with("CLOSED")]}}});
+        assert_eq!(parse(&v).unwrap().mine[0].status, Status::Closed);
+    }
+
+    #[test]
+    fn searches_ask_for_the_state_newest_first_and_the_repository() {
+        // Open ones exactly as before.
+        assert_eq!(
+            search_terms(Status::Open, "author:@me", None),
+            "is:open is:pr archived:false author:@me"
+        );
+        assert_eq!(
+            search_terms(Status::Merged, "review-requested:@me", None),
+            "is:merged sort:updated-desc is:pr archived:false review-requested:@me"
+        );
+        assert_eq!(
+            search_terms(Status::Closed, "author:@me", Some("acme/app")),
+            "is:closed is:unmerged sort:updated-desc is:pr archived:false author:@me repo:acme/app"
+        );
+        // The search is a variable, never part of the query text; at most 30.
+        assert!(QUERY.contains("search(query: $q, type: ISSUE, first: 30)"));
+        assert!(!QUERY.contains("is:open"));
+    }
+
+    #[test]
+    fn only_plain_repository_names_go_into_a_search() {
+        assert!(plain_repo("acme/app"));
+        assert!(plain_repo("acme-co/app.web_2"));
+        for bad in [
+            "acme",
+            "acme/app is:open",
+            "acme/app/x",
+            "/app",
+            "acme/",
+            "acme/\"x",
+        ] {
+            assert!(!plain_repo(bad), "{bad}");
+        }
+        assert!(fetch(Status::Merged, Some("acme/app author:sam")).is_err());
+    }
+
+    #[test]
+    fn all_asks_for_the_state() {
+        assert!(REPO_ALL
+            .replace("STATES", pr_states(Status::Open))
+            .contains("states: OPEN"));
+        assert!(MEMBER_REPOS
+            .replace("STATES", pr_states(Status::Merged))
+            .contains("pullRequests(states: MERGED, first: 30"));
+        assert_eq!(pr_states(Status::Closed), "CLOSED");
     }
 
     #[test]

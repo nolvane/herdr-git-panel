@@ -541,6 +541,7 @@ mod tests {
             created: None,
             updated: None,
             merge_state: MergeState::Blocked,
+            status: crate::model::Status::Open,
             approvals_given: 0,
             approvals_required: None,
             approved_by: vec![],

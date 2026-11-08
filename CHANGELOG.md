@@ -14,6 +14,13 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `Tab` `→` `l` and `Shift+Tab` `←` `h` now step forward and back through
   the three sections (#6).
 
+- `z` (or a click on the title) switches the list between open, merged and
+  closed (without merging) merge requests and pull requests, in every
+  section; the title says which. Merged and closed ones load the newest
+  first, for this project only when the list shows this project, and can be
+  looked at but not approved, merged, set to draft or opened as a branch
+  (#7).
+
 - `b` fetches the branch of the selected merge request or pull request and
   opens it in a new Herdr workspace (a git worktree Herdr creates), without
   touching the current checkout; forks open through the merge request's own

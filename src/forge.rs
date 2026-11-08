@@ -22,8 +22,32 @@ pub fn all_forges(project: Option<&Project>, gitlab_host: &str) -> (bool, bool) 
     }
 }
 
-/// The lists of every forge, and "All" for `all_of` (`None`: your projects).
-pub fn fetch_all(gitlab_host: &str, all_of: Option<&Project>) -> Result<Fetched, String> {
+/// Which forges "Mine" and "To review" ask, and for which project: open
+/// ones always every forge for every project (the list filters them, so `a`
+/// switches at once); merged and closed ones, of which only the newest
+/// load, only the forge of `all_of` for that project, so they are its own
+/// newest. As `(GitLab, GitHub, project path)`.
+pub fn list_forges<'a>(
+    status: Status,
+    all_of: Option<&'a Project>,
+    gitlab_host: &str,
+) -> (bool, bool, Option<&'a str>) {
+    match status {
+        Status::Open => (true, true, None),
+        _ => {
+            let (lab, hub) = all_forges(all_of, gitlab_host);
+            (lab, hub, all_of.map(|p| p.path.as_str()))
+        }
+    }
+}
+
+/// The lists in `status` of every forge, and "All" for `all_of` (`None`:
+/// your projects).
+pub fn fetch_all(
+    gitlab_host: &str,
+    status: Status,
+    all_of: Option<&Project>,
+) -> Result<Fetched, String> {
     let use_gitlab = cli::find("glab").is_some();
     let use_github = github::available();
     if !use_gitlab && !use_github {
@@ -32,31 +56,32 @@ pub fn fetch_all(gitlab_host: &str, all_of: Option<&Project>) -> Result<Fetched,
         );
     }
     let (all_gitlab, all_github) = all_forges(all_of, gitlab_host);
+    let (lists_gitlab, lists_github, lists_of) = list_forges(status, all_of, gitlab_host);
     let path = all_of.map(|p| p.path.as_str());
     let (lab, hub, lab_all, hub_all) = std::thread::scope(|scope| {
         let hub = scope.spawn(|| {
-            if use_github {
-                github::fetch()
+            if use_github && lists_github {
+                github::fetch(status, lists_of)
             } else {
                 Ok(None)
             }
         });
         let lab_all = scope.spawn(|| {
             if use_gitlab && all_gitlab {
-                gitlab::fetch_all_of(gitlab_host, path).map(Some)
+                gitlab::fetch_all_of(gitlab_host, status, path).map(Some)
             } else {
                 Ok(None)
             }
         });
         let hub_all = scope.spawn(|| {
             if use_github && all_github {
-                github::fetch_all_of(path)
+                github::fetch_all_of(status, path)
             } else {
                 Ok(None)
             }
         });
-        let lab = if use_gitlab {
-            gitlab::fetch(gitlab_host).map(Some)
+        let lab = if use_gitlab && lists_gitlab {
+            gitlab::fetch(gitlab_host, status, lists_of).map(Some)
         } else {
             Ok(None)
         };
@@ -69,12 +94,13 @@ pub fn fetch_all(gitlab_host: &str, all_of: Option<&Project>) -> Result<Fetched,
             hub_all.join().unwrap_or_else(|_| Err("gh crashed".into())),
         )
     });
-    combine(all_of, [lab, hub], [lab_all, hub_all])
+    combine(status, all_of, [lab, hub], [lab_all, hub_all])
 }
 
 /// Puts the forges' answers together: `lists` and `all` are GitLab's and
 /// GitHub's, in that order. "All" failing never fails the other lists.
 fn combine(
+    status: Status,
     all_of: Option<&Project>,
     lists: [Result<Option<Data>, String>; 2],
     all: [Result<Option<AllPart>, String>; 2],
@@ -94,11 +120,18 @@ fn combine(
         }
     }
     if !answered.contains(&true) {
-        return Err(if errors.is_empty() {
-            "gh is not logged in to github.com: run gh auth login".into()
-        } else {
+        return Err(if !errors.is_empty() {
             errors.join(" · ")
+        } else if let (Some(p), false) = (all_of, status == Status::Open) {
+            // Only this project's forge was asked.
+            not_available(p)
+        } else {
+            "gh is not logged in to github.com: run gh auth login".into()
         });
+    }
+    // Merged and closed ones were asked for this project only.
+    if status != Status::Open {
+        data.of = all_of.cloned();
     }
     let mut list = AllList {
         of: all_of.cloned(),
@@ -128,11 +161,7 @@ fn combine(
     // A project nobody could be asked about is not "no open merge
     // requests": say why.
     if let (Some(p), false, true) = (all_of, answered_all, all_errors.is_empty()) {
-        let tool = if p.host == github::HOST { "gh" } else { "glab" };
-        all_errors.push(format!(
-            "{tool} is not installed or not logged in to {}",
-            p.host
-        ));
+        all_errors.push(not_available(p));
     }
     list.error = (!all_errors.is_empty()).then(|| all_errors.join(" · "));
     list.newest = list.items.len();
@@ -153,6 +182,13 @@ fn combine(
         data,
         warning: (!errors.is_empty()).then(|| errors.join(" · ")),
     })
+}
+
+/// Why nothing could be asked about `p`: its forge's tool is missing or not
+/// logged in.
+fn not_available(p: &Project) -> String {
+    let tool = if p.host == github::HOST { "gh" } else { "glab" };
+    format!("{tool} is not installed or not logged in to {}", p.host)
 }
 
 pub fn fetch_activity(mr: &MergeRequest) -> Result<Vec<Discussion>, String> {
@@ -256,13 +292,94 @@ mod tests {
         Data {
             review: vec![mr(Forge::GitLab, 1, 1)],
             mine: vec![mr(Forge::GitLab, 2, 2)],
+            of: None,
             all: None,
         }
     }
 
     #[test]
+    fn merged_and_closed_lists_ask_only_the_projects_forge() {
+        let p = project("gitlab.com");
+        // Open ones: every forge, every project, as always.
+        assert_eq!(
+            list_forges(Status::Open, Some(&p), "gitlab.com"),
+            (true, true, None)
+        );
+        assert_eq!(
+            list_forges(Status::Merged, Some(&p), "gitlab.com"),
+            (true, false, Some("acme/app"))
+        );
+        let hub = project("github.com");
+        assert_eq!(
+            list_forges(Status::Closed, Some(&hub), "gitlab.com"),
+            (false, true, Some("acme/app"))
+        );
+        assert_eq!(
+            list_forges(Status::Merged, None, "gitlab.com"),
+            (true, true, None)
+        );
+    }
+
+    #[test]
+    fn merged_lists_remember_their_project() {
+        let p = project("gitlab.com");
+        let fetched = combine(
+            Status::Merged,
+            Some(&p),
+            [Ok(Some(lists())), Ok(None)],
+            [Ok(None), Ok(None)],
+        )
+        .unwrap();
+        assert_eq!(fetched.data.of, Some(p.clone()));
+        // Open ones are for every project.
+        let fetched = combine(
+            Status::Open,
+            Some(&p),
+            [Ok(Some(lists())), Ok(None)],
+            [Ok(None), Ok(None)],
+        )
+        .unwrap();
+        assert_eq!(fetched.data.of, None);
+    }
+
+    #[test]
+    fn merged_ones_of_a_project_nobody_could_be_asked_about_say_why() {
+        // glab missing, in a GitLab project: GitHub is not asked either.
+        let Err(e) = combine(
+            Status::Merged,
+            Some(&project("gitlab.com")),
+            [Ok(None), Ok(None)],
+            [Ok(None), Ok(None)],
+        ) else {
+            panic!("an empty list instead of the reason");
+        };
+        assert_eq!(e, "glab is not installed or not logged in to gitlab.com");
+        // Your projects: a forge without its tool is left out quietly.
+        let fetched = combine(
+            Status::Closed,
+            None,
+            [Ok(None), Ok(Some(lists()))],
+            [Ok(None), Ok(None)],
+        )
+        .unwrap();
+        assert_eq!(fetched.warning, None);
+        assert_eq!(fetched.data.mine.len(), 1);
+        // One forge failing keeps the other's, with the error in the footer.
+        let fetched = combine(
+            Status::Closed,
+            None,
+            [Err("glab: no network".into()), Ok(Some(lists()))],
+            [Ok(None), Ok(None)],
+        )
+        .unwrap();
+        assert_eq!(fetched.warning.as_deref(), Some("glab: no network"));
+        assert_eq!(fetched.data.review.len(), 1);
+    }
+
+    #[test]
     fn all_failing_keeps_the_other_lists() {
         let fetched = combine(
+            Status::Open,
             Some(&project("gitlab.com")),
             [Ok(Some(lists())), Ok(None)],
             [Err("GitLab: boom".into()), Ok(None)],
@@ -290,6 +407,7 @@ mod tests {
             projects: vec!["gitlab.com/acme/app".into()],
         };
         let fetched = combine(
+            Status::Open,
             Some(&project("gitlab.com")),
             [Ok(Some(data)), Ok(None)],
             [Ok(Some(part)), Ok(None)],
@@ -306,6 +424,7 @@ mod tests {
     fn a_project_nobody_was_asked_about_says_why() {
         // gh only, in a GitLab project.
         let fetched = combine(
+            Status::Open,
             Some(&project("gitlab.com")),
             [Ok(None), Ok(Some(lists()))],
             [Ok(None), Ok(None)],
@@ -317,13 +436,20 @@ mod tests {
             Some("glab is not installed or not logged in to gitlab.com")
         );
         // Your projects: a forge without its tool is simply left out.
-        let fetched = combine(None, [Ok(None), Ok(Some(lists()))], [Ok(None), Ok(None)]).unwrap();
+        let fetched = combine(
+            Status::Open,
+            None,
+            [Ok(None), Ok(Some(lists()))],
+            [Ok(None), Ok(None)],
+        )
+        .unwrap();
         assert_eq!(fetched.data.all.unwrap().error, None);
     }
 
     #[test]
     fn a_forge_that_failed_says_it_once() {
         let fetched = combine(
+            Status::Open,
             None,
             [Err("glab: not logged in".into()), Ok(Some(lists()))],
             [Err("glab: not logged in".into()), Ok(None)],
@@ -345,6 +471,7 @@ mod tests {
             projects: Vec::new(),
         };
         let fetched = combine(
+            Status::Open,
             None,
             [Ok(Some(lists())), Ok(Some(Data::default()))],
             [Ok(Some(lab)), Ok(Some(hub))],

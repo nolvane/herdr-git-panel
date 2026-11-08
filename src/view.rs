@@ -185,6 +185,7 @@ mod tests {
             created: Some(updated - 100),
             updated: Some(updated),
             merge_state: MergeState::Blocked,
+            status: crate::model::Status::Open,
             approvals_given: 0,
             approved_by: vec![],
             approved: false,

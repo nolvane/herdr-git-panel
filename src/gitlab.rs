@@ -1,5 +1,5 @@
-//! GitLab: open merge requests, their threads, approve, merge and changes,
-//! through the `glab` CLI.
+//! GitLab: open, merged and closed merge requests, their threads, approve,
+//! merge and changes, through the `glab` CLI.
 
 use crate::cli;
 use crate::model::*;
@@ -12,7 +12,7 @@ macro_rules! mr_fragment {
     () => {
         r#"
 fragment mr on MergeRequest {
-  iid title description webUrl draft createdAt updatedAt sourceBranch targetBranch diffHeadSha
+  iid title description webUrl draft state createdAt updatedAt sourceBranch targetBranch diffHeadSha
   sourceProjectId targetProjectId
   project { fullPath }
   author { username }
@@ -30,32 +30,49 @@ fragment mr on MergeRequest {
     };
 }
 
-/// One list per request: both in one query exceed GitLab's complexity limit
-/// (250). `LIST` is replaced by the list's field name.
-const QUERY: &str = concat!(
-    r#"
-query {
-  currentUser {
-    username
-    LIST(state: opened, first: 100) { nodes { ...mr } }
-  }
+/// GitLab's word for the state, as in `mergeRequests(state: …)`.
+fn state_word(status: Status) -> &'static str {
+    match status {
+        Status::Open => "opened",
+        Status::Merged => "merged",
+        Status::Closed => "closed",
+    }
 }
-"#,
-    mr_fragment!()
-);
+
+/// One list per request: both in one query exceed GitLab's complexity limit
+/// (250). `list` is the list's field name. Merged and closed ones come
+/// newest updated first and, when `scoped`, of the project in `$project`
+/// only; open ones as always.
+pub fn list_query(list: &str, status: Status, scoped: bool) -> String {
+    let (vars, args) = match (status, scoped) {
+        (Status::Open, _) => ("", "state: opened".to_string()),
+        (s, false) => ("", format!("state: {}, sort: UPDATED_DESC", state_word(s))),
+        (s, true) => (
+            "($project: String!)",
+            format!(
+                "state: {}, sort: UPDATED_DESC, projectPath: $project",
+                state_word(s)
+            ),
+        ),
+    };
+    format!(
+        "query{vars} {{\n  currentUser {{\n    username\n    {list}({args}, first: 100) {{ nodes {{ ...mr }} }}\n  }}\n}}\n{}",
+        mr_fragment!()
+    )
+}
 
 /// How many merge requests "All" loads, newest first: GitLab's largest page.
 pub const ALL_LIMIT: usize = 100;
 
-/// "All" in one project: its open merge requests, newest first, with the
-/// number open in all. Complexity about 140 of 250.
+/// "All" in one project: its merge requests in one state (`STATE`), newest
+/// first, with the number in that state in all. Complexity about 140 of 250.
 const PROJECT_ALL: &str = concat!(
     r#"
 query($project: ID!) {
   currentUser { username }
   project(fullPath: $project) {
     fullPath
-    mergeRequests(state: opened, first: 100, sort: UPDATED_DESC) { count nodes { ...mr } }
+    mergeRequests(state: STATE, first: 100, sort: UPDATED_DESC) { count nodes { ...mr } }
   }
 }
 "#,
@@ -63,14 +80,14 @@ query($project: ID!) {
 );
 
 /// "All" in your projects, first step: the projects you are a member of,
-/// most recently active first, with when their open merge requests were
-/// updated, but none of their details (complexity about 30).
+/// most recently active first, with when their merge requests in one state
+/// (`STATE`) were updated, but none of their details (complexity about 30).
 const MEMBER_PROJECTS: &str = r#"
 query {
   projects(membership: true, archived: EXCLUDE, withMergeRequestsEnabled: true, sort: "latest_activity_desc", first: 100) {
     nodes {
       fullPath
-      mergeRequests(state: opened, first: 100, sort: UPDATED_DESC) { count nodes { updatedAt } }
+      mergeRequests(state: STATE, first: 100, sort: UPDATED_DESC) { count nodes { updatedAt } }
     }
   }
 }
@@ -144,7 +161,7 @@ pub fn pick_members(value: &Value, limit: usize) -> Result<MemberPick, String> {
 /// The second step: the merge requests of these projects, from `after` on.
 /// Paths and time come from GitLab's own answer and go in as JSON strings,
 /// which are valid GraphQL strings.
-pub fn member_query(paths: &[String], after: Option<&str>) -> String {
+pub fn member_query(paths: &[String], after: Option<&str>, status: Status) -> String {
     let list = paths
         .iter()
         .map(|p| serde_json::to_string(p).unwrap_or_default())
@@ -159,26 +176,30 @@ pub fn member_query(paths: &[String], after: Option<&str>) -> String {
         })
         .unwrap_or_default();
     format!(
-        "query {{ currentUser {{ username }} projects(fullPaths: [{list}], first: {}) {{ nodes {{ mergeRequests(state: opened{after}, first: 100, sort: UPDATED_DESC) {{ nodes {{ ...mr }} }} }} }} }}\n{}",
+        "query {{ currentUser {{ username }} projects(fullPaths: [{list}], first: {}) {{ nodes {{ mergeRequests(state: {state}{after}, first: 100, sort: UPDATED_DESC) {{ nodes {{ ...mr }} }} }} }} }}\n{}",
         paths.len(),
-        mr_fragment!()
+        mr_fragment!(),
+        state = state_word(status),
     )
 }
 
-/// "All": every open merge request of `project`, or of the projects you are
-/// a member of when it is `None`, newest first, at most [`ALL_LIMIT`].
-pub fn fetch_all_of(host: &str, project: Option<&str>) -> Result<AllPart, String> {
+/// "All": every merge request in `status` of `project`, or of the projects
+/// you are a member of when it is `None`, newest first, at most
+/// [`ALL_LIMIT`].
+pub fn fetch_all_of(host: &str, status: Status, project: Option<&str>) -> Result<AllPart, String> {
     if let Some(path) = project {
-        let value = graphql(host, PROJECT_ALL, &[("project", path)])?;
+        let query = PROJECT_ALL.replace("STATE", state_word(status));
+        let value = graphql(host, &query, &[("project", path)])?;
         return parse_project_all(&value, host);
     }
-    let pick = pick_members(&graphql(host, MEMBER_PROJECTS, &[])?, ALL_LIMIT)?;
+    let query = MEMBER_PROJECTS.replace("STATE", state_word(status));
+    let pick = pick_members(&graphql(host, &query, &[])?, ALL_LIMIT)?;
     let answers: Vec<Result<Value, String>> = std::thread::scope(|scope| {
         let runs: Vec<_> = pick
             .paths
             .chunks(PROJECTS_PER_REQUEST)
             .map(|chunk| {
-                let query = member_query(chunk, pick.after.as_deref());
+                let query = member_query(chunk, pick.after.as_deref(), status);
                 scope.spawn(move || graphql(host, &query, &[]))
             })
             .collect();
@@ -258,11 +279,13 @@ pub fn parse_members(value: &Value, host: &str) -> Result<Vec<MergeRequest>, Str
         .collect())
 }
 
-pub fn fetch(host: &str) -> Result<Data, String> {
+/// Your merge requests and those you review in `status`, of `project` only
+/// when it is given (merged and closed ones).
+pub fn fetch(host: &str, status: Status, project: Option<&str>) -> Result<Data, String> {
     // Both lists at the same time.
     let (review, mine) = std::thread::scope(|scope| {
-        let mine = scope.spawn(|| query(host, "authoredMergeRequests"));
-        let review = query(host, "reviewRequestedMergeRequests");
+        let mine = scope.spawn(|| query(host, "authoredMergeRequests", status, project));
+        let review = query(host, "reviewRequestedMergeRequests", status, project);
         (
             review,
             mine.join().unwrap_or_else(|_| Err("glab crashed".into())),
@@ -287,8 +310,10 @@ pub fn fetch(host: &str) -> Result<Data, String> {
 }
 
 /// Runs one list query through glab and returns GitLab's JSON answer.
-fn query(host: &str, list: &str) -> Result<Value, String> {
-    graphql(host, &QUERY.replace("LIST", list), &[])
+fn query(host: &str, list: &str, status: Status, project: Option<&str>) -> Result<Value, String> {
+    let project = project.filter(|_| status != Status::Open);
+    let vars: Vec<(&str, &str)> = project.map(|p| ("project", p)).into_iter().collect();
+    graphql(host, &list_query(list, status, project.is_some()), &vars)
 }
 
 /// Runs a GraphQL query through glab, with variables, and returns GitLab's
@@ -493,6 +518,7 @@ pub fn parse(value: &Value, host: &str) -> Result<Data, String> {
     Ok(Data {
         review: list("reviewRequestedMergeRequests"),
         mine: list("authoredMergeRequests"),
+        of: None,
         all: None,
     })
 }
@@ -614,6 +640,12 @@ fn parse_mr(n: &Value, host: &str, viewer: &str) -> Option<MergeRequest> {
         created: n["createdAt"].as_str().and_then(time::parse_iso),
         updated: n["updatedAt"].as_str().and_then(time::parse_iso),
         merge_state,
+        status: match n["state"].as_str() {
+            Some("merged") => Status::Merged,
+            Some("closed") => Status::Closed,
+            // `opened`, and `locked` while GitLab merges it.
+            _ => Status::Open,
+        },
         approvals_given: approved_by,
         approvals_required: Some(if rules_required > 0 {
             rules_required
@@ -757,6 +789,62 @@ mod tests {
     }
 
     #[test]
+    fn reads_whether_a_merge_request_is_open_merged_or_closed() {
+        let with = |iid, state: &str| {
+            let mut n = node(iid, "acme/app", "me", None, "2026-11-08T07:00:00Z");
+            n["state"] = json!(state);
+            n
+        };
+        let v = json!({"data": {"currentUser": {"username": "me", "authoredMergeRequests": {"nodes": [
+            with(1, "merged"), with(2, "closed"), with(3, "opened"), with(4, "locked"),
+            node(5, "acme/app", "me", None, "2026-11-08T07:00:00Z")
+        ]}}}});
+        let d = parse(&v, "gitlab.com").unwrap();
+        let by = |iid| d.mine.iter().find(|m| m.iid == iid).unwrap().status;
+        assert_eq!(by(1), Status::Merged);
+        assert_eq!(by(2), Status::Closed);
+        assert_eq!(by(3), Status::Open);
+        assert_eq!(by(4), Status::Open, "locked while GitLab merges it");
+        assert_eq!(by(5), Status::Open);
+    }
+
+    #[test]
+    fn list_queries_ask_for_the_state_newest_first_and_the_project() {
+        let open = list_query("authoredMergeRequests", Status::Open, false);
+        assert!(open.starts_with("query {"), "no variables");
+        assert!(open.contains("authoredMergeRequests(state: opened, first: 100)"));
+        // Open ones are never asked per project.
+        assert_eq!(
+            list_query("authoredMergeRequests", Status::Open, true),
+            open
+        );
+        let merged = list_query("reviewRequestedMergeRequests", Status::Merged, false);
+        assert!(merged.starts_with("query {"), "no unused variable");
+        assert!(merged.contains(
+            "reviewRequestedMergeRequests(state: merged, sort: UPDATED_DESC, first: 100)"
+        ));
+        let closed = list_query("authoredMergeRequests", Status::Closed, true);
+        // GitLab's projectPath is a String, not an ID.
+        assert!(closed.starts_with("query($project: String!) {"));
+        assert!(closed.contains(
+            "authoredMergeRequests(state: closed, sort: UPDATED_DESC, projectPath: $project, first: 100)"
+        ));
+        assert!(closed.contains("fragment mr on MergeRequest"));
+    }
+
+    #[test]
+    fn all_asks_for_the_state() {
+        assert!(PROJECT_ALL
+            .replace("STATE", state_word(Status::Merged))
+            .contains("mergeRequests(state: merged, first: 100, sort: UPDATED_DESC)"));
+        assert!(MEMBER_PROJECTS
+            .replace("STATE", state_word(Status::Closed))
+            .contains("mergeRequests(state: closed, first: 100"));
+        let q = member_query(&["acme/app".to_string()], None, Status::Merged);
+        assert!(q.contains("mergeRequests(state: merged, first: 100"), "{q}");
+    }
+
+    #[test]
     fn project_all_has_everyones_once_with_the_total() {
         let v = json!({"data": {"currentUser": {"username": "me"}, "project": {"fullPath": "acme/app", "mergeRequests": {"count": 154, "nodes": [
             node(3, "acme/app", "sam", None, "2026-11-08T07:00:00Z"),
@@ -848,14 +936,14 @@ mod tests {
     #[test]
     fn member_query_names_projects_and_time_as_strings() {
         let paths = vec!["acme/app".to_string(), "acme/\"lib".to_string()];
-        let q = member_query(&paths, Some("2026-11-05T08:59:59Z"));
+        let q = member_query(&paths, Some("2026-11-05T08:59:59Z"), Status::Open);
         assert!(
             q.contains(r#"fullPaths: ["acme/app", "acme/\"lib"], first: 2"#),
             "{q}"
         );
         assert!(q.contains(r#"updatedAfter: "2026-11-05T08:59:59Z""#), "{q}");
         assert!(q.contains("fragment mr on MergeRequest"));
-        assert!(!member_query(&paths, None).contains("updatedAfter"));
+        assert!(!member_query(&paths, None, Status::Open).contains("updatedAfter"));
     }
 
     #[test]
