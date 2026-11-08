@@ -291,3 +291,37 @@ review" has entries; `1` selects "Mine" and `2` "To review". Without a second
 reviewer nobody asks for reviews, so opening on "To review" meant switching
 on every open. The order lives in one list, `Section::ORDER` in `src/app.rs`,
 which the header tabs, the starting section and the number keys read.
+
+## 2026-11-08: `b` opens the branch through Herdr's worktrees
+
+`b` fetches the selected merge request's branch and opens it with
+`herdr worktree create --branch` (or `herdr worktree open --path` when the
+branch has its own folder already), so Herdr picks the folder, groups it with
+the repository in the sidebar and removes it with its own action; the plugin
+stores nothing and needs no setting. No agent starts: Herdr starts one with
+a key in any pane. It works only in the clone the list opened in, on rows of
+any project its remotes point at. No `y` first: it writes nothing to the
+forge and never touches the current checkout.
+
+- A branch of the same repository is fetched into its remote-tracking ref and
+  gets a local branch of the same name whose upstream is set through
+  `branch.<name>.remote/merge`, which works whatever the remote's fetch
+  refspec. A fork's branch is fetched through the forge's own ref
+  (`refs/pull/<n>/head`, `refs/merge-requests/<iid>/head`) into `pr-<n>` /
+  `mr-<iid>`, so a fork's `main` is never mixed up with the repository's own.
+  Whether it is a fork comes from GitHub's `isCrossRepository` and GitLab's
+  `sourceProjectId`/`targetProjectId`; unknown counts as a fork, which is
+  fetched correctly either way.
+- An existing local branch only moves forward on a fast-forward; one with
+  commits of its own is kept and the list says so. A branch checked out in
+  the main checkout is refused before anything is fetched. If Herdr refuses,
+  a branch created in the same run is deleted again and a moved one put back.
+- git runs without a terminal: `GIT_TERMINAL_PROMPT=0`,
+  `GCM_INTERACTIVE=never`, and ssh's askpass forced to `false`
+  (`SSH_ASKPASS_REQUIRE=force`), so a passphrase or new host key fails at once
+  instead of writing over the list. That keeps the user's own ssh command and
+  agent, unlike overriding `GIT_SSH_COMMAND`. It has the same 30 s limit as
+  `glab` and `gh`.
+- Branch names from the forge go to `git` and `herdr` as arguments without a
+  shell; names git would not accept, above all ones starting with `-`, are
+  refused first.

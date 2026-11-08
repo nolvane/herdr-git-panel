@@ -254,6 +254,17 @@ pub struct App {
     diff_rx: Receiver<(u64, Result<crate::diff::Diff, String>)>,
     act_tx: Sender<Result<String, String>>,
     act_rx: Receiver<Result<String, String>>,
+    /// The folder the list runs in; `b` fetches into its clone.
+    pub workdir: Option<std::path::PathBuf>,
+    /// The projects the remotes of that clone point at (`origin` and, say,
+    /// `upstream`).
+    pub clone_projects: Vec<Project>,
+    /// The list runs inside Herdr, which `b` needs to open a workspace.
+    pub herdr: bool,
+    /// `b` is fetching and opening a branch.
+    pub opening_branch: bool,
+    branch_tx: Sender<Result<String, String>>,
+    branch_rx: Receiver<Result<String, String>>,
     tx: Sender<Result<Fetched, String>>,
     rx: Receiver<Result<Fetched, String>>,
     quit: bool,
@@ -270,6 +281,7 @@ impl App {
         let (activity_tx, activity_rx) = mpsc::channel();
         let (diff_tx, diff_rx) = mpsc::channel();
         let (resolve_tx, resolve_rx) = mpsc::channel();
+        let (branch_tx, branch_rx) = mpsc::channel();
         let scope = config.scope;
         // Until icons are chosen, say how to fix "?" or boxes in place of icons.
         let flash = (!config.icons_chosen).then(|| {
@@ -319,6 +331,12 @@ impl App {
             diff_rx,
             act_tx,
             act_rx,
+            workdir: None,
+            clone_projects: Vec::new(),
+            herdr: std::env::var("HERDR_ENV").is_ok_and(|v| v == "1"),
+            opening_branch: false,
+            branch_tx,
+            branch_rx,
             tx,
             rx,
             quit: false,
@@ -536,6 +554,70 @@ impl App {
             });
             let _ = tx.send(result);
         });
+    }
+
+    /// Whether the merge request belongs to the project of the clone the
+    /// list runs in, so `b` can fetch its branch there.
+    pub fn has_clone_of(&self, mr: &MergeRequest) -> bool {
+        self.workdir.is_some()
+            && self
+                .clone_projects
+                .iter()
+                .any(|p| p.host == mr.host && p.path == mr.project)
+    }
+
+    /// Fetches the selected merge request's branch and opens it in a new
+    /// Herdr workspace, in the background. No confirmation: it writes
+    /// nothing to the forge and leaves the current checkout alone.
+    fn open_branch(&mut self) {
+        let Some(mr) = self.selected().cloned() else {
+            return;
+        };
+        if self.opening_branch {
+            self.say("Still opening a branch");
+            return;
+        }
+        if !self.herdr {
+            self.say("Opening the branch only works inside Herdr");
+            return;
+        }
+        let Some(dir) = self.workdir.clone().filter(|_| self.has_clone_of(&mr)) else {
+            self.say(format!(
+                "No local clone of {} here: open the list in its folder",
+                mr.project
+            ));
+            return;
+        };
+        let branch = crate::branch::local_branch(&mr);
+        if !crate::branch::valid_branch(&branch) {
+            self.say(format!(
+                "Cannot open the branch {branch:?}: git does not allow that name"
+            ));
+            return;
+        }
+        self.opening_branch = true;
+        // Shown until the answer comes: the fetch and Herdr have 30 s each.
+        self.flash = Some((
+            format!("Fetching {branch}…"),
+            Instant::now() + Duration::from_secs(70),
+        ));
+        let tx = self.branch_tx.clone();
+        std::thread::spawn(move || {
+            let result = match crate::repo::remote_for(&dir, &mr.host, &mr.project) {
+                Some(remote) => crate::branch::open(&mr, &dir, &remote, &crate::branch::run_herdr),
+                None => Err(format!("No git remote for {} in this clone", mr.project)),
+            };
+            let _ = tx.send(result);
+        });
+    }
+
+    fn receive_branch(&mut self) {
+        while let Ok(result) = self.branch_rx.try_recv() {
+            self.opening_branch = false;
+            match result {
+                Ok(msg) | Err(msg) => self.say(msg),
+            }
+        }
     }
 
     fn confirm_action(&mut self) {
@@ -1079,6 +1161,7 @@ impl App {
             KeyCode::Char('v') => self.ask_approval(),
             KeyCode::Char('m') => self.ask_merge(),
             KeyCode::Char('w') => self.toggle_draft(),
+            KeyCode::Char('b') => self.open_branch(),
             KeyCode::Char('?') => self.help = true,
             KeyCode::Char('c') if !mods.contains(KeyModifiers::CONTROL) => {
                 let tab = if self.details && self.panel_tab == PanelTab::Activity {
@@ -1157,6 +1240,7 @@ impl App {
             self.receive_activity();
             self.receive_diff();
             self.receive_resolved();
+            self.receive_branch();
             self.load_activity();
             if !self.loading && Instant::now() >= self.next_refresh {
                 self.refresh();
@@ -1199,6 +1283,7 @@ mod tests {
             project: "acme/app".into(),
             author: "alex".into(),
             source_branch: format!("change-{iid}"),
+            from_fork: false,
             head_sha: "abc123".into(),
             target_branch: "main".into(),
             created: Some(0),
@@ -1230,6 +1315,8 @@ mod tests {
             ..Config::default()
         };
         let mut app = App::new(config, None, None);
+        // Not from the shell the tests run in.
+        app.herdr = false;
         app.data = Some(Data {
             review: (1..=3).map(sample_mr).collect(),
             mine: (4..=6).map(sample_mr).collect(),
@@ -1249,6 +1336,92 @@ mod tests {
             row: y,
             modifiers: KeyModifiers::NONE,
         });
+    }
+
+    /// The list opened in a clone of `acme/app` on gitlab.com, inside Herdr.
+    fn app_in_clone(dir: &std::path::Path) -> App {
+        let mut app = app();
+        let project = Project {
+            host: "gitlab.com".into(),
+            path: "acme/app".into(),
+        };
+        app.project = Some(project.clone());
+        app.clone_projects = vec![project];
+        app.workdir = Some(dir.to_path_buf());
+        app.herdr = true;
+        app
+    }
+
+    fn flash(app: &App) -> Option<&str> {
+        app.flash.as_ref().map(|(t, _)| t.as_str())
+    }
+
+    #[test]
+    fn b_refuses_rows_of_other_projects() {
+        let mut app = app_in_clone(std::path::Path::new("/nowhere"));
+        for mr in &mut app.data.as_mut().unwrap().mine {
+            mr.project = "acme/other".into();
+        }
+        // Other projects only show with "all projects".
+        app.scope = Scope::All;
+        app.clamp_selection();
+        press(&mut app, KeyCode::Char('b'));
+        assert_eq!(
+            flash(&app),
+            Some("No local clone of acme/other here: open the list in its folder")
+        );
+        assert!(!app.opening_branch);
+        // Without a project of its own the list has no clone at all.
+        let mut outside = self::app();
+        outside.herdr = true;
+        press(&mut outside, KeyCode::Char('b'));
+        assert!(flash(&outside)
+            .unwrap()
+            .starts_with("No local clone of acme/app"));
+        assert!(!outside.opening_branch);
+    }
+
+    #[test]
+    fn b_only_works_inside_herdr() {
+        let mut app = app_in_clone(std::path::Path::new("/nowhere"));
+        app.herdr = false;
+        press(&mut app, KeyCode::Char('b'));
+        assert_eq!(
+            flash(&app),
+            Some("Opening the branch only works inside Herdr")
+        );
+        assert!(!app.opening_branch);
+    }
+
+    #[test]
+    fn b_on_an_empty_list_does_nothing() {
+        let mut app = app_in_clone(std::path::Path::new("/nowhere"));
+        app.data = Some(Data::default());
+        app.clamp_selection();
+        press(&mut app, KeyCode::Char('b'));
+        assert_eq!(flash(&app), None);
+        assert!(!app.opening_branch);
+    }
+
+    #[test]
+    fn b_shows_that_it_fetches_and_the_list_keeps_working() {
+        // A folder that is no clone: the background run fails quickly.
+        let dir = std::env::temp_dir().join(format!("herdr-git-panel-app-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = app_in_clone(&dir);
+        press(&mut app, KeyCode::Char('b'));
+        assert_eq!(flash(&app), Some("Fetching change-6…"));
+        assert!(app.opening_branch);
+        press(&mut app, KeyCode::Char('b'));
+        assert_eq!(flash(&app), Some("Still opening a branch"));
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.mine_state.selected(), Some(1), "keys still work");
+        let result = app.branch_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(
+            result.unwrap_err(),
+            "No git remote for acme/app in this clone"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

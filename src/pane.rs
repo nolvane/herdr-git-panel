@@ -9,7 +9,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
 
-fn herdr() -> PathBuf {
+/// The running Herdr binary, as Herdr hands it to plugins.
+pub fn herdr() -> PathBuf {
     std::env::var_os("HERDR_BIN_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("herdr"))

@@ -58,31 +58,67 @@ fn git_common_dir(start: &Path) -> Option<PathBuf> {
     None
 }
 
-fn remote_url(config: &str) -> Option<String> {
+/// Every remote in a git config, as (name, url), in the order they appear.
+fn remotes(config: &str) -> Vec<(String, String)> {
     let mut section = String::new();
-    let mut first = None;
+    let mut found = Vec::new();
     for raw in config.lines() {
         let line = raw.trim();
         if line.starts_with('[') {
             section = line.to_string();
             continue;
         }
-        if !section.starts_with("[remote ") {
+        let Some(name) = section
+            .strip_prefix("[remote \"")
+            .and_then(|s| s.strip_suffix("\"]"))
+        else {
             continue;
-        }
+        };
         let Some((key, value)) = line.split_once('=') else {
             continue;
         };
-        if key.trim() != "url" {
-            continue;
+        if key.trim() == "url" {
+            found.push((name.to_string(), value.trim().to_string()));
         }
-        let url = value.trim().to_string();
-        if section == "[remote \"origin\"]" {
-            return Some(url);
-        }
-        first.get_or_insert(url);
     }
-    first
+    found
+}
+
+fn remote_url(config: &str) -> Option<String> {
+    let all = remotes(config);
+    all.iter()
+        .find(|(name, _)| name == "origin")
+        .or_else(|| all.first())
+        .map(|(_, url)| url.clone())
+}
+
+/// The projects every remote of the repository that contains `dir` points
+/// at.
+pub fn remote_projects(dir: &Path) -> Vec<Project> {
+    let Some(text) =
+        git_common_dir(dir).and_then(|c| std::fs::read_to_string(c.join("config")).ok())
+    else {
+        return Vec::new();
+    };
+    remotes(&text)
+        .iter()
+        .filter_map(|(_, url)| parse_remote(url))
+        .collect()
+}
+
+/// The name of the remote of the repository that contains `dir` whose URL
+/// points at `host`/`path`, such as `origin`.
+pub fn remote_for(dir: &Path, host: &str, path: &str) -> Option<String> {
+    let common = git_common_dir(dir)?;
+    let text = std::fs::read_to_string(common.join("config")).ok()?;
+    remote_named(&text, host, path)
+}
+
+fn remote_named(config: &str, host: &str, path: &str) -> Option<String> {
+    remotes(config)
+        .into_iter()
+        .find(|(_, url)| parse_remote(url).is_some_and(|p| p.host == host && p.path == path))
+        .map(|(name, _)| name)
 }
 
 /// Understands `git@host:group/project.git`, `ssh://git@host:22/group/project`
@@ -139,6 +175,20 @@ mod tests {
     fn origin_wins() {
         let cfg = "[core]\n\tbare = false\n[remote \"upstream\"]\n\turl = git@a.com:x/y.git\n[remote \"origin\"]\n\turl = git@b.com:p/q.git\n";
         assert_eq!(remote_url(cfg).as_deref(), Some("git@b.com:p/q.git"));
+    }
+
+    #[test]
+    fn remote_for_the_project() {
+        let cfg = "[remote \"origin\"]\n\turl = git@github.com:alex/app.git\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n[branch \"main\"]\n\tremote = origin\n[remote \"upstream\"]\n\turl = https://github.com/acme/app.git\n";
+        assert_eq!(
+            remote_named(cfg, "github.com", "acme/app").as_deref(),
+            Some("upstream")
+        );
+        assert_eq!(
+            remote_named(cfg, "github.com", "alex/app").as_deref(),
+            Some("origin")
+        );
+        assert_eq!(remote_named(cfg, "gitlab.com", "acme/app"), None);
     }
 
     #[test]

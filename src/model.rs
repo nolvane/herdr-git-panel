@@ -90,6 +90,9 @@ pub struct MergeRequest {
     pub project: String,
     pub author: String,
     pub source_branch: String,
+    /// The branch lives in another repository (a fork), so `source_branch`
+    /// names a branch there, not in `project`.
+    pub from_fork: bool,
     /// The commit at the head of the branch; a merge only goes through when
     /// it is still the same.
     pub head_sha: String,

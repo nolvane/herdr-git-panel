@@ -340,6 +340,7 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
                 ("c", "panel: overview / activity"),
                 ("Ctrl+d Ctrl+u", "scroll the panel"),
                 ("d", "show the changes (n N files, f tree, q back)"),
+                ("b", "open the branch in a new Herdr workspace"),
                 ("v", "approve / take approval back"),
                 ("m", "merge (when GitLab or GitHub allows it)"),
                 ("w", "your own: draft / ready for review"),
@@ -1203,6 +1204,10 @@ fn draw_details(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
         Span::styled("d", key),
         Span::styled(" changes   ", Style::new().fg(FAINT)),
     ];
+    if app.has_clone_of(mr) {
+        actions.push(Span::styled("b", key));
+        actions.push(Span::styled(" branch   ", Style::new().fg(FAINT)));
+    }
     if mr.author != me {
         let what = if mr.approved_by.contains(&me) {
             " revoke approval   "
@@ -1758,6 +1763,7 @@ mod tests {
             project: "acme/app".into(),
             author: "alex".into(),
             source_branch: "add-export".into(),
+            from_fork: false,
             head_sha: "abc123".into(),
             target_branch: "main".into(),
             created: Some(0),
@@ -2021,5 +2027,44 @@ mod tests {
             text.contains("Tab  1 2") && text.contains("mine / to review")
         });
         assert!(found, "help line for Tab 1 2");
+    }
+
+    /// Every row of a frame of this size, as text.
+    fn screen(app: &mut App, width: u16, height: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..height).map(|y| row_text(&buf, y)).collect()
+    }
+
+    #[test]
+    fn help_names_b() {
+        let mut app = app_with(vec![], vec![], false);
+        app.help = true;
+        let rows = screen(&mut app, 120, 50);
+        assert!(
+            rows.iter().any(|r| r.contains("b ")
+                && r.contains("open the branch in a new Herdr workspace")),
+            "{rows:#?}"
+        );
+    }
+
+    #[test]
+    fn details_offer_b_only_for_the_lists_own_clone() {
+        let mut app = app_with(vec![], sample_rows(), false);
+        app.details = true;
+        app.mine_state.select(Some(0));
+        let offered = |app: &mut App| {
+            let rows = screen(app, 160, 40);
+            assert!(rows.iter().any(|r| r.contains("d changes")), "{rows:#?}");
+            rows.iter().any(|r| r.contains(" b branch"))
+        };
+        assert!(!offered(&mut app), "no clone of acme/app here");
+        app.workdir = Some(std::path::PathBuf::from("/src/app"));
+        app.clone_projects = vec![crate::repo::Project {
+            host: "gitlab.com".into(),
+            path: "acme/app".into(),
+        }];
+        assert!(offered(&mut app));
     }
 }

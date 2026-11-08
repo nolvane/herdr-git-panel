@@ -44,6 +44,8 @@ pub fn command(name: &str) -> Command {
 /// What a finished tool left behind.
 pub struct Output {
     pub success: bool,
+    /// The exit code, when the tool exited normally.
+    pub code: Option<i32>,
     pub stdout: Vec<u8>,
     pub stderr: String,
 }
@@ -90,6 +92,7 @@ pub fn run(name: &str, mut cmd: Command, host: &str) -> Result<Output, String> {
     };
     Ok(Output {
         success: status.success(),
+        code: status.code(),
         stdout: out_reader.join().unwrap_or_default(),
         stderr: String::from_utf8_lossy(&err_reader.join().unwrap_or_default()).into_owned(),
     })

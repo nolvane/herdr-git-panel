@@ -98,6 +98,33 @@ Both run through `glab` or `gh` and refresh the list.
 `w` marks your own merge request as a draft, or as ready for review again,
 without asking (the same key undoes it).
 
+## Open the branch locally
+
+`b` fetches the branch of the selected merge request or pull request and
+opens it in a new Herdr workspace, through Herdr's own worktree feature:
+Herdr creates a folder with the branch checked out (under its
+`[worktrees].directory`, `~/.herdr/worktrees` by default) and groups it with
+the repository in the sidebar. Start a coding agent there to review or
+continue the work; remove the folder again with Herdr's own worktree remove
+action.
+
+- It works on rows of the repository the list was opened in (any of its
+  remotes, such as `origin` and `upstream`), and only inside Herdr.
+- Your current checkout, its branch and its uncommitted changes stay as they
+  are.
+- A branch of the same repository gets a local branch of the same name that
+  tracks it, so `git push` there updates the merge request. A fork's branch is
+  fetched through the merge request's own ref and opens as `pr-<n>` (GitHub)
+  or `mr-<iid>` (GitLab), without upstream.
+- A second `b` opens the existing folder again. A local branch that has
+  commits of its own is kept as it is, and the list says it differs. A branch
+  checked out in the main checkout already is not opened a second time: the
+  list says where it is.
+- When the branch can't be fetched (no network, branch deleted, no login for
+  the remote), the list says why and changes nothing. git never asks for a
+  password or passphrase here; it uses the logins and ssh keys you already
+  have.
+
 ## Mouse
 
 Click a row to select it, double-click to open it in the browser. Click a tab,
@@ -121,6 +148,7 @@ scrolls the details panel when the pointer is over it.
 | `v` | Approve (or take your approval back), after confirming |
 | `m` | Merge, after confirming, when GitLab or GitHub allows it |
 | `w` | Your own: mark as draft, or as ready for review again |
+| `b` | Open the branch in a new Herdr workspace (a git worktree) |
 | `?` | All keys |
 | `/` | Search |
 | `f` | Show: all, needs me, open threads, pipeline failed, ready |
@@ -213,8 +241,11 @@ When the list opens, it reads the git remote of its directory from
 
 Comments load when a merge request's activity tab is open. The list only
 writes what you asked for: an approval or taking one back, a merge (both
-after confirming), and resolving a thread or opening it again. Nothing is
-stored and nothing else is contacted. The list only runs while it is open.
+after confirming), and resolving a thread or opening it again. `b` runs
+`git fetch` against the clone's remote, creates or moves forward a local
+branch that is not checked out anywhere, and asks Herdr to create the
+folder. Nothing else is stored and nothing else is contacted. The list only
+runs while it is open.
 
 ## Development
 
