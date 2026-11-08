@@ -39,25 +39,6 @@ panel only.
 `compact = true` gives one line per merge request, with the number and the
 labels in columns of their own.
 
-## The three sections
-
-- **Mine**: your own open merge requests. The list opens here.
-- **To review**: the ones you are asked to review (on GitHub also the ones
-  you reviewed already).
-- **All**: every open merge request of the project the list was opened in,
-  whoever wrote it and whoever reviews it, your own and the ones you review
-  included. With "all projects" (`a`), or outside a project, it lists the
-  open ones of the projects you are a member of instead: on GitLab the ones
-  you are a member of, on GitHub your own repositories, the ones you
-  collaborate on and those of your organizations.
-
-"All" loads the newest open ones up to what one request gives (100 on
-GitLab, 30 on GitHub, the limits the other lists use); when there are more,
-the footer says how many it shows ("newest 30 of 54"). With "all projects"
-it looks at your 100 most recently active projects on each forge. Since
-"All" lists other merge requests per scope, `a` loads it again, and it shows
-"Loading" for a moment while "Mine" and "To review" switch at once.
-
 `p` opens the details panel (on the right on wide panes, below otherwise).
 **Overview**: title, status, branches, author, every reviewer and where they
 are, who approved and which approval rules still wait, threads, pipeline,
@@ -83,6 +64,25 @@ list last refreshed; `?` shows all keys.
 `q` closes the list after asking ("Close the git panel?", `y` to close, any
 other key keeps it). `Esc` never closes it: it only closes the panel, the
 search or a filter.
+
+## The three sections
+
+- **Mine**: your own open merge requests. The list opens here.
+- **To review**: the ones you are asked to review (on GitHub also the ones
+  you reviewed already).
+- **All**: every open merge request of the project the list was opened in,
+  whoever wrote it and whoever reviews it, your own and the ones you review
+  included. With "all projects" (`a`), or outside a project, it lists the
+  open ones of the projects you are a member of instead: on GitLab the ones
+  you are a member of, on GitHub your own repositories, the ones you
+  collaborate on and those of your organizations.
+
+"All" loads the newest open ones up to what one request gives (100 on
+GitLab, 30 on GitHub, the limits the other lists use); when there are more,
+the footer says how many it shows ("newest 30 of 54"). With "all projects"
+it looks at your 100 most recently active projects on each forge. Since
+"All" lists other merge requests per scope, `a` loads it again, and it shows
+"Loading" for a moment while "Mine" and "To review" switch at once.
 
 ## Search and sort
 

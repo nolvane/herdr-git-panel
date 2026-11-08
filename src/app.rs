@@ -1003,12 +1003,14 @@ impl App {
                     self.error = fetched.warning;
                     self.updated_at = Some(Instant::now());
                     self.clamp_selection();
+                    // `a` was pressed while loading: "All" is for the other
+                    // scope. Only after an answer, so a failing forge is not
+                    // asked again at once, over and over.
+                    if self.all_list().is_none() {
+                        self.next_refresh = Instant::now();
+                    }
                 }
                 Err(e) => self.error = Some(e),
-            }
-            // `a` was pressed while loading: "All" is for the other scope.
-            if self.data.is_some() && self.all_list().is_none() {
-                self.next_refresh = Instant::now();
             }
         }
     }
@@ -1617,6 +1619,20 @@ mod tests {
             "no second refresh: it fits the scope"
         );
         assert_eq!(iids(&app.rows(Section::All)), [9]);
+    }
+
+    #[test]
+    fn a_failed_refresh_after_a_does_not_retry_at_once() {
+        let mut app = app_in_clone(std::path::Path::new("/nowhere"));
+        assert!(app.all_list().is_none(), "All is for the other scope");
+        app.loading = true;
+        app.tx.send(Err("glab: no network".into())).unwrap();
+        app.receive();
+        assert!(
+            app.next_refresh > Instant::now(),
+            "waits for the next refresh"
+        );
+        assert_eq!(app.error.as_deref(), Some("glab: no network"));
     }
 
     #[test]
