@@ -337,8 +337,9 @@ fn relation(dir: &Path, local: &str, tip: &str) -> Result<Relation, String> {
 /// Fetches the merge request's branch from `remote` into the clone at `dir`
 /// and opens it in a Herdr workspace: the existing folder when the branch is
 /// checked out in a linked worktree already, else a new one. Refuses, before
-/// fetching, when the branch is checked out in the main working tree. On an
-/// error nothing but the fetched remote ref has changed.
+/// fetching, when the branch is checked out in the main working tree or in
+/// `dir` itself. On an error nothing but the fetched remote-tracking ref has
+/// changed.
 pub fn open(mr: &MergeRequest, dir: &Path, remote: &str, herdr: Herdr) -> Result<String, String> {
     let branch = local_branch(mr);
     let noun = mr.forge.noun();
