@@ -478,5 +478,11 @@ can be long.
   request and thread stay selected by key and id: they move to the top,
   since both lists are sorted newest first. The list now keeps each
   section's merge request selected by key on every refresh, not by its row.
-- Posting runs through the logged-in `glab` and `gh` under the forges'
-  terms, like approving and resolving.
+- Posting runs through the official APIs with the user's own login (the
+  logged-in `glab` and `gh`), one text the user wrote and confirmed at a
+  time. GitHub's Acceptable Use Policies forbid spam and "excessive automated
+  bulk activity", its API terms abuse of the API; GitLab's Acceptable Use
+  Policy forbids sending spam. None of that covers this use (read on
+  2026-11-09: docs.github.com/en/site-policy/github-terms/github-terms-of-service,
+  docs.github.com/en/site-policy/acceptable-use-policies/github-acceptable-use-policies,
+  handbook.gitlab.com/handbook/legal/acceptable-use-policy/).
