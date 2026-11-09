@@ -314,7 +314,17 @@ Changes apply the next time the list opens.
 | `split_direction` | `down` | Where a split goes: `down` (below) or `right` |
 | `icons` | `nerd` | `plain` for terminals without a Nerd Font (or press `i`) |
 | `compact` | `false` | `true`: one line per merge request instead of two, with the number in a column |
-| `gitlab_host` | `gitlab.com` | GitLab host `glab` is logged in to |
+| `gitlab_host` | `gitlab.com` | GitLab host `glab` is logged in to, without a port |
+
+For a GitLab whose web and API run on another port (such as
+`https://git.acme.test:8443`), set `gitlab_host = "git.acme.test"` and give
+`glab` the port as its API host:
+`glab auth login --hostname git.acme.test --api-host git.acme.test:8443`
+(add `--api-protocol http` for a GitLab without HTTPS; when `glab` is already
+logged in to the host, `glab config set api_host git.acme.test:8443 --host
+git.acme.test` is enough).
+`glab` takes no port in the host name, and a clone with a port in its remote
+is still recognised as its project.
 
 A GitLab Community Edition server works too. It has no approval rules, so
 the list shows how many people approved and who, but not how many are

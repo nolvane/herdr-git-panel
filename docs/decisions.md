@@ -725,3 +725,24 @@ and `first: 100` the newest threads.
 - GitLab complexity of the whole new request, measured on gitlab.com on
   2026-11-09 with `queryComplexity`: 35 of the 250 allowed. GitHub accepts
   the query; at most 100 × 50 comments stay far below its node limit.
+
+## 2026-11-09: A GitLab on another port: the port stays with glab
+
+`gitlab_host` is the host name glab is logged in to, without a port (#25).
+
+- glab (1.128) refuses a port in `--hostname` (`error parsing --hostname:
+  invalid hostname.`) before it sends anything. For a GitLab on another
+  port it logs in with the host name alone and keeps the port as the API
+  host (`glab auth login --hostname <host> --api-host <host>:<port>`, or
+  the per-host config key `api_host`), so the plugin passes the bare host
+  and glab adds the port.
+- A `gitlab_host` that ends in `:<digits>` fails every GitLab request
+  before glab starts, with a message that names the setting to use and the
+  `--api-host` login. Only digits count as a port, so another wrong value
+  (such as one with `https://`) still shows glab's own error rather than a
+  wrong suggestion.
+- The remote's port stays dropped in `repo::parse_remote`: an SSH remote's
+  port is the SSH server's (often 22 or 2222), not the web and API port, so
+  keeping it would break SSH clones of every self-hosted GitLab.
+- Rejected: taking `host:port` and handing the port to glab ourselves
+  (`GITLAB_API_HOST`), which would duplicate glab's own login setup.
