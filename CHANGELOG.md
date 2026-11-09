@@ -6,6 +6,8 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-11-09
+
 ### Added
 
 - `Ctrl+r` starts a failed pipeline again, after `y`: on GitLab the failed
@@ -59,7 +61,7 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   overview (`?`) uses two columns when it is taller than the screen (#10).
 
 - "Mine" is now the first section, before "To review", and the list opens on
-  it; `1` selects "Mine" and `2` "To review".
+  it; `1` selects "Mine" and `2` "To review" (#5).
 
 ### Fixed
 
@@ -96,7 +98,14 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   without a word or saying "run … auth login"; only a refused login counts
   as not logged in (#29).
 - The "Review" and "CI" dots and their headings start at the left edge of
-  their column, like every other column, instead of sitting centred.
+  their column, like every other column, instead of sitting centred (#4).
+- "This project" also finds the project when the clone's remote spells it
+  with other capitals than GitHub or GitLab, such as `GitHub.com:Acme/App`
+  for `acme/app` (#15).
+- A `glab` without a login is asked once when the list opens instead of
+  every minute, so gitlab.com no longer answers "HTTP 429"; as soon as
+  `glab auth login` ran, the open list loads GitLab within about a second,
+  without `r` (#27).
 
 ## [1.0.0] - 2026-11-08
 
@@ -118,5 +127,6 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Optional settings in `config.toml`, and plain symbols for terminals without
   a Nerd Font.
 
-[Unreleased]: https://github.com/nolvane/herdr-git-panel/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/nolvane/herdr-git-panel/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/nolvane/herdr-git-panel/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/nolvane/herdr-git-panel/releases/tag/v1.0.0
