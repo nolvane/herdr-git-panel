@@ -2976,6 +2976,154 @@ mod tests {
             .join("\n")
     }
 
+    /// The footer row (the last one) of a 20-row frame `width` cells wide,
+    /// one entry per cell, with the row's y.
+    fn footer_cells(app: &mut App, width: u16) -> (u16, Vec<String>) {
+        let mut terminal = Terminal::new(TestBackend::new(width, 20)).unwrap();
+        terminal.draw(|frame| ui::draw(frame, app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (
+            19,
+            (0..width)
+                .map(|x| buf[(x, 19)].symbol().to_string())
+                .collect(),
+        )
+    }
+
+    /// The cell where `text` starts in `cells`, if it is drawn there whole.
+    fn cell_of(cells: &[String], text: &str) -> Option<u16> {
+        let letters: Vec<String> = text.chars().map(String::from).collect();
+        (0..=cells.len().checked_sub(letters.len())?)
+            .find(|&x| letters.iter().zip(&cells[x..]).all(|(l, c)| l == c))
+            .map(|x| x as u16)
+    }
+
+    /// A long GitLab error, wider than a narrow pane.
+    const LONG_ERROR: &str = "GitLab: the merge request list could not be loaded \
+        (the server answered 502 Bad Gateway, try again later)";
+
+    /// Clicks every cell of `cells[from..to]` in the footer row, drawn
+    /// again before each click, and asserts none starts a refresh or says
+    /// anything.
+    fn assert_clicks_do_nothing(app: &mut App, width: u16, from: u16, to: u16) {
+        let flash_before = flash(app).map(String::from);
+        for x in from..to {
+            let (y, cells) = footer_cells(app, width);
+            click(app, x, y);
+            assert!(
+                !app.loading,
+                "{x} {:?} refreshed: {cells:?}",
+                cells[x as usize]
+            );
+            assert_eq!(flash(app).map(String::from), flash_before, "{x}: {cells:?}");
+            assert!(app.confirm.is_none() && !app.help && app.compose.is_none());
+        }
+    }
+
+    /// Clicks the "r" of "r refresh" and asserts it starts a refresh.
+    fn assert_refresh_click_refreshes(app: &mut App, width: u16) {
+        let (y, cells) = footer_cells(app, width);
+        let r = cell_of(&cells, "r refresh").expect("r refresh shown");
+        click(app, r, y);
+        assert!(app.loading, "{cells:?}");
+    }
+
+    #[test]
+    fn a_click_on_a_long_error_in_the_footer_does_not_refresh() {
+        let width = 50;
+        let mut app = app_with_error(LONG_ERROR);
+        let (_, cells) = footer_cells(&mut app, width);
+        // "r refresh" stays in view, in front of the start of the error.
+        let r = cell_of(&cells, "r refresh").unwrap_or_else(|| panic!("{cells:?}"));
+        let error = cell_of(&cells, "GitLab: the merge").unwrap_or_else(|| panic!("{cells:?}"));
+        assert_eq!(error, r + "r refresh  ".len() as u16, "{cells:?}");
+        // Every visible cell of the error, up to the edge, starts nothing.
+        assert_clicks_do_nothing(&mut app, width, error, width);
+        // Nor do the two blanks between "r refresh" and the error.
+        assert_clicks_do_nothing(&mut app, width, error - 2, error);
+        // "r refresh" itself does, from its first to its last letter.
+        for x in [r, r + "r refresh".len() as u16 - 1] {
+            let mut app = app_with_error(LONG_ERROR);
+            let (y, _) = footer_cells(&mut app, width);
+            click(&mut app, x, y);
+            assert!(app.loading, "{x}");
+        }
+    }
+
+    /// `app()` after a refresh that left `error` in the footer.
+    fn app_with_error(error: &str) -> App {
+        let mut app = app();
+        app.updated_at = Some(Instant::now());
+        app.error = Some(error.into());
+        app
+    }
+
+    #[test]
+    fn a_click_on_an_error_that_fits_does_not_refresh() {
+        let width = 120;
+        let error = "GitLab: the merge request list could not be loaded";
+        let mut app = app_with_error(error);
+        let (_, cells) = footer_cells(&mut app, width);
+        let text: String = cells.concat();
+        assert!(
+            text.contains("⏎ open") && text.contains("q close"),
+            "{text}"
+        );
+        let start = cell_of(&cells, error).unwrap_or_else(|| panic!("{text}"));
+        assert_clicks_do_nothing(&mut app, width, start, width);
+        assert_refresh_click_refreshes(&mut app, width);
+    }
+
+    #[test]
+    fn the_footer_has_no_refresh_click_while_refreshing_or_saying_something() {
+        let width = 60;
+        for saying in [false, true] {
+            let mut app = app();
+            app.updated_at = Some(Instant::now());
+            if saying {
+                app.flash = Some(("Opened in the browser".into(), Instant::now()));
+            } else {
+                app.loading = true;
+            }
+            let (_, cells) = footer_cells(&mut app, width);
+            assert!(cell_of(&cells, "r refresh").is_none(), "{cells:?}");
+            // The status on the right, from its first cell (the refresh
+            // icon while refreshing) to the edge.
+            let start = if saying {
+                cell_of(&cells, "Opened in the browser")
+            } else {
+                cell_of(&cells, "refreshing").map(|x| x - 2)
+            }
+            .unwrap_or_else(|| panic!("{cells:?}"));
+            if saying {
+                assert_clicks_do_nothing(&mut app, width, start, width);
+            } else {
+                // A refresh runs: a click on the right says nothing (an
+                // `r` would say "Already refreshing").
+                for x in start..width {
+                    let (y, _) = footer_cells(&mut app, width);
+                    click(&mut app, x, y);
+                    assert_eq!(flash(&app), None, "{x}: {cells:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn in_all_the_note_is_not_clickable_and_r_refresh_is() {
+        let width = 120;
+        let mut app = app();
+        app.updated_at = Some(Instant::now());
+        app.data.as_mut().unwrap().all.as_mut().unwrap().total = 40;
+        app.section = Section::All;
+        let (_, cells) = footer_cells(&mut app, width);
+        let note = cell_of(&cells, "newest 4 of 40").unwrap_or_else(|| panic!("{cells:?}"));
+        let r = cell_of(&cells, "r refresh").unwrap_or_else(|| panic!("{cells:?}"));
+        assert!(note < r, "{cells:?}");
+        assert_clicks_do_nothing(&mut app, width, note, r);
+        assert_refresh_click_refreshes(&mut app, width);
+    }
+
     #[test]
     fn reply_opens_a_field_for_the_selected_thread() {
         let mut app = in_activity();
