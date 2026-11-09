@@ -379,12 +379,12 @@ fn request(host: &str, query: &str, vars: &[(&str, &str)]) -> Result<Value, Fail
 fn answer(out: &cli::Output, host: &str) -> Result<Value, Failure> {
     // GitLab's own errors come as JSON, also when glab exits with an error.
     if let Ok(value) = serde_json::from_slice::<Value>(&out.stdout) {
-        if !out.success && refused(&value) {
+        if refused(&value) {
             return Err(Failure::NotLoggedIn);
         }
         return Ok(value);
     }
-    if !out.success && cli::not_logged_in(&out.stderr) {
+    if !out.success && refused_stderr(&out.stderr) {
         return Err(Failure::NotLoggedIn);
     }
     if !out.success {
@@ -398,24 +398,41 @@ fn answer(out: &cli::Output, host: &str) -> Result<Value, Failure> {
 }
 
 /// Whether GitLab's JSON answer refuses the token: without one, or with
-/// one it no longer takes, it answers 401 with "Invalid token" (GraphQL),
-/// `invalid_token` (an expired OAuth token) or "401 Unauthorized" (REST).
-/// Read from GitLab's own words only, so an error that merely mentions 401
-/// (a query's complexity) stays an error.
+/// one it no longer takes, it answers 401 with exactly "Invalid token"
+/// (GraphQL), `invalid_token` (an expired OAuth token) or "401
+/// Unauthorized" (REST). Whole messages only, so an error that merely
+/// mentions 401 or a token (a query's complexity, an integration) stays an
+/// error.
 fn refused(value: &Value) -> bool {
-    let text = cli::graphql_errors(value)
+    let is = |v: Option<&Value>, word: &str| {
+        v.and_then(Value::as_str)
+            .is_some_and(|m| m.trim().eq_ignore_ascii_case(word))
+    };
+    let errors = value.get("errors").and_then(Value::as_array);
+    errors
         .into_iter()
-        .chain(
-            ["error", "message"]
-                .iter()
-                .filter_map(|k| value.get(*k).and_then(Value::as_str).map(String::from)),
-        )
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase();
-    ["invalid token", "invalid_token", "401 unauthorized"]
-        .iter()
-        .any(|w| text.contains(w))
+        .flatten()
+        .any(|e| is(e.get("message"), "Invalid token"))
+        || is(value.get("error"), "invalid_token")
+        || is(value.get("message"), "401 Unauthorized")
+}
+
+/// Whether glab's error output, without a JSON answer, says it is not
+/// logged in. Stricter than [`cli::not_logged_in`]: a bare "401" may be
+/// part of a host name, and here it would hide GitLab without a word.
+fn refused_stderr(stderr: &str) -> bool {
+    let lower = stderr.to_lowercase();
+    [
+        "(http 401)",
+        "401 unauthorized",
+        "invalid token",
+        "invalid_token",
+        "not logged in",
+        "not authenticated",
+        "auth login",
+    ]
+    .iter()
+    .any(|w| lower.contains(w))
 }
 
 /// [`request`] for one merge request the user acts on: not being logged in
@@ -1165,13 +1182,35 @@ mod tests {
 
     #[test]
     fn an_error_that_mentions_401_is_not_a_login() {
-        // A logged-in query that GitLab refuses for another reason.
-        let complex = output(
+        // Logged-in queries that GitLab refuses for another reason.
+        for message in [
+            "Query has complexity of 401, which exceeds max complexity of 250",
+            "Jira integration: 401 Unauthorized",
+            "Invalid token for webhook",
+        ] {
+            let out = output(
+                false,
+                &json!({"errors": [{"message": message}]}).to_string(),
+                &format!("glab: {message}"),
+            );
+            assert!(answer(&out, "gitlab.com").is_ok(), "{message}");
+        }
+        // No network to a host whose name holds 401.
+        let offline = output(
             false,
-            r#"{"errors":[{"message":"Query has complexity of 401, which exceeds max complexity of 250"}]}"#,
-            "glab: Query has complexity of 401, which exceeds max complexity of 250",
+            "",
+            "dial tcp: lookup gitlab401.acme.test: no such host",
         );
-        assert!(answer(&complex, "gitlab.com").is_ok());
+        assert!(matches!(
+            answer(&offline, "gitlab401.acme.test"),
+            Err(Failure::Other(_))
+        ));
+        // GitLab's refusal is one also when glab exits without an error.
+        let quiet = output(true, r#"{"errors":[{"message":"Invalid token"}]}"#, "");
+        assert!(matches!(
+            answer(&quiet, "gitlab.com"),
+            Err(Failure::NotLoggedIn)
+        ));
     }
 
     #[test]

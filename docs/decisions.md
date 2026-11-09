@@ -512,13 +512,18 @@ Now both forges work the same way (#19).
   `{"errors":[{"message":"Invalid token"}]}` on stdout and `glab: Invalid
   token` on stderr. For a host it was never logged in to it sends no token,
   and GitLab answers anonymously with `currentUser: null`.
-- GitLab's JSON answer decides when there is one: "Invalid token",
-  `invalid_token` (an expired OAuth token) or "401 Unauthorized" in GitLab's
-  own error means not logged in, so an error that merely mentions 401 (a
-  query's complexity) still shows. Without JSON, `cli::not_logged_in` reads
-  glab's stderr as for gh; it now also knows "invalid token".
-- When one request of a refresh fails and another looks logged out, the
-  error wins and shows.
+- GitLab's JSON answer decides when there is one: exactly "Invalid token",
+  `invalid_token` (an expired OAuth token) or "401 Unauthorized" as GitLab's
+  whole error message means not logged in, so an error that merely mentions
+  401 or a token (a query's complexity, an integration) still shows. Without
+  JSON, glab's stderr decides, by words such as "(HTTP 401)" or "auth
+  login" but not a bare "401", which may be part of a host name.
+  `cli::not_logged_in`, which the messages of writes and of gh use, now
+  also knows "invalid token".
+- When one request of a refresh fails without an answer (no network, the
+  time limit) and another looks logged out, the error wins and shows. A
+  GraphQL error next to a logged-out answer means the login changed during
+  the refresh; the next refresh shows the real state.
 - The list queries (open, merged and closed, "All" in one project and in
   your projects) return `None` when not logged in or answered anonymously;
   every one of them asks for `currentUser`, so "All" in your projects can
@@ -534,7 +539,8 @@ Now both forges work the same way (#19).
   auth status`). It would cost a request on every refresh while logged in
   and change nothing the user sees.
 - Activity and resolving a thread act on one merge request the user chose,
-  so they say "glab is not logged in to … : run glab auth login" instead of
-  "GitLab: Invalid token"; that never reaches the footer.
+  so they say "glab is not logged in to …: run glab auth login" (with
+  `--hostname`) instead of "GitLab: Invalid token"; that never reaches the
+  footer.
 - A real GitLab error (no network, a GraphQL error while logged in, the time
   limit) still shows in the footer while GitHub's lists stay.
