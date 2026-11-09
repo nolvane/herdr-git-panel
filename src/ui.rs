@@ -1996,12 +1996,15 @@ fn draw_footer(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
     let mut x = left_area.x + 1;
     for (key, what, click) in keys {
         let text = format!(" {what}  ");
-        let width = (key.chars().count() + text.chars().count()) as u16;
+        let width = (Span::raw(key).width() + Span::raw(text.as_str()).width()) as u16;
+        // A hint that does not fit is left out whole, and so is every one
+        // after it; its two trailing blanks keep it off "r refresh".
+        if x + width > left_area.x + left_area.width {
+            break;
+        }
         if let Some(c) = click {
-            if x + width <= left_area.x + left_area.width {
-                app.hits
-                    .push((Rect::new(x, area.y, width - 2, 1), Hit::Key(c)));
-            }
+            app.hits
+                .push((Rect::new(x, area.y, width - 2, 1), Hit::Key(c)));
         }
         x += width;
         spans.push(Span::styled(
@@ -3049,6 +3052,89 @@ mod tests {
         }
     }
 
+    /// The footer's key hints in today's order, as drawn when they all fit.
+    const HINTS: [&str; 5] = ["⏎ open", "p details", "/ search", "? all keys", "q close"];
+
+    /// The list after a refresh, so the footer shows "updated … ago".
+    fn app_updated() -> App {
+        let mut app = app_with(vec![], sample_rows(), false);
+        app.updated_at = Some(std::time::Instant::now());
+        app
+    }
+
+    /// The footer's hints part: the text in front of "r refresh" (or the
+    /// status), without the leading blank.
+    fn hints_part(footer: &str, status: &str) -> String {
+        let end = footer
+            .find("r refresh")
+            .or_else(|| footer.find(status))
+            .unwrap_or_else(|| panic!("no status in {footer:?}"));
+        footer[..end].to_string()
+    }
+
+    /// Asserts the hints part holds whole hints from the left in today's
+    /// order, with no gap, and returns how many were shown.
+    fn assert_whole_hints(part: &str, footer: &str) -> usize {
+        let mut rest = part.strip_prefix(' ').unwrap_or(part);
+        let mut shown = 0;
+        for hint in HINTS {
+            match rest.strip_prefix(hint) {
+                Some(after) => {
+                    rest = after
+                        .strip_prefix("  ")
+                        .unwrap_or_else(|| panic!("two blanks after {hint:?}: {footer:?}"));
+                    shown += 1;
+                }
+                None => break,
+            }
+        }
+        assert!(rest.trim().is_empty(), "a cut or skipped hint: {footer:?}");
+        shown
+    }
+
+    #[test]
+    fn footer_shows_every_hint_when_wide() {
+        let mut app = app_updated();
+        let footer = screen(&mut app, 120, 20)[19].clone();
+        for hint in HINTS {
+            assert!(footer.contains(hint), "{hint:?} in {footer:?}");
+        }
+        assert!(footer.contains("r refresh"), "{footer}");
+        assert!(footer.contains(" updated "), "{footer}");
+    }
+
+    #[test]
+    fn footer_drops_whole_hints_from_the_right() {
+        let mut last = HINTS.len();
+        for width in (40..=120).rev() {
+            let mut app = app_updated();
+            let footer = screen(&mut app, width, 20)[19].clone();
+            assert!(footer.contains(" updated "), "{width}: {footer}");
+            // "close" shows whole with its blanks, or not at all.
+            assert!(
+                !footer.contains("clos") || footer.contains("q close  "),
+                "{width}: {footer}"
+            );
+            let part = hints_part(&footer, "updated");
+            let shown = assert_whole_hints(&part, &footer);
+            // Two blank cells (at least) before "r refresh".
+            assert!(part.ends_with("  "), "{width}: {footer:?}");
+            assert!(shown <= last, "{width}: narrower shows no more hints");
+            last = shown;
+        }
+        assert!(last < HINTS.len(), "40 cells leaves some out");
+    }
+
+    #[test]
+    fn footer_at_the_reported_width_drops_close_whole() {
+        for width in 76..=78 {
+            let mut app = app_updated();
+            let footer = screen(&mut app, width, 20)[19].clone();
+            assert!(!footer.contains("clos"), "{width}: {footer}");
+            assert!(footer.contains("? all keys"), "{width}: {footer}");
+        }
+    }
+
     #[test]
     fn help_names_ctrl_r() {
         let mut app = app_with(vec![], vec![], false);
@@ -3059,5 +3145,72 @@ mod tests {
                 && r.contains("open ones: start failed jobs again (then y)")),
             "{rows:#?}"
         );
+    }
+
+    #[test]
+    fn footer_hints_make_room_for_a_long_status_and_come_back() {
+        let mut app = app_updated();
+        app.error = Some("GitLab: the merge request list could not be loaded".into());
+        let footer = screen(&mut app, 90, 20)[19].clone();
+        assert!(footer.contains("could not be loaded"), "{footer}");
+        let shown = assert_whole_hints(&hints_part(&footer, "GitLab:"), &footer);
+        assert!(shown < HINTS.len(), "{footer}");
+        for (status, flash) in [
+            ("\u{f46a} refreshing", false),
+            ("Opened in the browser", true),
+        ] {
+            let mut app = app_updated();
+            if flash {
+                app.flash = Some((status.into(), std::time::Instant::now()));
+            } else {
+                app.loading = true;
+            }
+            let footer = screen(&mut app, 60, 20)[19].clone();
+            assert!(footer.contains(status), "{footer}");
+            assert_whole_hints(&hints_part(&footer, status), &footer);
+        }
+        app.error = None;
+        let footer = screen(&mut app, 90, 20)[19].clone();
+        let back = assert_whole_hints(&hints_part(&footer, "updated"), &footer);
+        assert_eq!(back, HINTS.len(), "{footer}");
+    }
+
+    #[test]
+    fn left_out_hints_cannot_be_clicked() {
+        let mut app = app_updated();
+        let footer = screen(&mut app, 60, 20)[19].clone();
+        assert!(!footer.contains("q close"), "{footer}");
+        let keys: Vec<char> = app
+            .hits
+            .iter()
+            .filter(|(r, _)| r.y == 19)
+            .filter_map(|(_, h)| match h {
+                Hit::Key(c) => Some(*c),
+                _ => None,
+            })
+            .collect();
+        assert!(!keys.contains(&'q'), "{keys:?}");
+        assert!(keys.contains(&'o') && keys.contains(&'r'), "{keys:?}");
+        // From the end of the last shown hint up to "r refresh", where the
+        // left-out hints would be: no click area on any cell.
+        let cell = |text: &str| footer[..footer.find(text).unwrap()].chars().count() as u16;
+        for x in cell("/ search") + 8..cell("r refresh") {
+            assert!(
+                !app.hits
+                    .iter()
+                    .any(|(r, _)| r.y == 19 && r.x <= x && x < r.x + r.width),
+                "{x}: {:?}",
+                app.hits
+            );
+        }
+        // A shown hint still opens: "/" starts a search.
+        let slash = cell("/ search");
+        let (rect, hit) = *app
+            .hits
+            .iter()
+            .find(|(r, _)| r.y == 19 && r.x == slash)
+            .expect("click area of / search");
+        assert_eq!(hit, Hit::Key('/'));
+        assert!(rect.width >= 1);
     }
 }

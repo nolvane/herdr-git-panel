@@ -68,6 +68,11 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   only the error "Field 'approvalsLeft' doesn't exist on type
   'MergeRequest'". The Approvals column shows how many approved, and the
   details who did (#28).
+
+- On a narrow pane, the footer leaves out whole key hints from the right
+  end instead of cutting one in the middle of its word, and always keeps
+  two blanks before "r refresh" (#18).
+
 - With `glab` installed but not logged in, GitLab is now left out quietly,
   like GitHub without `gh`'s login, instead of showing "GitLab: Invalid
   token" in the footer on every refresh. When no forge can be used, the list
