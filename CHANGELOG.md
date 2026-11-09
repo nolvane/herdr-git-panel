@@ -52,8 +52,8 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- On a GitLab Community Edition server (such as a self-hosted Free one
-  without approval rules) the list now shows the merge requests instead of
+- On a GitLab Community Edition server, which has no approval rules, the
+  list now shows the merge requests instead of
   only the error "Field 'approvalsLeft' doesn't exist on type
   'MergeRequest'". The Approvals column shows how many approved, and the
   details who did (#28).

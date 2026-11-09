@@ -2643,11 +2643,9 @@ mod tests {
         // GitLab Community Edition: no approval rules, so nothing "of needed".
         let mut approved = sample_mr(2, ReviewState::Unreviewed, Pipeline::Success);
         approved.approvals_given = 1;
-        approved.approvals_required = Some(0);
         approved.approved_by = vec!["alex".into()];
         approved.approved = true;
-        let mut open = sample_mr(1, ReviewState::Unreviewed, Pipeline::Success);
-        open.approvals_required = Some(0);
+        let open = sample_mr(1, ReviewState::Unreviewed, Pipeline::Success);
         let mut app = app_with(vec![], vec![approved.clone(), open.clone()], false);
         let icons = Icons { nerd: false };
         let cell = |mr: &MergeRequest, app: &App| {

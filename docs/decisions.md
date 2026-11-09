@@ -602,8 +602,9 @@ rejected every list (#28). The list now sends the full query first; when
 GitLab answers that `approvalsRequired`, `approvalsLeft` or `approvalState`
 "doesn't exist on type 'MergeRequest'", it sends the same query once more
 without them and remembers the host while the list runs, so later refreshes
-take one request again. Without those fields the existing parsing already
-counts who approved, needs nothing and waits for no rule.
+take one request again. Without those fields the parsing counts who
+approved, waits for no rule and leaves the number needed unknown (`None`,
+as GitHub does when it doesn't say), so the column shows no "of needed".
 
 - Retry on that error rather than asking the server which edition it is: an
   extra request on every open for everyone (gitlab.com included) costs more
@@ -615,6 +616,8 @@ counts who approved, needs nothing and waits for no rule.
   builders stay as they are; a test checks every query in every state still
   holds that piece and loses all three fields without it.
 - `approvalsLeft` was never read and is no longer asked for.
+- The error is recognised by the field named before "doesn't exist on type"
+  and the type `MergeRequest`, in any quotes, not by the whole sentence.
 - Checked on 2026-11-09 without a login against a public Community Edition
   server: the query without those fields is accepted and returns
   `approved` and `approvedBy`.
