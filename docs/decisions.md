@@ -810,6 +810,20 @@ hidden `/merge` or `/approve` in it would be a surprise.
   the commands differ between GitLab versions and editions.
 - An exception to "Replies and comments from the activity tab", which sends
   the text as typed otherwise. GitHub has no quick actions and is unchanged.
-- The list's own rendering of the posted note shows the backslash
-  (`\/merge later`), as it does for change requests; GitLab's web shows
-  `/merge later`.
+- The list's own rendering of the posted note shows `/merge later` since
+  #35, like GitLab's web (see the entry below).
+
+## 2026-11-09: The list shows `\/` as `/`, like the forges' pages
+
+The list's Markdown renderer (`inline` in `src/text.rs`) shows a backslash
+before `/` the way Markdown does (#35): `\/merge later`, which the list
+sends for a GitLab line starting with `/`, shows as `/merge later`, and an
+escaped backslash (`\\/`) shows as `\/`. Code spans and code blocks keep
+the backslash, as on GitLab's page.
+
+- In the renderer, not in GitLab's read path: there it would also strip the
+  backslash inside code, unlike GitLab's page.
+- For every forge and for descriptions too: the renderer knows no forge,
+  and GitHub's Markdown shows `\/` as `/` as well.
+- Only `\/`: other escapes (`\*`, `\_`, `\#`) still show their backslash;
+  the list writes no other.

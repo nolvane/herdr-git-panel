@@ -3299,6 +3299,58 @@ mod tests {
     }
 
     #[test]
+    fn escaped_slashes_show_as_on_the_forges_pages() {
+        let now = time::now();
+        let note = |body: &str| crate::model::Discussion {
+            id: String::new(),
+            resolvable: false,
+            resolved: false,
+            place: None,
+            notes: vec![note_at("sam", body, now - 60)],
+            hidden: 0,
+        };
+        // A GitLab note as the list posted it, and a GitHub comment with
+        // and without an escape: the activity tab follows Markdown.
+        let rows = activity_text(vec![
+            note("\\/merge later\nplain /text\n\\/approve"),
+            note("Looks good, see a/b."),
+            note("Typed \\/ on GitHub."),
+        ]);
+        assert!(!rows.iter().any(|r| r.contains('\\')), "{rows:#?}");
+        for shown in [
+            "/merge later",
+            "plain /text",
+            "/approve",
+            "Looks good, see a/b.",
+            "Typed / on GitHub.",
+        ] {
+            assert!(rows.iter().any(|r| r.contains(shown)), "{shown}: {rows:#?}");
+        }
+
+        // The description follows the same rule.
+        let mut mr = sample_mr(1, ReviewState::Approved, Pipeline::Success);
+        mr.description = "\\/merge later\n\n`\\/kept`".into();
+        let mut app = app_with(vec![], vec![mr.clone()], false);
+        app.details = true;
+        app.mine_state.select(Some(0));
+        let rows = screen(&mut app, 160, 40);
+        assert!(
+            rows.iter()
+                .any(|r| r.contains("/merge later") && !r.contains("\\/merge")),
+            "{rows:#?}"
+        );
+        assert!(rows.iter().any(|r| r.contains("\\/kept")), "{rows:#?}");
+
+        // The preview still shows the text as typed.
+        let mut c = Compose::new(mr, crate::compose::Target::Comment);
+        c.field.text = "/merge later".into();
+        c.stage = Stage::Preview;
+        let (lines, _) = compose_lines(&c, 40);
+        let first: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(first, "/merge later");
+    }
+
+    #[test]
     fn a_cut_thread_says_how_many_replies_are_not_shown() {
         let now = time::now();
         let thread = |hidden| crate::model::Discussion {

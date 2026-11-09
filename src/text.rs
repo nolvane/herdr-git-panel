@@ -103,7 +103,7 @@ pub fn wrap_tagged(
     (lines, spots)
 }
 
-/// Inline Markdown: **bold**, `code`, [links](url) and bare URLs. Links
+/// Inline Markdown: **bold**, `code`, [links](url), bare URLs and `\/`. Links
 /// carry their target. Everything else is shown as written.
 fn inline(text: &str, base: Style) -> Vec<(Span<'static>, Option<String>)> {
     let link_style = Style::new().fg(BLUE).add_modifier(Modifier::UNDERLINED);
@@ -173,6 +173,17 @@ fn inline(text: &str, base: Style) -> Vec<(Span<'static>, Option<String>)> {
                 rest = &rest[url.len()..];
                 continue;
             }
+        }
+        // Backslashes before `/` as Markdown shows them: each pair is one
+        // backslash, an odd last one escapes the `/` and is not shown
+        // (`\/` is how the list sends a GitLab line starting with `/`).
+        // Backslashes before anything else are shown as written.
+        let run = rest.len() - rest.trim_start_matches('\\').len();
+        if run > 0 && rest[run..].starts_with('/') {
+            plain.push_str(&"\\".repeat(run / 2));
+            plain.push('/');
+            rest = &rest[run + 1..];
+            continue;
         }
         plain.push(ch);
         rest = &rest[ch.len_utf8()..];
@@ -391,6 +402,24 @@ mod tests {
                 (0, 15, 16, "https://y.test/2".to_string())
             ]
         );
+    }
+
+    #[test]
+    fn an_escaped_slash_shows_as_markdown_shows_it() {
+        let t = |md: &str| text(&markdown_links(md, 80).0);
+        assert_eq!(t("\\/merge later"), ["/merge later"]);
+        assert_eq!(t("\\/a and \\/b, not a\\b"), ["/a and /b, not a\\b"]);
+        // An escaped backslash before `/` shows one backslash.
+        assert_eq!(t("\\\\/x and \\\\\\/y"), ["\\/x and \\/y"]);
+        // Other escapes are shown as written, as before.
+        assert_eq!(t("\\*x\\ and \\"), ["\\*x\\ and \\"]);
+        // Code keeps its backslash, as on the forges' pages.
+        assert_eq!(t("run `\\/x` now"), ["run \\/x now"]);
+        assert_eq!(
+            t("```\n\\/usr/bin/env\n```\n\\/after"),
+            ["  \\/usr/bin/env", "/after"]
+        );
+        assert_eq!(t("- \\/one\n## \\/two"), ["• /one", "", "/two"]);
     }
 
     #[test]
