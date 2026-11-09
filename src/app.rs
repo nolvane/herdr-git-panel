@@ -446,7 +446,7 @@ impl App {
     /// requests" (GitLab's word, also for a mix of both).
     pub fn plural_noun(&self) -> &'static str {
         let github = match self.scoped_project() {
-            Some(p) => p.host == crate::github::HOST,
+            Some(p) => p.on(crate::github::HOST),
             None => self.data.as_ref().is_some_and(|d| {
                 let mut all = d
                     .review
@@ -548,7 +548,7 @@ impl App {
         let mut rows: Vec<&MergeRequest> = list
             .into_iter()
             .filter(|mr| match self.scoped_project() {
-                Some(p) if section != Section::All => mr.project == p.path && mr.host == p.host,
+                Some(p) if section != Section::All => p.is(&mr.host, &mr.project),
                 _ => true,
             })
             .filter(|mr| match section {
@@ -1984,15 +1984,10 @@ mod tests {
 
     /// The list opened in a clone of `acme/app` on gitlab.com, inside Herdr.
     fn app_in_clone(dir: &std::path::Path) -> App {
-        let mut app = app();
-        let project = Project {
-            host: "gitlab.com".into(),
-            path: "acme/app".into(),
-        };
-        app.project = Some(project.clone());
+        let mut app = app_in("gitlab.com", "acme/app");
         app.remotes = vec![crate::repo::Remote {
             name: "origin".into(),
-            project,
+            project: app.project.clone().unwrap(),
         }];
         app.workdir = Some(dir.to_path_buf());
         app.herdr = true;
@@ -2001,6 +1996,47 @@ mod tests {
 
     fn flash(app: &App) -> Option<&str> {
         app.flash.as_ref().map(|(t, _)| t.as_str())
+    }
+
+    /// `app()` opened in a clone whose remote names `host`/`path`.
+    fn app_in(host: &str, path: &str) -> App {
+        let mut app = app();
+        app.project = Some(Project {
+            host: host.into(),
+            path: path.into(),
+        });
+        app.scope = Scope::Current;
+        app.clamp_selection();
+        app
+    }
+
+    #[test]
+    fn this_project_ignores_the_case_of_the_remote() {
+        // The forge says `acme/app` on `gitlab.com`; the clone was made from
+        // other capitals.
+        for (host, path) in [
+            ("gitlab.com", "Acme/App"),
+            ("GitLab.com", "acme/app"),
+            ("GITLAB.COM", "ACME/APP"),
+        ] {
+            let app = app_in(host, path);
+            assert_eq!(iids(&app.rows(Section::Mine)), [6, 5, 4], "{host}/{path}");
+            assert_eq!(iids(&app.rows(Section::Review)), [3, 2, 1], "{host}/{path}");
+        }
+        // A project whose name only starts or ends the same is another one.
+        for path in ["acme/app2", "acme/ap", "Acme/App2", "other/acme/app"] {
+            let app = app_in("gitlab.com", path);
+            assert!(iids(&app.rows(Section::Mine)).is_empty(), "{path}");
+            assert!(iids(&app.rows(Section::Review)).is_empty(), "{path}");
+        }
+    }
+
+    #[test]
+    fn the_header_word_follows_a_project_in_other_case() {
+        let mut app = app_in("GitHub.com", "Acme/App");
+        assert_eq!(app.plural_noun(), "Pull requests");
+        app.project.as_mut().unwrap().host = "GitLab.com".into();
+        assert_eq!(app.plural_noun(), "Merge requests");
     }
 
     #[test]

@@ -15,6 +15,19 @@ impl Project {
     pub fn name(&self) -> &str {
         self.path.rsplit('/').next().unwrap_or(&self.path)
     }
+
+    /// Whether it lives on `host`. Host names ignore case, so a remote
+    /// written `GitHub.com` is on `github.com`.
+    pub fn on(&self, host: &str) -> bool {
+        self.host.eq_ignore_ascii_case(host)
+    }
+
+    /// Whether it is `host`/`path`. GitHub and GitLab ignore case in both,
+    /// so a clone made from `Acme/App` is `acme/app`; only the whole path
+    /// counts, so it is never `acme/app2`.
+    pub fn is(&self, host: &str, path: &str) -> bool {
+        self.on(host) && self.path.eq_ignore_ascii_case(path)
+    }
 }
 
 /// The project of the repository that contains `dir`, taken from the `origin`
@@ -101,10 +114,9 @@ pub struct Remote {
 }
 
 impl Remote {
-    /// Whether it points at `host`/`path`. GitHub and GitLab ignore case in
-    /// both, so a clone made from `Acme/App` matches `acme/app`.
+    /// Whether it points at `host`/`path`, ignoring case as [`Project::is`].
     pub fn points_at(&self, host: &str, path: &str) -> bool {
-        self.project.host.eq_ignore_ascii_case(host) && self.project.path.eq_ignore_ascii_case(path)
+        self.project.is(host, path)
     }
 }
 
@@ -143,7 +155,14 @@ pub fn parse_remote(url: &str) -> Option<Project> {
         (host.to_string(), path.to_string())
     };
     let path = path.trim_matches('/');
-    let path = path.strip_suffix(".git").unwrap_or(path).to_string();
+    // `.git` in any case, as the forges accept `App.GIT` too.
+    let path = match path.len().checked_sub(4) {
+        Some(cut) if path.is_char_boundary(cut) && path[cut..].eq_ignore_ascii_case(".git") => {
+            &path[..cut]
+        }
+        _ => path,
+    }
+    .to_string();
     if host.is_empty() || !path.contains('/') {
         return None;
     }
@@ -198,6 +217,23 @@ mod tests {
         assert!(all[0].points_at("GitHub.com", "alex/app"));
         assert!(!all[0].points_at("gitlab.com", "alex/app"));
         assert!(!all[0].points_at("github.com", "alex/app2"));
+    }
+
+    #[test]
+    fn a_project_matches_ignoring_case_but_only_whole() {
+        let p = parse_remote("git@GitHub.com:Acme/App.git").unwrap();
+        assert!(p.on("github.com"));
+        assert!(p.is("github.com", "acme/app"));
+        assert!(
+            !p.is("github.com", "acme/app2"),
+            "a longer name is another project"
+        );
+        assert!(!p.is("github.com", "acme/ap"));
+        assert!(!p.is("gitlab.com", "acme/app"));
+        assert!(!p.on("github.co"));
+        // The `.git` ending counts in any case too.
+        let p = parse_remote("https://GitHub.com/Acme/App.GIT").unwrap();
+        assert!(p.is("github.com", "acme/app"), "{}", p.path);
     }
 
     #[test]
