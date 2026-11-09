@@ -150,17 +150,50 @@ fn run_with(
     })
 }
 
-/// Whether the tool's error output says it is not logged in.
+/// The forges' whole answers when they refuse the token: GitHub's "Bad
+/// credentials", GitLab's "401 Unauthorized" (REST), "Invalid token"
+/// (GraphQL) and `invalid_token` (an expired OAuth token).
+const REFUSALS: [&str; 4] = [
+    "bad credentials",
+    "401 unauthorized",
+    "invalid token",
+    "invalid_token",
+];
+
+/// Whether the tool's error output says it is not logged in: the HTTP
+/// status 401 as gh and glab write it ("(HTTP 401)", "HTTP 401:", glab's
+/// "<url>: 401 {message: …}"), the tools' own words, or a refusal as the
+/// whole message of a line. Not a bare "401" or "unauthorized": a number,
+/// a name or an integration's message may hold those (#29).
 pub fn not_logged_in(stderr: &str) -> bool {
     let lower = stderr.to_lowercase();
-    lower.contains("401")
-        || lower.contains("unauthorized")
-        || lower.contains("not authenticated")
-        || lower.contains("auth login")
-        || lower.contains("not logged in")
-        // GitLab refusing the token: none, revoked, or an expired OAuth one.
-        || lower.contains("invalid token")
-        || lower.contains("invalid_token")
+    let status = ["http 401", ": 401 {"].iter().any(|w| lower.contains(w));
+    let words = ["not logged in", "not authenticated", "auth login"]
+        .iter()
+        .any(|w| lower.contains(w));
+    let whole = lower.lines().any(|line| {
+        let mut line = line.trim();
+        for prefix in ["glab:", "gh:", "error:"] {
+            line = line.strip_prefix(prefix).unwrap_or(line).trim();
+        }
+        REFUSALS.contains(&line.trim_end_matches('.'))
+    });
+    status || words || whole
+}
+
+/// Whether a forge's JSON answer refuses the token: one of [`REFUSALS`] as
+/// its whole `message`, `error` or GraphQL error message. Whole messages
+/// only, so an error that merely mentions 401 or a token (a query's
+/// complexity, an integration) stays an error.
+pub fn refused(value: &serde_json::Value) -> bool {
+    let is = |v: Option<&serde_json::Value>| {
+        v.and_then(serde_json::Value::as_str)
+            .is_some_and(|m| REFUSALS.contains(&m.trim().to_lowercase().as_str()))
+    };
+    let errors = value.get("errors").and_then(serde_json::Value::as_array);
+    errors.into_iter().flatten().any(|e| is(e.get("message")))
+        || is(value.get("error"))
+        || is(value.get("message"))
 }
 
 /// What to do about a tool that is not logged in to `host`. glab logs in
@@ -195,15 +228,17 @@ pub fn explain_failure(name: &str, host: &str, stderr: &str) -> String {
     format!("{name} failed: {reason}")
 }
 
-/// Why a failed REST call (`glab api`, `gh api`) failed: the forge's own
-/// message from its JSON answer when there is one (`label` names the forge),
-/// else the tool's error output.
+/// Why a failed REST call (`glab api`, `gh api`) failed: the forge's JSON
+/// answer decides when there is one, a refusal of the token as the login
+/// hint and any other message as the forge's own words (`label` names the
+/// forge); else the tool's error output.
 pub fn api_error(name: &str, host: &str, label: &str, out: &Output) -> String {
-    if !not_logged_in(&out.stderr) {
-        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
-            if let Some(msg) = rest_message(&value) {
-                return format!("{label}: {msg}");
-            }
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
+        if refused(&value) {
+            return login_hint(name, host);
+        }
+        if let Some(msg) = rest_message(&value) {
+            return format!("{label}: {msg}");
         }
     }
     explain_failure(name, host, &out.stderr)
@@ -351,6 +386,124 @@ mod tests {
             &failed("", "dial tcp: lookup x.com: no such host"),
         );
         assert_eq!(e, "Cannot reach x.com: check the connection");
+    }
+
+    #[test]
+    fn only_a_refused_login_is_not_logged_in() {
+        // What gh and glab write when the login is missing or refused.
+        for stderr in [
+            "To get started with GitHub CLI, please run:  gh auth login",
+            "gh: Bad credentials (HTTP 401)",
+            "HTTP 401: Bad credentials (https://api.github.com/graphql)\nTry authenticating with:  gh auth login -h github.com",
+            "glab: 401 Unauthorized",
+            "glab: Invalid token",
+            "glab: invalid_token",
+            "ERROR\n\n  401 Unauthorized\n",
+            "PUT https://gitlab.com/api/v4/projects/acme%2Fapp/merge_requests/7/merge: 401 {message: 401 Unauthorized}",
+            "glab: HTTP 401",
+        ] {
+            assert!(not_logged_in(stderr), "{stderr}");
+        }
+        // Errors that only mention 401 or "unauthorized" stay errors.
+        for stderr in [
+            "gh: Query has complexity of 401, which exceeds max complexity of 400",
+            "glab: merge request !401 cannot be merged",
+            "glab: Jira integration: 401 Unauthorized",
+            "gh: Unauthorized to push to protected branch",
+            "GraphQL: Could not resolve to a Repository with the name 'acme/app401'.",
+            "dial tcp: lookup git401.acme.test: no such host",
+        ] {
+            assert!(!not_logged_in(stderr), "{stderr}");
+        }
+    }
+
+    #[test]
+    fn writes_that_mention_401_say_what_failed() {
+        assert_eq!(
+            explain_failure(
+                "glab",
+                "gitlab.com",
+                "glab: merge request !401 cannot be merged"
+            ),
+            "glab failed: glab: merge request !401 cannot be merged"
+        );
+        assert_eq!(
+            explain_failure(
+                "glab",
+                "gitlab.com",
+                "ERROR\n  Jira integration: 401 Unauthorized"
+            ),
+            "glab failed: Jira integration: 401 Unauthorized"
+        );
+        assert_eq!(
+            explain_failure(
+                "gh",
+                "github.com",
+                "GraphQL: Pull request #401 is not mergeable (mergePullRequest)"
+            ),
+            "gh failed: GraphQL: Pull request #401 is not mergeable (mergePullRequest)"
+        );
+        // A real refusal still says how to log in, with the host when it
+        // is not gitlab.com.
+        assert_eq!(
+            explain_failure(
+                "gh",
+                "github.com",
+                "HTTP 401: Bad credentials (https://api.github.com/graphql)"
+            ),
+            "gh is not logged in to github.com: run gh auth login"
+        );
+        assert_eq!(
+            explain_failure("glab", "git.acme.test", "glab: 401 Unauthorized"),
+            "glab is not logged in to git.acme.test: run glab auth login --hostname git.acme.test"
+        );
+        // No network to a host with 401 in its name is no login problem.
+        assert_eq!(
+            explain_failure(
+                "glab",
+                "git401.acme.test",
+                "dial tcp: lookup git401.acme.test: no such host"
+            ),
+            "Cannot reach git401.acme.test: check the connection"
+        );
+    }
+
+    #[test]
+    fn rest_errors_that_mention_401_are_the_forges_words() {
+        let e = api_error(
+            "glab",
+            "gitlab.com",
+            "GitLab",
+            &failed(
+                r#"{"message":"Jira integration: 401 Unauthorized"}"#,
+                "glab: Jira integration: 401 Unauthorized (HTTP 422)",
+            ),
+        );
+        assert_eq!(e, "GitLab: Jira integration: 401 Unauthorized");
+        let e = api_error(
+            "gh",
+            "github.com",
+            "GitHub",
+            &failed(
+                r#"{"message":"Issue #401 is locked"}"#,
+                "gh: Issue #401 is locked (HTTP 403)",
+            ),
+        );
+        assert_eq!(e, "GitHub: Issue #401 is locked");
+        // GitLab's refusal as its whole answer still says how to log in.
+        let e = api_error(
+            "glab",
+            "git.acme.test",
+            "GitLab",
+            &failed(
+                r#"{"message":"401 Unauthorized"}"#,
+                "glab: 401 Unauthorized",
+            ),
+        );
+        assert_eq!(
+            e,
+            "glab is not logged in to git.acme.test: run glab auth login --hostname git.acme.test"
+        );
     }
 
     #[test]

@@ -578,6 +578,21 @@ mod tests {
     const BOTH: [bool; 2] = [true, true];
 
     #[test]
+    fn a_github_error_shows_instead_of_a_login_hint() {
+        // GitLab not logged in, GitHub failing for a reason of its own.
+        let e = "GitHub: Query has complexity of 401, which exceeds max complexity of 400";
+        let result = combine(
+            "gitlab.com",
+            BOTH,
+            Status::Open,
+            None,
+            [Ok(None), Err(e.into())],
+            [Ok(None), Err(e.into())],
+        );
+        assert_eq!(result.err().as_deref(), Some(e));
+    }
+
+    #[test]
     fn gitlab_not_logged_in_is_left_out_quietly() {
         // glab not logged in (`Ok(None)` for its lists and "All"), gh
         // answering: GitHub's lists, nothing in the footer.

@@ -379,12 +379,21 @@ fn graphql(query: &str, vars: &[(&str, &str)]) -> Result<Value, Failure> {
         };
     }
     let out = cli::run("gh", cmd, HOST).map_err(Failure::Other)?;
-    if !out.success && cli::not_logged_in(&out.stderr) {
-        return Err(Failure::NotLoggedIn);
-    }
+    answer(&out)
+}
+
+/// GitHub's answer in gh's output: its JSON decides when there is one, gh's
+/// error output only without it.
+fn answer(out: &cli::Output) -> Result<Value, Failure> {
     // GitHub's own errors come as JSON, also when gh exits with an error.
     if let Ok(value) = serde_json::from_slice::<Value>(&out.stdout) {
+        if !out.success && cli::refused(&value) {
+            return Err(Failure::NotLoggedIn);
+        }
         return Ok(value);
+    }
+    if !out.success && cli::not_logged_in(&out.stderr) {
+        return Err(Failure::NotLoggedIn);
     }
     if !out.success {
         return Err(Failure::Other(cli::explain_failure(
@@ -743,11 +752,7 @@ pub fn reply(thread: &str, body: &str) -> Result<bool, String> {
     let mut cmd = cli::command("gh");
     cmd.args(input_args("graphql", "POST"));
     let out = cli::run_input("gh", cmd, HOST, reply_body(thread, body))?;
-    if !out.success && cli::not_logged_in(&out.stderr) {
-        return Err(String::from(Failure::NotLoggedIn));
-    }
-    let value = serde_json::from_slice::<Value>(&out.stdout)
-        .map_err(|_| cli::explain_failure("gh", HOST, &out.stderr))?;
+    let value = answer(&out)?;
     if let Some(msg) = cli::graphql_errors(&value) {
         return Err(format!("GitHub: {msg}"));
     }
@@ -1178,6 +1183,76 @@ mod tests {
         let part = parse_nodes(&v, 41).unwrap();
         assert_eq!(part.items.len(), 1);
         assert_eq!(part.total, 41);
+    }
+
+    fn output(success: bool, stdout: &str, stderr: &str) -> cli::Output {
+        cli::Output {
+            success,
+            code: Some(if success { 0 } else { 1 }),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.into(),
+        }
+    }
+
+    #[test]
+    fn a_refused_login_leaves_github_out() {
+        // What gh 2.x writes without a login, and with a token GitHub
+        // refuses (HTTP 401).
+        let logged_out = output(
+            false,
+            "",
+            "To get started with GitHub CLI, please run:  gh auth login\nAlternatively, populate the GH_TOKEN environment variable with a GitHub API authentication token.",
+        );
+        assert!(matches!(answer(&logged_out), Err(Failure::NotLoggedIn)));
+        let refused = output(
+            false,
+            r#"{"message":"Bad credentials","documentation_url":"https://docs.github.com/rest","status":"401"}"#,
+            "gh: Bad credentials (HTTP 401)",
+        );
+        assert!(matches!(answer(&refused), Err(Failure::NotLoggedIn)));
+        assert_eq!(
+            error_of(&refused),
+            "gh is not logged in to github.com: run gh auth login"
+        );
+    }
+
+    fn error_of(out: &cli::Output) -> String {
+        match answer(out) {
+            Err(f) => String::from(f),
+            Ok(_) => panic!("an error"),
+        }
+    }
+
+    #[test]
+    fn errors_that_mention_401_stay_errors() {
+        // A GraphQL error while logged in: GitHub's own answer, shown.
+        let complex = output(
+            false,
+            r#"{"errors":[{"message":"Query has complexity of 401, which exceeds max complexity of 400"}]}"#,
+            "gh: Query has complexity of 401, which exceeds max complexity of 400",
+        );
+        let Ok(value) = answer(&complex) else {
+            panic!("GitHub's answer");
+        };
+        assert_eq!(
+            parse(&value).unwrap_err(),
+            "GitHub: Query has complexity of 401, which exceeds max complexity of 400"
+        );
+        // Without JSON, the tool's error output is the error.
+        let unauthorized = output(false, "", "gh: Unauthorized to view repository acme/app401");
+        assert_eq!(
+            error_of(&unauthorized),
+            "gh failed: gh: Unauthorized to view repository acme/app401"
+        );
+        let offline = output(
+            false,
+            "",
+            "Post \"https://api.github.com/graphql\": dial tcp: lookup api.github.com: no such host",
+        );
+        assert_eq!(
+            error_of(&offline),
+            "Cannot reach github.com: check the connection"
+        );
     }
 
     #[test]
