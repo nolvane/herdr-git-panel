@@ -834,6 +834,31 @@ fn approve_args(project: &str, iid: u64, head_sha: &str) -> Vec<String> {
     args
 }
 
+/// The REST request that submits a review requesting changes with
+/// `reason`, on the head the list showed (`head_sha`), so the review
+/// belongs to the commit that was on screen.
+fn request_changes_body(head_sha: &str, reason: &str) -> Vec<u8> {
+    let mut review = serde_json::json!({ "event": "REQUEST_CHANGES", "body": reason });
+    if !head_sha.is_empty() {
+        review["commit_id"] = head_sha.into();
+    }
+    review.to_string().into_bytes()
+}
+
+/// Submits a review that requests changes, with `reason` as its text.
+pub fn request_changes(mr: &MergeRequest, reason: &str) -> Result<(), String> {
+    let endpoint = format!("repos/{}/pulls/{}/reviews", mr.project, mr.iid);
+    let mut cmd = cli::command("gh");
+    cmd.args(input_args(&endpoint, "POST"));
+    let data = request_changes_body(&mr.head_sha, reason);
+    let out = cli::run_input("gh", cmd, HOST, data)?;
+    if out.success {
+        Ok(())
+    } else {
+        Err(cli::api_error("gh", HOST, "GitHub", &out))
+    }
+}
+
 /// The pull request's changes as a unified diff, without colours.
 pub fn fetch_diff(mr: &MergeRequest) -> Result<String, String> {
     pr_command(mr, &["diff", "--color", "never"])
@@ -891,6 +916,34 @@ mod tests {
             comments_endpoint("acme/app", 2903),
             "repos/acme/app/issues/2903/comments"
         );
+    }
+
+    #[test]
+    fn a_change_request_is_a_review_on_the_shown_head() {
+        let sent: Value =
+            serde_json::from_slice(&request_changes_body("abc123", "Rename it.")).unwrap();
+        assert_eq!(
+            sent,
+            json!({"event": "REQUEST_CHANGES", "body": "Rename it.", "commit_id": "abc123"})
+        );
+        let sent: Value = serde_json::from_slice(&request_changes_body("", "Rename it.")).unwrap();
+        assert_eq!(
+            sent,
+            json!({"event": "REQUEST_CHANGES", "body": "Rename it."})
+        );
+    }
+
+    #[test]
+    fn a_change_request_reason_is_sent_as_typed() {
+        for reason in [
+            "/merge later",
+            "\"quotes\", {owner} and $int:5",
+            "Bitte ändern: Grösse 👍\nzweite Zeile",
+            &"long ".repeat(200),
+        ] {
+            let sent: Value = serde_json::from_slice(&request_changes_body("abc", reason)).unwrap();
+            assert_eq!(sent["body"], reason);
+        }
     }
 
     #[test]

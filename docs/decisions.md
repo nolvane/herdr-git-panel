@@ -547,3 +547,48 @@ Now both forges work the same way (#19).
   footer.
 - A real GitLab error (no network, a GraphQL error while logged in, the time
   limit) still shows in the footer while GitHub's lists stay.
+
+## 2026-11-09: Requesting changes with a reason
+
+`!` requests changes on the selected merge request (the owner's decision on
+#11, since `b` opens the branch), in the list and in both panel tabs, like
+`v`. The reason is written in the text field of replies and comments
+(`src/compose.rs`, target `RequestChanges`), over several lines, also the
+owner's decision: `Ctrl+s` shows it with the merge request's reference and
+title, only `y` sends, `n` goes back to the text, `Esc` throws it away. A
+failure keeps the text in the open box with the reason.
+
+- Refused on your own (neither forge's own rule everywhere: gitlab.com took
+  a change request on the author's own merge request in a live check, but
+  the issue asks for the same rule as approving) and on merged and closed
+  ones.
+- GitHub: `POST /repos/{owner}/{repo}/pulls/{n}/reviews` with
+  `event=REQUEST_CHANGES`, the reason as `body` and `commit_id` set to the
+  head the list showed, like approving. The JSON goes on standard input, as
+  for comments. A pending review of yours on that pull request (a reply
+  kept in it) makes GitHub refuse; the list shows GitHub's message.
+- GitLab has no API to set your own reviewer state (its GraphQL has only
+  `mergeRequestSetReviewers` and `mergeRequestReviewerRereview`), so the
+  reason goes as a REST note through the comments' endpoint whose first
+  line is the quick action `/submit_review requested_changes`. GitLab takes
+  the line out, posts the rest and writes the system note "requested
+  changes" (checked live on 2026-11-09 on gitlab.com, on a merge request
+  without reviewers); for a reviewer it sets the state the list reads as
+  `REQUESTED_CHANGES` (GitLab's documentation of the quick action). Like the web's
+  "Request changes", it also publishes your pending draft comments. The
+  quick action goes first, so nothing in the reason (an unclosed code
+  block, an HTML block, `>>>`) can hide it. GitLab answers with the note
+  as it saved it, without the line when the quick action ran; a server
+  older than 17.2, or one with "request changes" off, keeps the line, and
+  the list then says that only the comment was posted instead of
+  "Changes requested".
+- GitLab runs every line of a note that starts with `/` in its first column
+  as a quick action, so a reason such as "/merge later" would merge. Each
+  such line gets a backslash in front (`\/merge later`), which GitLab leaves
+  as text and Markdown shows as "/merge later" (checked live: `\/todo` ran
+  nothing; a line starting with a space runs nothing either, so only the
+  first column is escaped). Inside a code block the backslash shows; finding
+  code blocks the way GitLab does would be fragile for a rare case.
+  Replies and comments from #10 send their text as typed, so there a line
+  starting with `/` does run as a GitLab command, as in GitLab's own
+  comment box; whether that should change is its own issue.

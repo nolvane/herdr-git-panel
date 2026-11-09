@@ -138,6 +138,18 @@ next to the search field; each can be clicked.
 "yes"); on a GitLab merge request you already approved it takes your approval
 back (GitHub has no way to do that). Your own cannot be approved from here.
 
+`!` requests changes on the selected merge request, with a reason: a box at
+the bottom takes the text over several lines (`Enter` adds a line break),
+`Ctrl+s` shows it with the merge request it goes to, and only `y` sends it
+(`n` goes back to the text, `Esc` throws it away). On GitHub it is a review
+with "Request changes" on the commit the list showed; on GitLab a comment
+with the text that also submits your review as "requested changes" (this
+also publishes comments of yours that are still pending in a review). The
+Review dot turns red at the refresh. Your own cannot get it, like
+approving; when sending fails, the box says why and keeps the text. On
+GitLab a line of the reason that starts with `/` is sent as text, never as
+a GitLab command (`\/` in front; inside a code block the backslash shows).
+
 `m` merges it after you confirm, only when GitLab or GitHub says it can be
 merged (approved, pipeline passed, no conflict, threads resolved); otherwise
 the list says what is missing. GitLab uses the merge request's own settings
@@ -204,6 +216,7 @@ the pointer is over it.
 | `+` | Activity, open ones: write a comment on the merge request |
 | `Enter` `Ctrl+s` `Esc` | In the text of a reply or comment: line break, show it before posting (`y` posts), discard |
 | `v` | Open ones: approve (or take your approval back), after confirming |
+| `!` | Open ones of others: request changes with a reason (`Ctrl+s`, then `y` sends) |
 | `m` | Open ones: merge, after confirming, when GitLab or GitHub allows it |
 | `w` | Your own open ones: mark as draft, or as ready for review again |
 | `b` | Open ones: open the branch in a new Herdr workspace (a git worktree) |
@@ -310,10 +323,12 @@ When the list opens, it reads the git remote of its directory from
 
 Comments load when a merge request's activity tab is open. The list only
 writes what you asked for: an approval or taking one back, a merge, a reply
-to a thread or a comment (all after confirming), and resolving a thread or
-opening it again. Replies and comments go through `glab api` (GitLab's REST
-API) and `gh api` (GitHub's GraphQL API for replies, REST for comments),
-with the text as typed, sent to them on standard input. `b` runs
+to a thread, a comment or a change request (all after confirming), and
+resolving a thread or opening it again. Replies, comments and change
+requests go through `glab api` (GitLab's REST API) and `gh api` (GitHub's
+GraphQL API for replies, REST for comments and reviews), with the text as
+typed, sent to them on standard input; on GitLab a change request adds the
+quick action line in front and a backslash before lines starting with `/`. `b` runs
 `git fetch` against the clone's remote, creates or moves forward a local
 branch that is not checked out anywhere, sets its upstream when it has
 none, and asks Herdr to create the folder. Nothing else is stored and
