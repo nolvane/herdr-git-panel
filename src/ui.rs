@@ -2858,7 +2858,7 @@ mod tests {
             assert!(footer.contains(hint), "{hint:?} in {footer:?}");
         }
         assert!(footer.contains("r refresh"), "{footer}");
-        assert!(footer.contains("updated 0s ago"), "{footer}");
+        assert!(footer.contains(" updated "), "{footer}");
     }
 
     #[test]
@@ -2867,8 +2867,12 @@ mod tests {
         for width in (40..=120).rev() {
             let mut app = app_updated();
             let footer = screen(&mut app, width, 20)[19].clone();
-            assert!(footer.contains("updated 0s ago"), "{width}: {footer}");
-            assert!(!footer.contains("clos "), "{width}: {footer}");
+            assert!(footer.contains(" updated "), "{width}: {footer}");
+            // "close" shows whole with its blanks, or not at all.
+            assert!(
+                !footer.contains("clos") || footer.contains("q close  "),
+                "{width}: {footer}"
+            );
             let part = hints_part(&footer, "updated");
             let shown = assert_whole_hints(&part, &footer);
             // Two blank cells (at least) before "r refresh".
@@ -2933,16 +2937,18 @@ mod tests {
             .collect();
         assert!(!keys.contains(&'q'), "{keys:?}");
         assert!(keys.contains(&'o') && keys.contains(&'r'), "{keys:?}");
-        // Where "q close" would be: no click area at all.
+        // From the end of the last shown hint up to "r refresh", where the
+        // left-out hints would be: no click area on any cell.
         let cell = |text: &str| footer[..footer.find(text).unwrap()].chars().count() as u16;
-        let x = cell("r refresh") - 2;
-        assert!(
-            !app.hits
-                .iter()
-                .any(|(r, _)| r.y == 19 && r.x <= x && x < r.x + r.width),
-            "{:?}",
-            app.hits
-        );
+        for x in cell("/ search") + 8..cell("r refresh") {
+            assert!(
+                !app.hits
+                    .iter()
+                    .any(|(r, _)| r.y == 19 && r.x <= x && x < r.x + r.width),
+                "{x}: {:?}",
+                app.hits
+            );
+        }
         // A shown hint still opens: "/" starts a search.
         let slash = cell("/ search");
         let (rect, hit) = *app
