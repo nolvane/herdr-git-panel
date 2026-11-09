@@ -593,6 +593,49 @@ failure keeps the text in the open box with the reason.
   starting with `/` does run as a GitLab command, as in GitLab's own
   comment box; whether that should change is its own issue.
 
+## 2026-11-09: A glab without a login is not asked again until it logs in
+
+gitlab.com counts requests without a usable token as traffic of the IP
+address and answers `429 Too Many Requests` after a while (limit
+`unauthenticated_traffic_per_ip`, reset once an hour). The list asked on
+every refresh, so a `glab` without a login ran into it and showed "glab
+failed: glab: HTTP 429" (#27). The owner's decision on #27: after `glab
+auth login` the list asks GitLab right away, noticed locally, and while
+glab is not logged in it does not keep asking gitlab.com.
+
+- After GitLab answered "not logged in" (#19), refreshes leave it out: the
+  timer, `z`, `a` and the refresh after a write. `r` (and its click) asks
+  again, and so does a list that opens.
+- The login change is noticed from glab's config file `config.yml`: `glab
+  auth login` and `glab auth logout` rewrite it, also when the token goes to
+  the system keyring, and a second login to the same host rewrites it too
+  (checked with an empty `GLAB_CONFIG_DIR` and a fake host, without a
+  request to gitlab.com). The list only takes each file's modification time
+  and length, never what it holds, so it never sees a token. It looks where
+  glab keeps the file: `$GLAB_CONFIG_DIR` when set, else
+  `$XDG_CONFIG_HOME/glab-cli`, `~/.config/glab-cli` and
+  `~/Library/Application Support/glab-cli`. The main loop compares it every
+  frame (a few `stat` calls), so a login shows within a second.
+- Other writes to the file (`glab config set`, glab creating and migrating
+  a new config on its first runs) cost one more request each, bounded by
+  what the user does, not by the timer. A token in an environment variable
+  can't change for the running list; reopening it picks one up.
+- glab only says "HTTP 429", so the list can't tell gitlab.com's limits
+  apart. Until GitLab answered with lists in this open list, a 429 counts
+  as "not logged in" and stays quiet (otherwise a list opened while the
+  limit is used up would keep asking for the rest of the hour). Once it
+  answered with lists, a 429 is an error and shows, like no network,
+  until glab's config file changes (a logout or another login). Lists in
+  the same refresh prove the login too, so a 429 for "All" next to them
+  shows. The price: a logged-in user who opens the list while GitLab's
+  limit for logged-in traffic is used up sees GitLab left out without a
+  word until `r` or reopening; that limit is far higher and rarely
+  reached.
+- Not done: `glab auth status` before each refresh. With a stored token it
+  asks `/api/v4/user` every time, the refused-token case of #27, and it
+  ties the list to glab's output. A timer that asks every 15 minutes
+  (the triage's proposal) was replaced by the owner's decision.
+
 ## 2026-11-09: GitLab without approval rules (Community Edition)
 
 GitLab Community Edition has no `approvalsRequired`, `approvalsLeft` or

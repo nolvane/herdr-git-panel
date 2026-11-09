@@ -6,7 +6,10 @@ use crate::model::*;
 use crate::time;
 use serde_json::Value;
 use std::collections::HashSet;
+use std::ffi::OsString;
+use std::path::PathBuf;
 use std::sync::{LazyLock, Mutex};
+use std::time::SystemTime;
 
 /// The fields of a merge request that only GitLab's Enterprise Edition has
 /// (also gitlab.com and an unlicensed self-managed one): approval rules.
@@ -531,6 +534,59 @@ fn anonymous(value: &Value) -> bool {
         && value
             .pointer("/data/currentUser")
             .is_some_and(Value::is_null)
+}
+
+/// Whether a list's error is GitLab's rate limit (`429 Too Many
+/// Requests`), which glab reports as "HTTP 429" without saying which limit.
+pub fn limited(error: &str) -> bool {
+    let lower = error.to_lowercase();
+    lower.contains("http 429") || lower.contains("429 too many requests")
+}
+
+/// What glab's config files looked like: each one's modification time and
+/// length, `None` while it does not exist. `glab auth login` and `glab auth
+/// logout` rewrite the file, also when the token goes to the system
+/// keyring, so a different stamp means the login may have changed. Only
+/// the files' metadata is read, never what they hold (the token).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LoginStamp(pub(crate) Vec<(PathBuf, Option<(SystemTime, u64)>)>);
+
+/// The stamp of glab's config files now.
+pub fn login_stamp() -> LoginStamp {
+    stamp_of(config_files(&|key| std::env::var_os(key)))
+}
+
+fn stamp_of(files: Vec<PathBuf>) -> LoginStamp {
+    LoginStamp(
+        files
+            .into_iter()
+            .map(|path| {
+                let meta = std::fs::metadata(&path)
+                    .ok()
+                    .and_then(|m| Some((m.modified().ok()?, m.len())));
+                (path, meta)
+            })
+            .collect(),
+    )
+}
+
+/// Where glab keeps its config: only `$GLAB_CONFIG_DIR` when it is set,
+/// else every place a glab version uses (`$XDG_CONFIG_HOME`, `~/.config`,
+/// and macOS's application support folder).
+fn config_files(env: &dyn Fn(&str) -> Option<OsString>) -> Vec<PathBuf> {
+    let set = |key: &str| env(key).filter(|v| !v.is_empty()).map(PathBuf::from);
+    if let Some(dir) = set("GLAB_CONFIG_DIR") {
+        return vec![dir.join("config.yml")];
+    }
+    let mut dirs = Vec::new();
+    if let Some(xdg) = set("XDG_CONFIG_HOME") {
+        dirs.push(xdg.join("glab-cli"));
+    }
+    if let Some(home) = set("HOME") {
+        dirs.push(home.join(".config/glab-cli"));
+        dirs.push(home.join("Library/Application Support/glab-cli"));
+    }
+    dirs.into_iter().map(|d| d.join("config.yml")).collect()
 }
 
 /// Runs a `glab mr …` command on the merge request and returns its output.
@@ -2061,5 +2117,72 @@ mod tests {
             ),
             Some("GitLab: Pipeline cannot be retried".into())
         );
+    }
+
+    #[test]
+    fn a_429_is_the_rate_limit() {
+        assert!(limited("glab failed: glab: HTTP 429"));
+        assert!(limited("glab failed: 429 Too Many Requests"));
+        assert!(!limited("glab failed: HTTP 500"));
+        assert!(!limited(
+            "Cannot reach gitlab429.example.com: check the connection"
+        ));
+    }
+
+    #[test]
+    fn glab_config_is_looked_for_where_glab_keeps_it() {
+        let env = |vars: &'static [(&'static str, &'static str)]| {
+            move |key: &str| {
+                vars.iter()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, v)| OsString::from(v))
+            }
+        };
+        let paths = |files: Vec<PathBuf>| -> Vec<String> {
+            files.iter().map(|p| p.display().to_string()).collect()
+        };
+        // Its own folder wins over everything else.
+        assert_eq!(
+            paths(config_files(&env(&[
+                ("GLAB_CONFIG_DIR", "/cfg"),
+                ("HOME", "/home/alex")
+            ]))),
+            ["/cfg/config.yml"]
+        );
+        assert_eq!(
+            paths(config_files(&env(&[
+                ("GLAB_CONFIG_DIR", ""),
+                ("XDG_CONFIG_HOME", "/xdg"),
+                ("HOME", "/home/alex")
+            ]))),
+            [
+                "/xdg/glab-cli/config.yml",
+                "/home/alex/.config/glab-cli/config.yml",
+                "/home/alex/Library/Application Support/glab-cli/config.yml"
+            ]
+        );
+        assert!(config_files(&env(&[])).is_empty());
+    }
+
+    #[test]
+    fn the_stamp_changes_when_glab_writes_its_config() {
+        let dir = std::env::temp_dir().join(format!("herdr-git-panel-glab-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("config.yml");
+        let stamp = || stamp_of(vec![file.clone()]);
+        let missing = stamp();
+        assert_eq!(missing, stamp(), "nothing changed");
+        // A login creates the file.
+        std::fs::write(&file, "hosts:\n").unwrap();
+        let created = stamp();
+        assert_ne!(created, missing);
+        assert_eq!(created, stamp());
+        // A login or logout rewrites it.
+        std::fs::write(&file, "hosts:\n    gitlab.example.com:\n").unwrap();
+        assert_ne!(stamp(), created);
+        std::fs::remove_file(&file).unwrap();
+        assert_eq!(stamp(), missing, "removed again");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

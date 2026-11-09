@@ -3,7 +3,8 @@
 
 use crate::compose::{Compose, Edit, Stage, Target};
 use crate::config::{Config, Scope};
-use crate::forge::{self, Fetched, Posted};
+use crate::forge::{self, AskGitLab, Fetched, GitLabLogin, Posted};
+use crate::gitlab;
 use crate::model::{AllList, Data, Forge, MergeRequest, MergeState, Status};
 use crate::repo::Project;
 use crate::ui;
@@ -122,6 +123,20 @@ pub fn open_in_browser(opener: &str, url: &str) -> bool {
         .spawn()
         .is_ok()
 }
+
+/// Loads the lists: the list's own is [`forge::fetch_all`]; tests put in one
+/// that never runs glab or gh.
+pub type Fetcher =
+    fn(&str, Status, Option<&Project>, AskGitLab) -> (GitLabLogin, Result<Fetched, String>);
+
+/// A refresh's answer: the state it was for, what GitLab said about its
+/// login, glab's login stamp taken before it asked, and the lists.
+type Refreshed = (
+    Status,
+    GitLabLogin,
+    gitlab::LoginStamp,
+    Result<Fetched, String>,
+);
 
 /// Posts a reply, a comment or a change request through the merge
 /// request's forge.
@@ -396,8 +411,20 @@ pub struct App {
     pub opening_branch: bool,
     branch_tx: Sender<Result<String, String>>,
     branch_rx: Receiver<Result<String, String>>,
-    tx: Sender<(Status, Result<Fetched, String>)>,
-    rx: Receiver<(Status, Result<Fetched, String>)>,
+    tx: Sender<Refreshed>,
+    rx: Receiver<Refreshed>,
+    pub fetcher: Fetcher,
+    /// glab's login stamp now: the list's own is [`gitlab::login_stamp`].
+    pub login_stamp: fn() -> gitlab::LoginStamp,
+    /// GitLab answered "not logged in", with glab's login stamp of then:
+    /// refreshes leave it out until the stamp changes (a login) or `r`
+    /// asks, so a glab without a login does not ask gitlab.com every
+    /// minute and run into its limit for traffic without a login.
+    gitlab_out: Option<gitlab::LoginStamp>,
+    /// GitLab answered with its lists since the list opened, with glab's
+    /// login stamp of then: while the stamp is the same, a 429 is an error
+    /// to show, not the limit for traffic without a login.
+    gitlab_in: Option<gitlab::LoginStamp>,
     quit: bool,
 }
 
@@ -483,6 +510,10 @@ impl App {
             branch_rx,
             tx,
             rx,
+            fetcher: forge::fetch_all,
+            login_stamp: gitlab::login_stamp,
+            gitlab_out: None,
+            gitlab_in: None,
             quit: false,
         }
     }
@@ -661,7 +692,55 @@ impl App {
             .and_then(|i| rows.get(i).copied())
     }
 
+    /// Loads the lists. GitLab is left out while it is not logged in and
+    /// its login has not changed.
     fn refresh(&mut self) {
+        self.start_refresh(false);
+    }
+
+    /// Whether a refresh asks GitLab, with glab's login stamp now: not while
+    /// it answered "not logged in" and the stamp is the same, unless `r`
+    /// asked (`by_hand`).
+    fn ask_gitlab(&self, by_hand: bool, stamp: &gitlab::LoginStamp) -> AskGitLab {
+        match &self.gitlab_out {
+            Some(then) if !by_hand && then == stamp => AskGitLab::No,
+            _ if self.gitlab_in.as_ref() == Some(stamp) => AskGitLab::Yes,
+            _ => AskGitLab::Again,
+        }
+    }
+
+    /// Takes what GitLab said about its login in a refresh that started
+    /// with glab's login stamp `stamp`.
+    fn note_gitlab_login(&mut self, login: GitLabLogin, stamp: gitlab::LoginStamp) {
+        match login {
+            GitLabLogin::LoggedOut => {
+                self.gitlab_out = Some(stamp);
+                self.gitlab_in = None;
+            }
+            GitLabLogin::LoggedIn => {
+                self.gitlab_out = None;
+                self.gitlab_in = Some(stamp);
+            }
+            GitLabLogin::Failed => self.gitlab_out = None,
+            GitLabLogin::NotAsked => {}
+        }
+    }
+
+    /// Whether GitLab is left out as not logged in and glab's login changed
+    /// since (its config file was written): then the list asks GitLab at
+    /// once, without waiting for the next refresh.
+    fn gitlab_login_changed(&self) -> bool {
+        self.gitlab_out
+            .as_ref()
+            .is_some_and(|then| *then != (self.login_stamp)())
+    }
+
+    /// `r`: loads the lists and asks GitLab also while it is left out.
+    fn refresh_by_hand(&mut self) {
+        self.start_refresh(true);
+    }
+
+    fn start_refresh(&mut self, by_hand: bool) {
         if self.loading {
             return;
         }
@@ -669,8 +748,12 @@ impl App {
         let tx = self.tx.clone();
         let host = self.config.gitlab_host.clone();
         let (status, all_of) = self.fetch_request();
+        let stamp = (self.login_stamp)();
+        let ask = self.ask_gitlab(by_hand, &stamp);
+        let fetch = self.fetcher;
         std::thread::spawn(move || {
-            let _ = tx.send((status, forge::fetch_all(&host, status, all_of.as_ref())));
+            let (login, result) = fetch(&host, status, all_of.as_ref(), ask);
+            let _ = tx.send((status, login, stamp, result));
         });
     }
 
@@ -1582,8 +1665,9 @@ impl App {
     }
 
     fn receive(&mut self) {
-        while let Ok((status, result)) = self.rx.try_recv() {
+        while let Ok((status, login, stamp, result)) = self.rx.try_recv() {
             self.loading = false;
+            self.note_gitlab_login(login, stamp);
             self.next_refresh = Instant::now() + Duration::from_secs(self.config.refresh_secs);
             if status != self.status {
                 // Asked for before the state changed: keep it for that state,
@@ -1922,7 +2006,7 @@ impl App {
                 if self.loading {
                     self.say("Already refreshing");
                 } else {
-                    self.refresh();
+                    self.refresh_by_hand();
                 }
             }
             KeyCode::Char('a') => self.toggle_scope(),
@@ -1943,7 +2027,8 @@ impl App {
             self.receive_branch();
             self.receive_posted();
             self.load_activity();
-            if !self.loading && Instant::now() >= self.next_refresh {
+            if !self.loading && (Instant::now() >= self.next_refresh || self.gitlab_login_changed())
+            {
                 self.refresh();
             }
             if let Some((_, until)) = &self.flash {
@@ -2018,6 +2103,9 @@ mod tests {
         app.herdr = false;
         // Tests never start the browser.
         app.opener = opens;
+        // Never glab or gh, never the real glab config.
+        app.fetcher = says_how_gitlab_was_asked;
+        app.login_stamp = || stamp(1);
         app.data = Some(Data {
             review: (1..=3).map(sample_mr).collect(),
             mine: (4..=6).map(sample_mr).collect(),
@@ -2277,6 +2365,8 @@ mod tests {
         app.tx
             .send((
                 Status::Open,
+                GitLabLogin::NotAsked,
+                gitlab::LoginStamp::default(),
                 Ok(Fetched {
                     data,
                     warning: None,
@@ -2303,6 +2393,8 @@ mod tests {
         app.tx
             .send((
                 Status::Open,
+                GitLabLogin::NotAsked,
+                gitlab::LoginStamp::default(),
                 Ok(Fetched {
                     data,
                     warning: None,
@@ -2323,7 +2415,12 @@ mod tests {
         assert!(app.all_list().is_none(), "All is for the other scope");
         app.loading = true;
         app.tx
-            .send((Status::Open, Err("glab: no network".into())))
+            .send((
+                Status::Open,
+                GitLabLogin::NotAsked,
+                gitlab::LoginStamp::default(),
+                Err("glab: no network".into()),
+            ))
             .unwrap();
         app.receive();
         assert!(
@@ -2450,6 +2547,8 @@ mod tests {
         app.tx
             .send((
                 status,
+                GitLabLogin::NotAsked,
+                gitlab::LoginStamp::default(),
                 Ok(Fetched {
                     data,
                     warning: None,
@@ -2520,7 +2619,12 @@ mod tests {
         app.next_refresh = Instant::now() + Duration::from_secs(60);
         app.loading = true;
         app.tx
-            .send((Status::Open, Err("glab: no network".into())))
+            .send((
+                Status::Open,
+                GitLabLogin::NotAsked,
+                gitlab::LoginStamp::default(),
+                Err("glab: no network".into()),
+            ))
             .unwrap();
         app.receive();
         assert!(app.next_refresh <= Instant::now());
@@ -2533,7 +2637,12 @@ mod tests {
         press(&mut app, KeyCode::Char('z'));
         app.loading = true;
         app.tx
-            .send((Status::Merged, Err("gh: no network".into())))
+            .send((
+                Status::Merged,
+                GitLabLogin::NotAsked,
+                gitlab::LoginStamp::default(),
+                Err("gh: no network".into()),
+            ))
             .unwrap();
         app.receive();
         assert_eq!(app.error.as_deref(), Some("gh: no network"));
@@ -3970,5 +4079,166 @@ mod tests {
             "{footer}"
         );
         assert!(!footer.contains("open"), "{footer}");
+    }
+
+    /// A login stamp; another number is another login.
+    fn stamp(n: u64) -> gitlab::LoginStamp {
+        gitlab::LoginStamp(vec![(
+            "/glab/config.yml".into(),
+            Some((std::time::UNIX_EPOCH + Duration::from_secs(n), n)),
+        )])
+    }
+
+    /// A fetcher for a glab without a login: GitLab answers "not logged in"
+    /// whenever it is asked, and the footer says how it was asked.
+    fn says_how_gitlab_was_asked(
+        _: &str,
+        _: Status,
+        _: Option<&Project>,
+        ask: AskGitLab,
+    ) -> (GitLabLogin, Result<Fetched, String>) {
+        let login = if ask == AskGitLab::No {
+            GitLabLogin::NotAsked
+        } else {
+            GitLabLogin::LoggedOut
+        };
+        let fetched = Fetched {
+            data: Data::default(),
+            warning: Some(format!("{ask:?}")),
+        };
+        (login, Ok(fetched))
+    }
+
+    /// Waits for the refresh running now and takes its answer.
+    fn settle(app: &mut App) {
+        let until = Instant::now() + Duration::from_secs(5);
+        while app.loading && Instant::now() < until {
+            app.receive();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(!app.loading, "the refresh answered");
+    }
+
+    /// Refreshes like the main loop and says how GitLab was asked.
+    fn refresh_now(app: &mut App) -> String {
+        app.refresh();
+        settle(app);
+        app.error.clone().unwrap_or_default()
+    }
+
+    #[test]
+    fn a_glab_without_a_login_is_asked_once_not_every_refresh() {
+        for refresh_secs in [60, 10] {
+            let mut app = app();
+            app.config.refresh_secs = refresh_secs;
+            // Opening asks GitLab.
+            assert_eq!(refresh_now(&mut app), "Again");
+            // An hour of refreshes leaves it out.
+            let refreshes = 3600 / refresh_secs;
+            let asked = (0..refreshes)
+                .filter(|_| refresh_now(&mut app) != "No")
+                .count();
+            assert_eq!(asked, 0, "every {refresh_secs} s");
+            assert!(!app.gitlab_login_changed());
+        }
+    }
+
+    #[test]
+    fn a_new_list_asks_gitlab_once() {
+        let mut app = app();
+        assert_eq!(refresh_now(&mut app), "Again");
+        assert_eq!(refresh_now(&mut app), "No");
+        // Closed and opened again: asked again at opening.
+        let mut app = super::tests::app();
+        assert_eq!(refresh_now(&mut app), "Again");
+    }
+
+    #[test]
+    fn after_a_login_gitlab_is_asked_at_once() {
+        let mut app = app();
+        assert_eq!(refresh_now(&mut app), "Again");
+        // `glab auth login` writes its config: the main loop refreshes at
+        // once, not after the interval.
+        app.login_stamp = || stamp(2);
+        assert!(app.gitlab_login_changed());
+        assert_eq!(refresh_now(&mut app), "Again");
+        // Still not logged in (the stamp of that refresh is kept).
+        assert!(!app.gitlab_login_changed());
+        assert_eq!(refresh_now(&mut app), "No");
+        // Logged in now: its lists show, and it is asked every refresh.
+        app.login_stamp = || stamp(3);
+        app.fetcher = |_, _, _, _| {
+            let mut data = Data::default();
+            data.mine.push(sample_mr(9));
+            (
+                GitLabLogin::LoggedIn,
+                Ok(Fetched {
+                    data,
+                    warning: None,
+                }),
+            )
+        };
+        refresh_now(&mut app);
+        assert_eq!(iids(&app.rows(Section::Mine)), [9]);
+        assert!(!app.gitlab_login_changed());
+        app.fetcher = says_how_gitlab_was_asked;
+        assert_eq!(refresh_now(&mut app), "Yes", "a 429 now shows");
+    }
+
+    #[test]
+    fn r_asks_gitlab_also_while_it_is_left_out() {
+        let mut app = app();
+        assert_eq!(refresh_now(&mut app), "Again");
+        press(&mut app, KeyCode::Char('r'));
+        settle(&mut app);
+        assert_eq!(app.error.as_deref(), Some("Again"));
+        assert_eq!(refresh_now(&mut app), "No");
+    }
+
+    #[test]
+    fn switching_the_state_or_the_scope_does_not_ask_gitlab() {
+        let mut app = app_in("gitlab.com", "acme/app");
+        assert_eq!(refresh_now(&mut app), "Again");
+        for key in ['z', 'a', 'z', 'a'] {
+            press(&mut app, KeyCode::Char(key));
+            assert_eq!(refresh_now(&mut app), "No", "after {key}");
+        }
+    }
+
+    #[test]
+    fn a_login_lost_while_open_leaves_gitlab_out_from_then_on() {
+        let mut app = app();
+        app.note_gitlab_login(GitLabLogin::LoggedIn, stamp(1));
+        assert_eq!(app.ask_gitlab(false, &stamp(1)), AskGitLab::Yes);
+        // `glab auth logout` (or another login) writes the config: not known
+        // as logged in any more, so a 429 is the limit without a login.
+        assert_eq!(app.ask_gitlab(false, &stamp(2)), AskGitLab::Again);
+        // The token is revoked: "not logged in".
+        app.note_gitlab_login(GitLabLogin::LoggedOut, stamp(1));
+        assert_eq!(app.ask_gitlab(false, &stamp(1)), AskGitLab::No);
+        assert_eq!(app.ask_gitlab(true, &stamp(1)), AskGitLab::Again);
+        assert_eq!(app.ask_gitlab(false, &stamp(2)), AskGitLab::Again);
+        // Left out or not asked: nothing changes.
+        app.note_gitlab_login(GitLabLogin::NotAsked, stamp(2));
+        assert_eq!(app.ask_gitlab(false, &stamp(1)), AskGitLab::No);
+        // A real error: asked again, as before.
+        app.note_gitlab_login(GitLabLogin::Failed, stamp(1));
+        assert_eq!(app.ask_gitlab(false, &stamp(1)), AskGitLab::Again);
+    }
+
+    #[test]
+    fn not_logged_in_counts_also_for_a_state_no_longer_shown() {
+        let mut app = app();
+        app.loading = true;
+        app.tx
+            .send((
+                Status::Merged,
+                GitLabLogin::LoggedOut,
+                stamp(1),
+                Err("gh: no network".into()),
+            ))
+            .unwrap();
+        app.receive();
+        assert_eq!(app.ask_gitlab(false, &stamp(1)), AskGitLab::No);
     }
 }
