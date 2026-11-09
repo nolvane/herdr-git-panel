@@ -170,7 +170,10 @@ fn gitlab_login(
             r => r,
         }
     }
-    let again = gitlab == AskGitLab::Again;
+    // Lists in one half prove the login: then a 429 in the other is an
+    // error to show.
+    let answered = matches!(lists, Ok(Some(_))) || matches!(all, Ok(Some(_)));
+    let again = gitlab == AskGitLab::Again && !answered;
     let (lists, all) = (quiet(again, lists), quiet(again, all));
     let login = match (&lists, &all) {
         (Ok(None), Ok(None)) => GitLabLogin::LoggedOut,
@@ -809,6 +812,23 @@ mod tests {
             assert_eq!(fetched.warning, None, "nothing in the footer");
             assert_eq!(fetched.data.mine.len(), 1, "GitHub's lists stay");
         }
+        // Lists prove the login: a 429 for "All" is an error to show.
+        let (said, lists, all) =
+            gitlab_login(true, AskGitLab::Again, Ok(Some(lists())), Err(LIMIT.into()));
+        assert_eq!(said, GitLabLogin::LoggedIn);
+        let fetched = combine(
+            "gitlab.com",
+            BOTH,
+            Status::Open,
+            Some(&project("gitlab.com")),
+            [lists, Ok(None)],
+            [all, Ok(None)],
+        )
+        .unwrap();
+        assert_eq!(
+            fetched.warning.as_deref(),
+            Some("All: glab failed: glab: HTTP 429")
+        );
         // Another error stays one.
         let (said, lists, _) = gitlab_login(
             true,

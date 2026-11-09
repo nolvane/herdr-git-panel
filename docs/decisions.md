@@ -624,7 +624,13 @@ glab is not logged in it does not keep asking gitlab.com.
   apart. Until GitLab answered with lists in this open list, a 429 counts
   as "not logged in" and stays quiet (otherwise a list opened while the
   limit is used up would keep asking for the rest of the hour). Once it
-  answered with lists, a 429 is an error and shows, like no network.
+  answered with lists, a 429 is an error and shows, like no network,
+  until glab's config file changes (a logout or another login). Lists in
+  the same refresh prove the login too, so a 429 for "All" next to them
+  shows. The price: a logged-in user who opens the list while GitLab's
+  limit for logged-in traffic is used up sees GitLab left out without a
+  word until `r` or reopening; that limit is far higher and rarely
+  reached.
 - Not done: `glab auth status` before each refresh. With a stored token it
   asks `/api/v4/user` every time, the refused-token case of #27, and it
   ties the list to glab's output. A timer that asks every 15 minutes

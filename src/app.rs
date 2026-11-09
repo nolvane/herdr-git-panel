@@ -379,9 +379,10 @@ pub struct App {
     /// asks, so a glab without a login does not ask gitlab.com every
     /// minute and run into its limit for traffic without a login.
     gitlab_out: Option<gitlab::LoginStamp>,
-    /// GitLab answered with its lists since the list opened, so a 429 is
-    /// an error to show, not the limit for traffic without a login.
-    gitlab_logged_in: bool,
+    /// GitLab answered with its lists since the list opened, with glab's
+    /// login stamp of then: while the stamp is the same, a 429 is an error
+    /// to show, not the limit for traffic without a login.
+    gitlab_in: Option<gitlab::LoginStamp>,
     quit: bool,
 }
 
@@ -469,7 +470,7 @@ impl App {
             fetcher: forge::fetch_all,
             login_stamp: gitlab::login_stamp,
             gitlab_out: None,
-            gitlab_logged_in: false,
+            gitlab_in: None,
             quit: false,
         }
     }
@@ -660,7 +661,7 @@ impl App {
     fn ask_gitlab(&self, by_hand: bool, stamp: &gitlab::LoginStamp) -> AskGitLab {
         match &self.gitlab_out {
             Some(then) if !by_hand && then == stamp => AskGitLab::No,
-            _ if self.gitlab_logged_in => AskGitLab::Yes,
+            _ if self.gitlab_in.as_ref() == Some(stamp) => AskGitLab::Yes,
             _ => AskGitLab::Again,
         }
     }
@@ -671,11 +672,11 @@ impl App {
         match login {
             GitLabLogin::LoggedOut => {
                 self.gitlab_out = Some(stamp);
-                self.gitlab_logged_in = false;
+                self.gitlab_in = None;
             }
             GitLabLogin::LoggedIn => {
                 self.gitlab_out = None;
-                self.gitlab_logged_in = true;
+                self.gitlab_in = Some(stamp);
             }
             GitLabLogin::Failed => self.gitlab_out = None,
             GitLabLogin::NotAsked => {}
@@ -3867,6 +3868,9 @@ mod tests {
         let mut app = app();
         app.note_gitlab_login(GitLabLogin::LoggedIn, stamp(1));
         assert_eq!(app.ask_gitlab(false, &stamp(1)), AskGitLab::Yes);
+        // `glab auth logout` (or another login) writes the config: not known
+        // as logged in any more, so a 429 is the limit without a login.
+        assert_eq!(app.ask_gitlab(false, &stamp(2)), AskGitLab::Again);
         // The token is revoked: "not logged in".
         app.note_gitlab_login(GitLabLogin::LoggedOut, stamp(1));
         assert_eq!(app.ask_gitlab(false, &stamp(1)), AskGitLab::No);
