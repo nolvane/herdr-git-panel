@@ -585,7 +585,8 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
     app.hits.push((full, Hit::Help));
     // The version in the bottom border, linked to the repository. It takes
     // no row, so it stays when the box is cut to a short pane; a narrow box
-    // drops the address, then the name. Pushed after `Hit::Help`, so a
+    // drops the address, then the name, and one too narrow for the version
+    // itself shows nothing. Pushed after `Hit::Help`, so a
     // click on it finds the link first.
     if area.height >= 3 {
         let version = env!("CARGO_PKG_VERSION");

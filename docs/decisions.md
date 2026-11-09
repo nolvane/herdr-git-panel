@@ -598,8 +598,8 @@ failure keeps the text in the open box with the reason.
 The help overlay (`?`) shows "Herdr Git Panel <version> ·
 github.com/nolvane/herdr-git-panel" in its bottom border (#14), so it takes
 no row from the list or the help text and stays visible when the box is cut
-to a short pane. A narrow box drops the address, then the name, but keeps
-the version. A click on it opens the repository through the same web-link
+to a short pane. A narrow box drops the address, then the name, and keeps
+the version as long as it fits between the corners. A click on it opens the repository through the same web-link
 check as links in the details panel and closes the help; every other click
 still only closes it. The version is `CARGO_PKG_VERSION`, the same value as
 `--version`, and the address is `repository` in `Cargo.toml`, so neither is

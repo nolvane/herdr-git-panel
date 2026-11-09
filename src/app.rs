@@ -105,6 +105,13 @@ pub type Poster = fn(&MergeRequest, &Target, &str) -> Result<Posted, String>;
 /// started; tests put in one that starts nothing.
 pub type Opener = fn(&str, &str) -> bool;
 
+/// The system's program that opens a link in the browser.
+const OPENER: &str = if cfg!(target_os = "macos") {
+    "open"
+} else {
+    "xdg-open"
+};
+
 /// Starts `opener` (`open`, `xdg-open`) on `url`.
 pub fn open_in_browser(opener: &str, url: &str) -> bool {
     Command::new(opener)
@@ -1644,15 +1651,10 @@ impl App {
             self.say("Only web links can be opened");
             return;
         }
-        let opener = if cfg!(target_os = "macos") {
-            "open"
-        } else {
-            "xdg-open"
-        };
-        self.say(if (self.opener)(opener, url) {
+        self.say(if (self.opener)(OPENER, url) {
             "Opened in the browser".to_string()
         } else {
-            format!("Could not run {opener}")
+            format!("Could not run {OPENER}")
         });
     }
 
@@ -1973,6 +1975,8 @@ mod tests {
         let mut app = App::new(config, None, None);
         // Not from the shell the tests run in.
         app.herdr = false;
+        // Tests never start the browser.
+        app.opener = opens;
         app.data = Some(Data {
             review: (1..=3).map(sample_mr).collect(),
             mine: (4..=6).map(sample_mr).collect(),
@@ -3650,12 +3654,6 @@ mod tests {
             .expect("a link in the help");
         (app, spot)
     }
-
-    const OPENER: &str = if cfg!(target_os = "macos") {
-        "open"
-    } else {
-        "xdg-open"
-    };
 
     #[test]
     fn clicking_the_version_in_the_help_opens_the_repository() {
