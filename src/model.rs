@@ -252,9 +252,66 @@ pub fn thread_notes(
 ) -> (Vec<Note>, usize) {
     let mut notes: Vec<(String, Note)> = head
         .into_iter()
-        .filter(|(id, _)| !tail.iter().any(|(t, _)| t == id))
+        // A note without an id is never taken for another one.
+        .filter(|(id, _)| id.is_empty() || !tail.iter().any(|(t, _)| t == id))
         .collect();
     notes.extend(tail);
     let hidden = total.saturating_sub(notes.len());
     (notes.into_iter().map(|(_, n)| n).collect(), hidden)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Notes `from..=to` of a thread, each with its id.
+    fn notes(from: u32, to: u32) -> Vec<(String, Note)> {
+        (from..=to)
+            .map(|i| {
+                let note = Note {
+                    author: "sam".into(),
+                    body: format!("Note {i}"),
+                    created: Some(i as i64),
+                    system: false,
+                };
+                (format!("N{i}"), note)
+            })
+            .collect()
+    }
+
+    fn bodies(list: &[Note]) -> Vec<String> {
+        list.iter().map(|n| n.body.clone()).collect()
+    }
+
+    #[test]
+    fn thread_notes_at_the_edges() {
+        // 50 notes: head and tail just touch, nothing is hidden.
+        let (list, hidden) = thread_notes(notes(1, 1), notes(2, 50), 50);
+        assert_eq!(list.len(), 50);
+        assert_eq!(hidden, 0);
+        // 51 notes: one between.
+        let (list, hidden) = thread_notes(notes(1, 1), notes(3, 51), 51);
+        assert_eq!(bodies(&list[..2]), ["Note 1", "Note 3"]);
+        assert_eq!(hidden, 1);
+        // A total below what loaded (a reply posted between the two counts).
+        let (list, hidden) = thread_notes(notes(1, 1), notes(1, 3), 2);
+        assert_eq!(bodies(&list), ["Note 1", "Note 2", "Note 3"]);
+        assert_eq!(hidden, 0);
+        // Only one end.
+        let (list, _) = thread_notes(vec![], notes(1, 2), 2);
+        assert_eq!(bodies(&list), ["Note 1", "Note 2"]);
+        let (list, _) = thread_notes(notes(1, 1), vec![], 0);
+        assert_eq!(bodies(&list), ["Note 1"]);
+    }
+
+    #[test]
+    fn notes_without_an_id_are_never_merged() {
+        let unnamed = |n: Vec<(String, Note)>| -> Vec<(String, Note)> {
+            n.into_iter().map(|(_, n)| (String::new(), n)).collect()
+        };
+        let (list, hidden) = thread_notes(unnamed(notes(1, 1)), unnamed(notes(12, 60)), 60);
+        assert_eq!(list[0].body, "Note 1", "the first note stays");
+        assert_eq!(list.len(), 50);
+        assert_eq!(hidden, 10);
+    }
 }

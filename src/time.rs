@@ -96,9 +96,11 @@ pub fn age(secs: i64) -> String {
 
 /// Age for "… ago" text: `now` under a minute, else `5m ago`.
 pub fn ago(secs: i64) -> String {
-    match age(secs) {
-        now if secs < 60 => now,
-        short => format!("{short} ago"),
+    let short = age(secs);
+    if short == "now" {
+        short
+    } else {
+        format!("{short} ago")
     }
 }
 

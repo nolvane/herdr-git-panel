@@ -601,6 +601,10 @@ the thread's total (`count`, on GitHub `totalCount`), and the newest 100
 threads (`discussions(last: 100)`, `reviewThreads(last: 100)`). Both forges
 give notes oldest first, so `first: 50` dropped exactly the newest replies,
 and `first: 100` the newest threads.
+- `last: 100` counts threads by when they were started, not by their
+  latest reply: on a merge request with more than 100 threads (on GitLab
+  each system note is one), an old thread that just got a reply can still
+  be left out. Neither forge sorts threads by activity in this connection.
 - The first note stays because the thread's place (file and line) and the
   reply marks hang on it. Head and tail overlap on a thread of up to 50
   notes; `model::thread_notes` merges them by note id, so each note shows

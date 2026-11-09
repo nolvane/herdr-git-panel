@@ -1799,17 +1799,23 @@ fn activity_lines(
             // not loaded.
             if i == 0 && d.hidden > 0 {
                 let what = if d.hidden == 1 { "reply" } else { "replies" };
-                if d.resolvable {
-                    hits.push((lines.len(), 0, width, Hit::Thread(index)));
-                }
-                lines.push(Line::from(vec![
-                    bar.clone(),
-                    Span::raw(" "),
-                    Span::styled(
+                let gap = text::wrap(
+                    vec![Span::styled(
                         format!("… {} earlier {what} not shown", d.hidden),
                         Style::new().fg(FAINT),
-                    ),
-                ]));
+                    )],
+                    width.saturating_sub(2),
+                    Span::raw(""),
+                    Span::raw("  "),
+                );
+                for l in gap {
+                    if d.resolvable {
+                        hits.push((lines.len(), 0, width, Hit::Thread(index)));
+                    }
+                    let mut spans = vec![bar.clone(), Span::raw(" ")];
+                    spans.extend(l.spans);
+                    lines.push(Line::from(spans));
+                }
             }
         }
     }
@@ -2921,6 +2927,24 @@ mod tests {
         );
         let rows = activity_text(vec![thread(0)]);
         assert!(!rows.iter().any(|r| r.contains("not shown")), "{rows:#?}");
+        // A narrow pane wraps the line instead of cutting it.
+        let activity = Activity::Loaded(vec![thread(12)]);
+        let (lines, _, _, _) =
+            activity_lines(Some(&activity), "me", 20, ThreadFilter::All, None, true);
+        let rows: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        let gap = rows.iter().position(|r| r.contains("… 12")).unwrap();
+        assert!(
+            rows[gap..gap + 3].iter().all(|r| r.chars().count() <= 20),
+            "{rows:#?}"
+        );
+        let words: Vec<&str> = rows.iter().flat_map(|r| r.split_whitespace()).collect();
+        assert!(
+            words.join(" ").contains("… 12 earlier replies not shown"),
+            "{rows:#?}"
+        );
     }
 
     #[test]

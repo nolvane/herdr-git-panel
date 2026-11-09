@@ -1172,8 +1172,10 @@ mod tests {
     fn activity_loads_the_newest_hundred_threads_with_both_ends() {
         assert!(ACTIVITY.contains("discussions(last: 100)"), "{ACTIVITY}");
         assert!(ACTIVITY.contains("head: notes(first: 1)"), "{ACTIVITY}");
-        assert!(ACTIVITY.contains("tail: notes(last: 49)"), "{ACTIVITY}");
-        assert!(ACTIVITY.contains("count"), "{ACTIVITY}");
+        assert!(
+            ACTIVITY.contains("tail: notes(last: 49) {\n            count\n"),
+            "{ACTIVITY}"
+        );
     }
 
     #[test]
