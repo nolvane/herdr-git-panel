@@ -17,9 +17,15 @@ pub struct Fetched {
 /// for your projects (`None`). As `(GitLab, GitHub)`.
 pub fn all_forges(project: Option<&Project>, gitlab_host: &str) -> (bool, bool) {
     match project {
-        Some(p) => (p.host == gitlab_host, p.host == github::HOST),
+        Some(p) => (p.on(gitlab_host), p.on(github::HOST)),
         None => (true, true),
     }
+}
+
+/// Whether `project` lives on a forge the list knows: GitHub or the
+/// configured GitLab host.
+pub fn known(project: &Project, gitlab_host: &str) -> bool {
+    project.on(gitlab_host) || project.on(github::HOST)
 }
 
 /// Which forges "Mine" and "To review" ask, and for which project: open
@@ -187,7 +193,7 @@ fn combine(
 /// Why nothing could be asked about `p`: its forge's tool is missing or not
 /// logged in.
 fn not_available(p: &Project) -> String {
-    let tool = if p.host == github::HOST { "gh" } else { "glab" };
+    let tool = if p.on(github::HOST) { "gh" } else { "glab" };
     format!("{tool} is not installed or not logged in to {}", p.host)
 }
 
@@ -303,6 +309,32 @@ mod tests {
         );
         // Your projects: every forge.
         assert_eq!(all_forges(None, "gitlab.com"), (true, true));
+    }
+
+    #[test]
+    fn a_host_in_other_case_is_the_same_forge() {
+        // Hosts ignore case, as written in the clone's remote or the setting.
+        assert_eq!(
+            all_forges(Some(&project("GitHub.com")), "gitlab.com"),
+            (false, true)
+        );
+        assert_eq!(
+            all_forges(Some(&project("GitLab.com")), "gitlab.com"),
+            (true, false)
+        );
+        assert_eq!(
+            all_forges(Some(&project("git.acme.test")), "Git.Acme.test"),
+            (true, false)
+        );
+        assert!(known(&project("GitHub.com"), "gitlab.com"));
+        assert!(known(&project("GITLAB.COM"), "gitlab.com"));
+        assert!(known(&project("git.acme.test"), "Git.Acme.Test"));
+        assert!(!known(&project("work-github"), "gitlab.com"));
+        assert!(!known(&project("github.com.evil.test"), "gitlab.com"));
+        assert_eq!(
+            not_available(&project("GitHub.com")),
+            "gh is not installed or not logged in to GitHub.com"
+        );
     }
 
     fn mr(forge: Forge, iid: u64, updated: i64) -> MergeRequest {

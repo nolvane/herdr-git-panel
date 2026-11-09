@@ -41,7 +41,7 @@ fn list() -> std::io::Result<()> {
     let project = here
         .as_deref()
         .and_then(repo::detect)
-        .filter(|p| p.host == config.gitlab_host || p.host == github::HOST);
+        .filter(|p| forge::known(p, &config.gitlab_host));
     let mut app = app::App::new(config, project, dir);
     app.remotes = here.as_deref().map(repo::remotes_of).unwrap_or_default();
     app.workdir = here;

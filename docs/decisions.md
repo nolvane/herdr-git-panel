@@ -315,7 +315,11 @@ forge and never touches the current checkout.
   `refs/herdr-git-panel/…`, removed again at the end), not from the shared
   `FETCH_HEAD`, which another fetch could overwrite in between.
 - Remotes match the merge request's project ignoring case, as GitHub and
-  GitLab do.
+  GitLab do. The same holds wherever the clone's project meets a forge's
+  (2026-11-09, #15): whether the folder has a project at all, the "this
+  project" scope, which forge is asked for it and the header word. The
+  comparison lives in `repo::Project::on`/`is`; the remote's spelling is
+  kept as written, since both forges accept any case in their queries.
   Whether it is a fork comes from GitHub's `isCrossRepository` and GitLab's
   `sourceProjectId`/`targetProjectId`; unknown counts as a fork, which is
   fetched correctly either way.
