@@ -592,3 +592,32 @@ failure keeps the text in the open box with the reason.
   Replies and comments from #10 send their text as typed, so there a line
   starting with `/` does run as a GitLab command, as in GitLab's own
   comment box; whether that should change is its own issue.
+
+## 2026-11-09: GitLab without approval rules (Community Edition)
+
+GitLab Community Edition has no `approvalsRequired`, `approvalsLeft` or
+`approvalState` on a merge request (they are defined only in GitLab's `ee/`
+code), and GitLab checks a whole query before it runs it, so one of them
+rejected every list (#28). The list now sends the full query first; when
+GitLab answers that `approvalsRequired`, `approvalsLeft` or `approvalState`
+"doesn't exist on type 'MergeRequest'", it sends the same query once more
+without them and remembers the host while the list runs, so later refreshes
+take one request again. Without those fields the parsing counts who
+approved, waits for no rule and leaves the number needed unknown (`None`,
+as GitHub does when it doesn't say), so the column shows no "of needed".
+
+- Retry on that error rather than asking the server which edition it is: an
+  extra request on every open for everyone (gitlab.com included) costs more
+  than a second request on the first load of a Community Edition server.
+  The first load there takes two requests per list ("Mine" and "To review"
+  and the "All" requests run at the same time, each finds out on its own).
+- The Enterprise-only fields are one exact piece of the fragment
+  (`approval_rule_fields!`), taken out when the query is sent, so the query
+  builders stay as they are; a test checks every query in every state still
+  holds that piece and loses all three fields without it.
+- `approvalsLeft` was never read and is no longer asked for.
+- The error is recognised by the field named before "doesn't exist on type"
+  and the type `MergeRequest`, in any quotes, not by the whole sentence.
+- Checked on 2026-11-09 without a login against a public Community Edition
+  server: the query without those fields is accepted and returns
+  `approved` and `approvedBy`.

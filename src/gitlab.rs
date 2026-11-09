@@ -5,20 +5,34 @@ use crate::cli;
 use crate::model::*;
 use crate::time;
 use serde_json::Value;
+use std::collections::HashSet;
+use std::sync::{LazyLock, Mutex};
+
+/// The fields of a merge request that only GitLab's Enterprise Edition has
+/// (also gitlab.com and an unlicensed self-managed one): approval rules.
+/// Community Edition rejects a query that asks for them, so they are one
+/// exact piece of [`mr_fragment`] that [`without_approval_rules`] takes out.
+macro_rules! approval_rule_fields {
+    () => {
+        "\n  approvalsRequired approvalState { rules { name type approved approvalsRequired } }"
+    };
+}
 
 /// The fields the list shows of a merge request, for every query that loads
 /// merge requests.
 macro_rules! mr_fragment {
     () => {
-        r#"
+        concat!(
+            r#"
 fragment mr on MergeRequest {
   iid title description webUrl draft state createdAt updatedAt sourceBranch targetBranch diffHeadSha
   sourceProjectId targetProjectId
   project { fullPath }
   author { username }
-  approved approvalsRequired approvalsLeft
-  approvedBy { nodes { username } }
-  approvalState { rules { name type approved approvalsRequired } }
+  approved
+  approvedBy { nodes { username } }"#,
+            approval_rule_fields!(),
+            r#"
   reviewers { nodes { username mergeRequestInteraction { reviewState } } }
   detailedMergeStatus
   resolvableDiscussionsCount resolvedDiscussionsCount
@@ -27,6 +41,7 @@ fragment mr on MergeRequest {
   diffStatsSummary { additions deletions }
 }
 "#
+        )
     };
 }
 
@@ -194,7 +209,7 @@ pub fn fetch_all_of(
 ) -> Result<Option<AllPart>, String> {
     if let Some(path) = project {
         let query = PROJECT_ALL.replace("STATE", state_word(status));
-        let Some(value) = user_graphql(host, &query, &[("project", path)])? else {
+        let Some(value) = mr_graphql(host, &query, &[("project", path)])? else {
             return Ok(None);
         };
         return parse_project_all(&value, host).map(Some);
@@ -210,7 +225,7 @@ pub fn fetch_all_of(
             .chunks(PROJECTS_PER_REQUEST)
             .map(|chunk| {
                 let query = member_query(chunk, pick.after.as_deref(), status);
-                scope.spawn(move || user_graphql(host, &query, &[]))
+                scope.spawn(move || mr_graphql(host, &query, &[]))
             })
             .collect();
         runs.into_iter()
@@ -352,7 +367,7 @@ fn query(
     // Only a query that declares `$project` may get it.
     let project = project.filter(|_| status != Status::Open);
     let vars: Vec<(&str, &str)> = project.map(|p| ("project", p)).into_iter().collect();
-    user_graphql(host, &list_query(list, status, project.is_some()), &vars)
+    mr_graphql(host, &list_query(list, status, project.is_some()), &vars)
 }
 
 /// Why a GitLab request failed.
@@ -455,6 +470,75 @@ fn user_graphql(host: &str, query: &str, vars: &[(&str, &str)]) -> Result<Option
         Err(Failure::NotLoggedIn) => Ok(None),
         Err(Failure::Other(e)) => Err(e),
     }
+}
+
+/// Hosts whose GitLab has no approval rules (Community Edition), learned
+/// from their answer while the list runs, so later refreshes ask them
+/// without those fields straight away.
+static WITHOUT_RULES: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Mutex::default);
+
+/// [`user_graphql`] for a query that loads merge requests: without the
+/// approval rule fields on a host that has none.
+fn mr_graphql(host: &str, query: &str, vars: &[(&str, &str)]) -> Result<Option<Value>, String> {
+    with_rules_fallback(host, query, &WITHOUT_RULES, |q| user_graphql(host, q, vars))
+}
+
+/// Sends `query` with `send`, and once more without the approval rule
+/// fields when GitLab says it has none; `known` remembers such hosts.
+fn with_rules_fallback(
+    host: &str,
+    query: &str,
+    known: &Mutex<HashSet<String>>,
+    send: impl Fn(&str) -> Result<Option<Value>, String>,
+) -> Result<Option<Value>, String> {
+    if known.lock().is_ok_and(|hosts| hosts.contains(host)) {
+        return send(&without_approval_rules(query));
+    }
+    let value = send(query)?;
+    if !value.as_ref().is_some_and(lacks_approval_rules) {
+        return Ok(value);
+    }
+    let short = without_approval_rules(query);
+    // Nothing to leave out: the same request would fail the same way.
+    if short == query {
+        return Ok(value);
+    }
+    if let Ok(mut hosts) = known.lock() {
+        hosts.insert(host.to_string());
+    }
+    send(&short)
+}
+
+/// The query without the fields only Enterprise Edition has.
+fn without_approval_rules(query: &str) -> String {
+    query.replace(approval_rule_fields!(), "")
+}
+
+/// Whether GitLab refused the query because it lacks the approval rule
+/// fields, in graphql-ruby's words: "Field 'approvalState' doesn't exist on
+/// type 'MergeRequest'". Any other error stays an error.
+fn lacks_approval_rules(value: &Value) -> bool {
+    value
+        .get("errors")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.get("message").and_then(Value::as_str))
+        .any(|m| {
+            // The field named before "doesn't exist", in any quotes, so a
+            // field GitLab merely suggests ("Did you mean …") does not count.
+            let Some((field, kind)) = m.split_once("doesn't exist on type") else {
+                return false;
+            };
+            kind.contains("MergeRequest")
+                && ["approvalsRequired", "approvalState", "approvalsLeft"]
+                    .iter()
+                    .any(|f| {
+                        ['\'', '"', '`']
+                            .iter()
+                            .any(|q| field.contains(&format!("{q}{f}{q}")))
+                    })
+        })
 }
 
 /// Whether GitLab answered without a user and without an error: glab sent
@@ -897,11 +981,12 @@ fn parse_mr(n: &Value, host: &str, viewer: &str) -> Option<MergeRequest> {
             _ => Status::Open,
         },
         approvals_given: approved_by,
-        approvals_required: Some(if rules_required > 0 {
-            rules_required
+        // Community Edition has no approval rules and says nothing.
+        approvals_required: if rules_required > 0 {
+            Some(rules_required)
         } else {
-            required
-        }),
+            n.get("approvalsRequired").map(|_| required)
+        },
         approved_by: approver_names,
         approved: n["approved"].as_bool().unwrap_or(false) && (required > 0 || approved_by > 0),
         pending_rules,
@@ -1060,7 +1145,7 @@ mod tests {
                 "sourceBranch": "abc-1-export", "targetBranch": "main",
                 "sourceProjectId": 11, "targetProjectId": 11,
                 "project": {"fullPath": "acme/app"}, "author": {"username": "alex"},
-                "approved": false, "approvalsRequired": 1, "approvalsLeft": 1,
+                "approved": false, "approvalsRequired": 1,
                 "approvedBy": {"nodes": []},
                 "approvalState": {"rules": [
                     {"name": "*, /docs/", "type": "CODE_OWNER", "approved": false, "approvalsRequired": 1},
@@ -1077,14 +1162,14 @@ mod tests {
             "authoredMergeRequests": {"nodes": [
                 {"iid": "7", "title": "Old", "webUrl": "u7", "draft": true, "updatedAt": "2026-11-01T08:00:00Z",
                  "project": {"fullPath": "acme/app"}, "author": {"username": "me"},
-                 "approved": true, "approvalsRequired": 0, "approvalsLeft": 0, "approvedBy": {"nodes": []},
+                 "approved": true, "approvalsRequired": 0, "approvedBy": {"nodes": []},
                  "reviewers": {"nodes": []}, "detailedMergeStatus": "DRAFT_STATUS",
                  "resolvableDiscussionsCount": 0, "resolvedDiscussionsCount": 0,
                  "labels": {"nodes": []}, "headPipeline": null, "diffStatsSummary": null},
                 {"iid": "9", "title": "New", "webUrl": "u9", "draft": false, "updatedAt": "2026-11-07T08:00:00Z",
                  "sourceProjectId": 12, "targetProjectId": 11,
                  "project": {"fullPath": "acme/lib"}, "author": {"username": "me"},
-                 "approved": true, "approvalsRequired": 2, "approvalsLeft": 0, "approvedBy": {"nodes": [{"username": "alex"}]},
+                 "approved": true, "approvalsRequired": 2, "approvedBy": {"nodes": [{"username": "alex"}]},
                  "reviewers": {"nodes": [{"username": "alex", "mergeRequestInteraction": {"reviewState": "APPROVED"}}]},
                  "detailedMergeStatus": "MERGEABLE",
                  "resolvableDiscussionsCount": 2, "resolvedDiscussionsCount": 2,
@@ -1494,6 +1579,206 @@ mod tests {
         let part = newest(items, 5, 1);
         assert_eq!(part.items[0].project, "acme/lib", "newest first, cut");
         assert_eq!(part.total, 5);
+    }
+
+    /// GitLab Community Edition's answer to a query with the approval rule
+    /// fields, as a public server gave it.
+    fn without_rules_error() -> Value {
+        json!({"errors": [
+            {"message": "Field 'approvalsLeft' doesn't exist on type 'MergeRequest' (Did you mean `approved`?)"},
+            {"message": "Field 'approvalState' doesn't exist on type 'MergeRequest' (Did you mean `approved`?)"}
+        ]})
+    }
+
+    /// A Community Edition answer without the approval rule fields: alex
+    /// approved !2, nobody !1.
+    fn community_answer() -> Value {
+        let mut approved = node(2, "acme/app", "me", None, "2026-11-08T09:00:00Z");
+        let mut open = node(1, "acme/app", "sam", Some("me"), "2026-11-08T08:00:00Z");
+        for n in [&mut approved, &mut open] {
+            let o = n.as_object_mut().unwrap();
+            o.remove("approvalsRequired");
+            o.remove("approvalState");
+        }
+        approved["approved"] = json!(true);
+        approved["approvedBy"] = json!({"nodes": [{"username": "alex"}]});
+        json!({"data": {"currentUser": {"username": "me",
+            "authoredMergeRequests": {"nodes": [approved]},
+            "reviewRequestedMergeRequests": {"nodes": [open]}}}})
+    }
+
+    /// Every query that loads merge requests, in every state.
+    fn mr_queries() -> Vec<String> {
+        let mut queries = Vec::new();
+        for status in [Status::Open, Status::Merged, Status::Closed] {
+            for list in ["authoredMergeRequests", "reviewRequestedMergeRequests"] {
+                for scoped in [false, true] {
+                    queries.push(list_query(list, status, scoped));
+                }
+            }
+            queries.push(PROJECT_ALL.replace("STATE", state_word(status)));
+            queries.push(member_query(&["acme/app".into()], None, status));
+        }
+        queries
+    }
+
+    #[test]
+    fn every_merge_request_query_can_leave_out_the_approval_rules() {
+        for q in mr_queries() {
+            assert!(q.contains("approvalsRequired approvalState"), "{q}");
+            let short = without_approval_rules(&q);
+            for field in ["approvalsRequired", "approvalState", "approvalsLeft"] {
+                assert!(!short.contains(field), "{short}");
+            }
+            // What every GitLab edition has stays.
+            assert!(short.contains("approved\n  approvedBy { nodes { username } }"));
+            assert!(short.contains("...mr") && short.contains("fragment mr on MergeRequest"));
+        }
+        assert!(!mr_fragment!().contains("approvalsLeft"), "never read");
+    }
+
+    #[test]
+    fn only_the_missing_approval_fields_count_as_no_rules() {
+        assert!(lacks_approval_rules(&without_rules_error()));
+        assert!(lacks_approval_rules(&json!({"errors": [
+            {"message": "Field 'approvalsRequired' doesn't exist on type 'MergeRequest'"}
+        ]})));
+        assert!(
+            lacks_approval_rules(&json!({"errors": [
+                {"message": "Field \"approvalState\" doesn't exist on type \"MergeRequest\""}
+            ]})),
+            "other quotes"
+        );
+        for message in [
+            "Field 'nope' doesn't exist on type 'MergeRequest'",
+            "Field 'nope' doesn't exist on type 'MergeRequest' (Did you mean `approvalState`?)",
+            "Field 'approvalState' doesn't exist on type 'Project'",
+            "Invalid token",
+            "Internal server error",
+        ] {
+            assert!(
+                !lacks_approval_rules(&json!({"errors": [{"message": message}]})),
+                "{message}"
+            );
+        }
+        assert!(!lacks_approval_rules(&community_answer()));
+    }
+
+    /// Sends through [`with_rules_fallback`] and records each query sent,
+    /// answering `answer(query)`.
+    fn send_all(
+        host: &str,
+        known: &Mutex<HashSet<String>>,
+        answer: impl Fn(&str) -> Result<Option<Value>, String>,
+    ) -> (Result<Option<Value>, String>, Vec<String>) {
+        let sent = std::cell::RefCell::new(Vec::new());
+        let query = list_query("authoredMergeRequests", Status::Open, false);
+        let result = with_rules_fallback(host, &query, known, |q| {
+            sent.borrow_mut().push(q.to_string());
+            answer(q)
+        });
+        (result, sent.into_inner())
+    }
+
+    /// A Community Edition server: refuses the approval rule fields.
+    fn community(q: &str) -> Result<Option<Value>, String> {
+        Ok(Some(if q.contains("approvalState") {
+            without_rules_error()
+        } else {
+            community_answer()
+        }))
+    }
+
+    #[test]
+    fn a_server_without_approval_rules_is_asked_again_without_them() {
+        let known = Mutex::new(HashSet::new());
+        let (result, sent) = send_all("git.acme.test", &known, community);
+        assert_eq!(sent.len(), 2, "once more, without the fields");
+        assert!(sent[0].contains("approvalState") && !sent[1].contains("approvalState"));
+        let data = parse(&result.unwrap().unwrap(), "git.acme.test").unwrap();
+        assert_eq!(data.mine.len(), 1);
+        assert_eq!(data.review.len(), 1);
+        assert!(known.lock().unwrap().contains("git.acme.test"));
+        // Later refreshes ask that host without them straight away.
+        let (result, sent) = send_all("git.acme.test", &known, community);
+        assert_eq!(sent.len(), 1, "{sent:#?}");
+        assert!(!sent[0].contains("approvalState"));
+        assert!(parse(&result.unwrap().unwrap(), "git.acme.test").is_ok());
+        // Another host is asked in full.
+        let (_, sent) = send_all("gitlab.com", &known, |_| Ok(Some(sample())));
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].contains("approvalState"));
+    }
+
+    #[test]
+    fn a_server_with_approval_rules_takes_one_full_request() {
+        let known = Mutex::new(HashSet::new());
+        for _ in 0..2 {
+            let (result, sent) = send_all("gitlab.com", &known, |_| Ok(Some(sample())));
+            assert_eq!(sent.len(), 1);
+            assert!(sent[0].contains(approval_rule_fields!()));
+            let d = parse(&result.unwrap().unwrap(), "gitlab.com").unwrap();
+            assert_eq!(d.review[0].approvals_required, Some(2), "given of needed");
+            assert_eq!(d.review[0].pending_rules, vec!["code owners", "Builders"]);
+        }
+        assert!(known.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn other_errors_are_not_asked_again() {
+        let known = Mutex::new(HashSet::new());
+        let unknown =
+            json!({"errors": [{"message": "Field 'nope' doesn't exist on type 'MergeRequest'"}]});
+        let (result, sent) = send_all("git.acme.test", &known, |_| Ok(Some(unknown.clone())));
+        assert_eq!(sent.len(), 1);
+        let e = parse(&result.unwrap().unwrap(), "git.acme.test").unwrap_err();
+        assert_eq!(
+            e,
+            "GitLab: Field 'nope' doesn't exist on type 'MergeRequest'"
+        );
+        let (result, sent) = send_all("git.acme.test", &known, |_| {
+            Err("git.acme.test did not answer within 30 s".into())
+        });
+        assert_eq!(sent.len(), 1);
+        assert!(result.is_err());
+        let (result, sent) = send_all("git.acme.test", &known, |_| Ok(None));
+        assert_eq!(sent.len(), 1, "not logged in");
+        assert!(result.unwrap().is_none());
+        assert!(known.lock().unwrap().is_empty());
+        // A query without the fields is never sent twice.
+        let short =
+            without_approval_rules(&list_query("authoredMergeRequests", Status::Open, false));
+        let count = std::cell::Cell::new(0);
+        let result = with_rules_fallback("git.acme.test", &short, &known, |_| {
+            count.set(count.get() + 1);
+            Ok(Some(without_rules_error()))
+        });
+        assert_eq!(count.get(), 1);
+        assert!(result.unwrap().is_some());
+    }
+
+    #[test]
+    fn approvals_without_rules_count_who_approved() {
+        let d = parse(&community_answer(), "git.acme.test").unwrap();
+        let (approved, open) = (&d.mine[0], &d.review[0]);
+        assert_eq!(approved.approvals_given, 1);
+        assert_eq!(approved.approvals_required, None, "no 'of needed'");
+        assert!(approved.approved);
+        assert_eq!(approved.approved_by, ["alex"]);
+        assert!(approved.pending_rules.is_empty());
+        assert_eq!(open.approvals_given, 0);
+        assert_eq!(open.approvals_required, None);
+        assert!(!open.approved, "nobody approved");
+        assert!(open.pending_rules.is_empty());
+        // "All" reads the same nodes.
+        let nodes =
+            community_answer()["data"]["currentUser"]["authoredMergeRequests"]["nodes"].clone();
+        let v = json!({"data": {"currentUser": {"username": "me"}, "project": {"fullPath": "acme/app", "mergeRequests": {"count": 1, "nodes": nodes.clone()}}}});
+        let part = parse_project_all(&v, "git.acme.test").unwrap();
+        assert!(part.items[0].approved && part.items[0].approvals_required.is_none());
+        let v = json!({"data": {"currentUser": {"username": "me"}, "projects": {"nodes": [{"mergeRequests": {"nodes": nodes}}]}}});
+        let items = parse_members(&v, "git.acme.test").unwrap();
+        assert!(items[0].approved && items[0].pending_rules.is_empty());
     }
 
     #[test]

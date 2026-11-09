@@ -2639,6 +2639,36 @@ mod tests {
     }
 
     #[test]
+    fn approvals_without_approval_rules_show_who_approved() {
+        // GitLab Community Edition: no approval rules, so nothing "of needed".
+        let mut approved = sample_mr(2, ReviewState::Unreviewed, Pipeline::Success);
+        approved.approvals_given = 1;
+        approved.approved_by = vec!["alex".into()];
+        approved.approved = true;
+        let open = sample_mr(1, ReviewState::Unreviewed, Pipeline::Success);
+        let mut app = app_with(vec![], vec![approved.clone(), open.clone()], false);
+        let icons = Icons { nerd: false };
+        let cell = |mr: &MergeRequest, app: &App| {
+            let line = cell_line(Col::Approvals, mr, app, &icons);
+            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            (text, line.spans[0].style.fg)
+        };
+        assert_eq!(cell(&approved, &app), ("✓ 1".to_string(), Some(GREEN)));
+        assert_eq!(cell(&open, &app), ("0".to_string(), Some(FAINT)));
+        app.details = true;
+        for (row, says) in [(0, "approved by alex"), (1, "not approved yet")] {
+            app.mine_state.select(Some(row));
+            let rows = screen(&mut app, 160, 40);
+            let line = rows
+                .iter()
+                .find(|r| r.contains("Approvals") && !r.contains("Updated"))
+                .unwrap_or_else(|| panic!("{rows:#?}"));
+            assert!(line.contains(says), "{line}");
+            assert!(!rows.iter().any(|r| r.contains("waiting for")), "{rows:#?}");
+        }
+    }
+
+    #[test]
     fn details_of_a_merged_one_offer_no_writes() {
         let with_clone = |app: &mut App| {
             app.details = true;
