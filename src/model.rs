@@ -76,6 +76,35 @@ pub enum MergeState {
     Blocked,
 }
 
+/// Whether a merge request is still open, was merged, or was closed without
+/// merging. The list shows one of them at a time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Status {
+    #[default]
+    Open,
+    Merged,
+    Closed,
+}
+
+impl Status {
+    /// The order the state key steps through, round at the end.
+    pub fn next(self) -> Status {
+        match self {
+            Status::Open => Status::Merged,
+            Status::Merged => Status::Closed,
+            Status::Closed => Status::Open,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Status::Open => "open",
+            Status::Merged => "merged",
+            Status::Closed => "closed",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct MergeRequest {
     pub forge: Forge,
@@ -100,6 +129,8 @@ pub struct MergeRequest {
     pub created: Option<i64>,
     pub updated: Option<i64>,
     pub merge_state: MergeState,
+    /// Open, merged or closed without merging.
+    pub status: Status,
     pub approvals_given: u64,
     /// Approvals needed in all, when the forge says (GitLab: the sum of its
     /// approval rules; GitHub: the branch protection, visible to admins).
@@ -148,6 +179,10 @@ impl MergeRequest {
 pub struct Data {
     pub review: Vec<MergeRequest>,
     pub mine: Vec<MergeRequest>,
+    /// The project "Mine" and "To review" were asked for, for merged and
+    /// closed ones (`None`: every project). Open ones are always asked for
+    /// every project and filtered in the list.
+    pub of: Option<crate::repo::Project>,
     /// The "All" section; `None` until it is loaded.
     pub all: Option<AllList>,
 }

@@ -1,6 +1,6 @@
 //! Colours and icons.
 
-use crate::model::{MergeState, Pipeline, ReviewState};
+use crate::model::{MergeState, Pipeline, ReviewState, Status};
 use ratatui::style::Color;
 
 pub const TEXT: Color = Color::Rgb(0xE4, 0xE4, 0xEF);
@@ -35,6 +35,17 @@ impl Icons {
             MergeState::NeedsRebase => (self.pick("\u{f47f}", "↻"), YELLOW),
             MergeState::Checking => (self.pick("\u{f43a}", "…"), YELLOW),
             MergeState::Blocked => (self.pick("\u{f407}", "●"), GREEN),
+        }
+    }
+
+    /// The icon of a merged or closed one, in place of its merge state;
+    /// `None` for open ones.
+    pub fn status(&self, s: Status) -> Option<(&'static str, Color)> {
+        match s {
+            Status::Open => None,
+            // Octicons git-merge and git-pull-request-closed.
+            Status::Merged => Some((self.pick("\u{f419}", "✔"), ACCENT)),
+            Status::Closed => Some((self.pick("\u{f4dc}", "✕"), RED)),
         }
     }
 

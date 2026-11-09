@@ -3,7 +3,7 @@
 
 use crate::config::{Config, Scope};
 use crate::forge::{self, Fetched};
-use crate::model::{AllList, Data, Forge, MergeRequest, MergeState};
+use crate::model::{AllList, Data, Forge, MergeRequest, MergeState, Status};
 use crate::repo::Project;
 use crate::ui;
 use crate::view::{self, Show, SortKey};
@@ -64,6 +64,8 @@ impl Section {
 pub enum Hit {
     Section(Section),
     Scope,
+    /// The title: steps open, merged, closed.
+    Status,
     /// A column heading: sorts by it, a second click turns the order round.
     Sort(SortKey),
     /// A table row, by its index in the current section.
@@ -149,6 +151,31 @@ impl ThreadFilter {
     }
 }
 
+/// The lists of a state that is not on screen, kept so switching back shows
+/// them at once.
+#[derive(Debug, Default)]
+struct Parked {
+    data: Option<Data>,
+    error: Option<String>,
+    updated_at: Option<Instant>,
+    /// Where each section was, so coming back shows it as it was left.
+    tables: Option<[TableState; 3]>,
+}
+
+impl Parked {
+    /// Keeps a refresh's answer.
+    fn store(&mut self, result: Result<Fetched, String>) {
+        match result {
+            Ok(fetched) => {
+                self.data = Some(fetched.data);
+                self.error = fetched.warning;
+                self.updated_at = Some(Instant::now());
+            }
+            Err(e) => self.error = Some(e),
+        }
+    }
+}
+
 /// The built-in changes viewer.
 pub struct DiffView {
     pub iid: u64,
@@ -216,6 +243,10 @@ pub struct App {
     pub project: Option<Project>,
     pub scope: Scope,
     pub section: Section,
+    /// Open, merged or closed ones on screen; open every time the list opens.
+    pub status: Status,
+    /// The lists of the other two states, as far as loaded.
+    parked: std::collections::HashMap<Status, Parked>,
     pub review_state: TableState,
     pub mine_state: TableState,
     pub all_state: TableState,
@@ -280,8 +311,8 @@ pub struct App {
     pub opening_branch: bool,
     branch_tx: Sender<Result<String, String>>,
     branch_rx: Receiver<Result<String, String>>,
-    tx: Sender<Result<Fetched, String>>,
-    rx: Receiver<Result<Fetched, String>>,
+    tx: Sender<(Status, Result<Fetched, String>)>,
+    rx: Receiver<(Status, Result<Fetched, String>)>,
     quit: bool,
 }
 
@@ -310,6 +341,8 @@ impl App {
             project,
             scope,
             section: Section::ORDER[0],
+            status: Status::Open,
+            parked: std::collections::HashMap::new(),
             review_state: TableState::default(),
             mine_state: TableState::default(),
             all_state: TableState::default(),
@@ -425,6 +458,24 @@ impl App {
             })
     }
 
+    /// Whether "Mine" and "To review" as loaded fit the scope shown now:
+    /// open ones always (the list filters them), merged and closed ones only
+    /// when they were asked for this scope.
+    pub fn lists_fit(&self) -> bool {
+        self.data
+            .as_ref()
+            .is_some_and(|d| self.status == Status::Open || d.of.as_ref() == self.scoped_project())
+    }
+
+    /// Whether a section still waits for its list: nothing loaded yet, or
+    /// loaded for the other scope.
+    pub fn loading_section(&self, section: Section) -> bool {
+        match section {
+            Section::All => self.all_list().is_none(),
+            _ => !self.lists_fit(),
+        }
+    }
+
     fn all_items(&self) -> impl Iterator<Item = &MergeRequest> {
         self.all_list().into_iter().flat_map(|all| &all.items)
     }
@@ -435,6 +486,9 @@ impl App {
         let Some(data) = &self.data else {
             return Vec::new();
         };
+        if self.loading_section(section) {
+            return Vec::new();
+        }
         let list: Vec<&MergeRequest> = match section {
             Section::Review => data.review.iter().collect(),
             Section::Mine => data.mine.iter().collect(),
@@ -519,10 +573,85 @@ impl App {
         self.loading = true;
         let tx = self.tx.clone();
         let host = self.config.gitlab_host.clone();
-        let all_of = self.scoped_project().cloned();
+        let (status, all_of) = self.fetch_request();
         std::thread::spawn(move || {
-            let _ = tx.send(forge::fetch_all(&host, all_of.as_ref()));
+            let _ = tx.send((status, forge::fetch_all(&host, status, all_of.as_ref())));
         });
+    }
+
+    /// What a refresh asks for: the state on screen, and "All" (and merged
+    /// or closed lists) for the scope on screen.
+    pub fn fetch_request(&self) -> (Status, Option<Project>) {
+        (self.status, self.scoped_project().cloned())
+    }
+
+    /// Steps the list to the next state: open, merged, closed. The lists of
+    /// the state left are kept, so coming back shows them at once.
+    fn step_status(&mut self) {
+        let next = self.status.next();
+        let shown = Parked {
+            data: self.data.take(),
+            error: self.error.take(),
+            updated_at: self.updated_at.take(),
+            tables: Some(Section::ORDER.map(|s| *self.table_state(s))),
+        };
+        self.parked.insert(self.status, shown);
+        let back = self.parked.remove(&next).unwrap_or_default();
+        self.data = back.data;
+        self.error = back.error;
+        self.updated_at = back.updated_at;
+        self.status = next;
+        // The quick filters are for open ones.
+        if next != Status::Open {
+            self.show = Show::All;
+        }
+        match back.tables {
+            Some(tables) => {
+                for (section, table) in Section::ORDER.into_iter().zip(tables) {
+                    *self.table_state_mut(section) = table;
+                }
+                self.clamp_selection();
+            }
+            None => self.after_view_change(),
+        }
+        self.details_scroll = 0;
+        // Other merge requests now: a thread chosen before is not theirs.
+        self.thread = None;
+        self.schedule_shown();
+    }
+
+    /// Whether any section still waits for its list for this scope.
+    fn any_section_loading(&self) -> bool {
+        Section::ORDER.iter().any(|s| self.loading_section(*s))
+    }
+
+    /// When to load the state on screen: at once when its lists are
+    /// missing, for the other scope or old (after the refresh running now,
+    /// if any), otherwise one interval after they were loaded.
+    fn schedule_shown(&mut self) {
+        let every = Duration::from_secs(self.config.refresh_secs);
+        self.next_refresh = match self.updated_at {
+            Some(at) if at.elapsed() < every && !self.any_section_loading() => at + every,
+            _ => Instant::now(),
+        };
+    }
+
+    /// After a write to a forge: the kept merged and closed lists may miss
+    /// what it changed (a merge), so they load again when shown.
+    fn after_write(&mut self) {
+        for parked in self.parked.values_mut() {
+            parked.updated_at = None;
+        }
+    }
+
+    /// Says so when `mr` is merged or closed, where only open ones can be
+    /// approved, merged, set to draft or opened as a branch.
+    fn refuse_closed(&mut self, mr: &MergeRequest) -> bool {
+        if mr.status == Status::Open {
+            return false;
+        }
+        self.say(format!("{} is {}", mr.reference(), mr.status.name()));
+        true
     }
 
     fn receive_actions(&mut self) {
@@ -530,6 +659,7 @@ impl App {
             match result {
                 Ok(msg) => {
                     self.say(msg);
+                    self.after_write();
                     self.loading = false;
                     self.refresh();
                 }
@@ -544,6 +674,9 @@ impl App {
         let Some(mr) = self.selected().cloned() else {
             return;
         };
+        if self.refuse_closed(&mr) {
+            return;
+        }
         if mr.author == mr.viewer {
             self.say(format!("You cannot approve your own {}", mr.forge.noun()));
             return;
@@ -569,6 +702,9 @@ impl App {
         let Some(mr) = self.selected().cloned() else {
             return;
         };
+        if self.refuse_closed(&mr) {
+            return;
+        }
         if mr.merge_state != MergeState::Ready {
             let forge = mr.forge.name();
             let why = match mr.merge_state {
@@ -595,6 +731,9 @@ impl App {
         let Some(mr) = self.selected().cloned() else {
             return;
         };
+        if self.refuse_closed(&mr) {
+            return;
+        }
         if mr.author != mr.viewer {
             self.say(format!(
                 "Only your own {}s can be set to draft or ready here",
@@ -639,6 +778,9 @@ impl App {
         let Some(mr) = self.selected().cloned() else {
             return;
         };
+        if self.refuse_closed(&mr) {
+            return;
+        }
         if self.opening_branch {
             self.say("Still opening a branch");
             return;
@@ -961,6 +1103,7 @@ impl App {
                 }
                 Some(Hit::Section(s)) => self.section = s,
                 Some(Hit::Scope) => self.toggle_scope(),
+                Some(Hit::Status) => self.step_status(),
                 Some(Hit::Sort(k)) => self.sort_by(k),
                 Some(Hit::Row(i)) => {
                     // A second click on the same row within half a second
@@ -994,19 +1137,27 @@ impl App {
     }
 
     fn receive(&mut self) {
-        while let Ok(result) = self.rx.try_recv() {
+        while let Ok((status, result)) = self.rx.try_recv() {
             self.loading = false;
             self.next_refresh = Instant::now() + Duration::from_secs(self.config.refresh_secs);
+            if status != self.status {
+                // Asked for before the state changed: keep it for that state,
+                // and load the one on screen when it needs it.
+                self.parked.entry(status).or_default().store(result);
+                self.schedule_shown();
+                continue;
+            }
             match result {
                 Ok(fetched) => {
                     self.data = Some(fetched.data);
                     self.error = fetched.warning;
                     self.updated_at = Some(Instant::now());
                     self.clamp_selection();
-                    // `a` was pressed while loading: "All" is for the other
-                    // scope. Only after an answer, so a failing forge is not
-                    // asked again at once, over and over.
-                    if self.all_list().is_none() {
+                    // `a` was pressed while loading: "All" (or merged and
+                    // closed lists) are for the other scope. Only after an
+                    // answer, so a failing forge is not asked again at once,
+                    // over and over.
+                    if self.any_section_loading() {
                         self.next_refresh = Instant::now();
                     }
                 }
@@ -1128,10 +1279,12 @@ impl App {
         for section in Section::ORDER {
             self.table_state_mut(section).select(Some(0));
         }
+        self.thread = None;
         self.clamp_selection();
-        // "All" lists other merge requests per scope: load them now (the
-        // main loop starts it; one already running is followed by another).
-        if self.all_list().is_none() {
+        // "All", and merged and closed ones, list other merge requests per
+        // scope: load them now (the main loop starts it; one already running
+        // is followed by another).
+        if self.any_section_loading() {
             self.next_refresh = Instant::now();
         }
     }
@@ -1249,6 +1402,10 @@ impl App {
             }
             KeyCode::Char('d') => self.show_changes(),
             KeyCode::Char('/') => self.typing = true,
+            KeyCode::Char('f') if self.status != Status::Open => {
+                let noun = self.plural_noun().to_lowercase();
+                self.say(format!("Quick filters are for open {noun}"));
+            }
             KeyCode::Char('f') => {
                 self.show = self.show.next();
                 self.after_view_change();
@@ -1299,6 +1456,7 @@ impl App {
                 }
             }
             KeyCode::Char('a') => self.toggle_scope(),
+            KeyCode::Char('z') => self.step_status(),
             KeyCode::Char('i') => self.toggle_icons(),
             _ => {}
         }
@@ -1362,6 +1520,7 @@ mod tests {
             created: Some(0),
             updated: Some(iid as i64),
             merge_state: MergeState::Blocked,
+            status: crate::model::Status::Open,
             approvals_given: 0,
             approvals_required: None,
             approved_by: vec![],
@@ -1393,6 +1552,7 @@ mod tests {
         app.data = Some(Data {
             review: (1..=3).map(sample_mr).collect(),
             mine: (4..=6).map(sample_mr).collect(),
+            of: None,
             all: Some(AllList {
                 of: None,
                 items: all_rows(),
@@ -1610,10 +1770,13 @@ mod tests {
             error: None,
         });
         app.tx
-            .send(Ok(Fetched {
-                data,
-                warning: None,
-            }))
+            .send((
+                Status::Open,
+                Ok(Fetched {
+                    data,
+                    warning: None,
+                }),
+            ))
             .unwrap();
         app.receive();
         assert!(
@@ -1633,10 +1796,13 @@ mod tests {
         let data = app.data.clone().unwrap();
         assert_eq!(data.all.as_ref().unwrap().of, None);
         app.tx
-            .send(Ok(Fetched {
-                data,
-                warning: None,
-            }))
+            .send((
+                Status::Open,
+                Ok(Fetched {
+                    data,
+                    warning: None,
+                }),
+            ))
             .unwrap();
         app.receive();
         assert!(!app.loading);
@@ -1651,7 +1817,9 @@ mod tests {
         let mut app = app_in_clone(std::path::Path::new("/nowhere"));
         assert!(app.all_list().is_none(), "All is for the other scope");
         app.loading = true;
-        app.tx.send(Err("glab: no network".into())).unwrap();
+        app.tx
+            .send((Status::Open, Err("glab: no network".into())))
+            .unwrap();
         app.receive();
         assert!(
             app.next_refresh > Instant::now(),
@@ -1747,6 +1915,319 @@ mod tests {
         assert_eq!(app.section, Section::All);
         click(&mut app, mine_x, mine_y);
         assert_eq!(app.section, Section::Mine);
+    }
+
+    /// Merged ones in every section, as loaded for `of`.
+    fn merged_data(of: Option<Project>) -> Data {
+        let merged = |iid| {
+            let mut mr = sample_mr(iid);
+            mr.status = Status::Merged;
+            // What GitHub and GitLab still report for merged ones.
+            mr.merge_state = MergeState::Ready;
+            mr
+        };
+        Data {
+            review: vec![merged(11), merged(12)],
+            mine: vec![merged(13)],
+            of: of.clone(),
+            all: Some(AllList {
+                of,
+                items: vec![merged(14)],
+                total: 1,
+                newest: 1,
+                error: None,
+            }),
+        }
+    }
+
+    /// The answer of a refresh for `status`, as the background thread sends it.
+    fn answer(app: &mut App, status: Status, data: Data) {
+        app.tx
+            .send((
+                status,
+                Ok(Fetched {
+                    data,
+                    warning: None,
+                }),
+            ))
+            .unwrap();
+        app.receive();
+    }
+
+    #[test]
+    fn the_list_opens_on_open_ones() {
+        let app = app();
+        assert_eq!(app.status, Status::Open);
+        assert_eq!(app.fetch_request(), (Status::Open, None));
+    }
+
+    #[test]
+    fn z_steps_open_merged_closed_and_back() {
+        let mut app = app();
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Char('z'));
+            seen.push(app.status);
+        }
+        assert_eq!(seen, [Status::Merged, Status::Closed, Status::Open]);
+        // A refresh asks for the state on screen.
+        press(&mut app, KeyCode::Char('z'));
+        assert_eq!(app.fetch_request().0, Status::Merged);
+    }
+
+    #[test]
+    fn merged_ones_load_on_the_first_switch_and_open_ones_come_back_at_once() {
+        let mut app = app();
+        app.updated_at = Some(Instant::now());
+        app.next_refresh = Instant::now() + Duration::from_secs(60);
+        press(&mut app, KeyCode::Char('z'));
+        assert!(app.data.is_none(), "nothing merged loaded yet");
+        assert!(app.rows(Section::Review).is_empty());
+        assert!(app.next_refresh <= Instant::now(), "loads at once");
+        answer(&mut app, Status::Merged, merged_data(None));
+        assert_eq!(iids(&app.rows(Section::Mine)), [13]);
+        assert_eq!(iids(&app.rows(Section::All)), [14]);
+        // Back to open: the open lists at once, no waiting.
+        press(&mut app, KeyCode::Char('z'));
+        press(&mut app, KeyCode::Char('z'));
+        assert_eq!(app.status, Status::Open);
+        assert_eq!(iids(&app.rows(Section::Mine)), [6, 5, 4]);
+        assert!(
+            app.next_refresh > Instant::now(),
+            "loaded a moment ago: no refresh needed"
+        );
+        // And merged again, kept from before.
+        press(&mut app, KeyCode::Char('z'));
+        assert_eq!(iids(&app.rows(Section::Mine)), [13]);
+    }
+
+    #[test]
+    fn an_answer_for_a_state_no_longer_shown_is_kept_and_the_shown_one_loads() {
+        let mut app = app();
+        // A refresh of open ones runs while `z` switches to merged.
+        app.loading = true;
+        press(&mut app, KeyCode::Char('z'));
+        let open = app.parked[&Status::Open].data.clone().unwrap();
+        answer(&mut app, Status::Open, open);
+        assert!(app.data.is_none(), "not shown as merged ones");
+        assert!(app.next_refresh <= Instant::now(), "merged ones load now");
+        // Also when that answer was an error.
+        app.next_refresh = Instant::now() + Duration::from_secs(60);
+        app.loading = true;
+        app.tx
+            .send((Status::Open, Err("glab: no network".into())))
+            .unwrap();
+        app.receive();
+        assert!(app.next_refresh <= Instant::now());
+        assert_eq!(app.error, None, "the error belongs to open ones");
+    }
+
+    #[test]
+    fn a_failed_merged_load_keeps_the_open_list() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('z'));
+        app.loading = true;
+        app.tx
+            .send((Status::Merged, Err("gh: no network".into())))
+            .unwrap();
+        app.receive();
+        assert_eq!(app.error.as_deref(), Some("gh: no network"));
+        assert!(
+            app.next_refresh > Instant::now(),
+            "a failing forge is not asked again at once"
+        );
+        press(&mut app, KeyCode::Char('z'));
+        press(&mut app, KeyCode::Char('z'));
+        assert_eq!(iids(&app.rows(Section::Mine)), [6, 5, 4]);
+        assert_eq!(app.error, None, "the open list has no error");
+    }
+
+    #[test]
+    fn merged_ones_follow_the_scope() {
+        let mut app = app_in_clone(std::path::Path::new("/nowhere"));
+        let project = app.project.clone();
+        press(&mut app, KeyCode::Char('z'));
+        assert_eq!(app.fetch_request(), (Status::Merged, project.clone()));
+        answer(&mut app, Status::Merged, merged_data(project.clone()));
+        assert_eq!(iids(&app.rows(Section::Review)), [12, 11]);
+        // All projects: these were asked for this project only.
+        app.next_refresh = Instant::now() + Duration::from_secs(60);
+        press(&mut app, KeyCode::Char('a'));
+        assert!(app.rows(Section::Review).is_empty());
+        assert!(app.loading_section(Section::Mine));
+        assert!(app.next_refresh <= Instant::now(), "load at once");
+        // An answer for the old scope does not count either.
+        answer(&mut app, Status::Merged, merged_data(project));
+        assert!(app.rows(Section::Mine).is_empty());
+        assert!(app.next_refresh <= Instant::now());
+        answer(&mut app, Status::Merged, merged_data(None));
+        assert_eq!(iids(&app.rows(Section::Mine)), [13]);
+        // Open ones keep switching at once, as before.
+        press(&mut app, KeyCode::Char('z'));
+        press(&mut app, KeyCode::Char('z'));
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(iids(&app.rows(Section::Mine)), [6, 5, 4]);
+    }
+
+    #[test]
+    fn merged_and_closed_ones_cannot_be_approved_merged_drafted_or_branched() {
+        let mut app = app_in_clone(std::path::Path::new("/nowhere"));
+        app.scope = Scope::All;
+        press(&mut app, KeyCode::Char('z'));
+        answer(&mut app, Status::Merged, merged_data(None));
+        for key in ['v', 'm', 'w', 'b'] {
+            app.flash = None;
+            press(&mut app, KeyCode::Char(key));
+            assert_eq!(flash(&app), Some("!13 is merged"), "{key}");
+            assert!(app.confirm.is_none(), "{key}");
+            assert!(!app.opening_branch, "{key}");
+        }
+        let mut closed = merged_data(None);
+        closed.mine[0].status = Status::Closed;
+        press(&mut app, KeyCode::Char('z'));
+        answer(&mut app, Status::Closed, closed);
+        press(&mut app, KeyCode::Char('v'));
+        assert_eq!(flash(&app), Some("!13 is closed"));
+        assert!(app.confirm.is_none());
+    }
+
+    #[test]
+    fn merged_ones_can_still_be_looked_at() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('z'));
+        answer(&mut app, Status::Merged, merged_data(None));
+        press(&mut app, KeyCode::Enter);
+        // Reaches the browser step (the sample has no link), not a refusal.
+        assert_eq!(flash(&app), Some("Only web links can be opened"));
+        press(&mut app, KeyCode::Char('p'));
+        assert!(app.details);
+        press(&mut app, KeyCode::Char('c'));
+        assert_eq!(app.panel_tab, PanelTab::Activity);
+        // Search and sort as on open ones.
+        press(&mut app, KeyCode::Char('2'));
+        app.filter = "change 11".into();
+        assert_eq!(iids(&app.rows(Section::Review)), [11]);
+        app.filter.clear();
+        app.sort_by(SortKey::Number);
+        app.sort_by(SortKey::Number);
+        assert_eq!(iids(&app.rows(Section::Review)), [11, 12]);
+    }
+
+    #[test]
+    fn quick_filters_are_off_for_merged_and_closed_ones() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('f'));
+        assert_eq!(app.show, Show::NeedsMe);
+        press(&mut app, KeyCode::Char('z'));
+        assert_eq!(app.show, Show::All, "reset when leaving open");
+        answer(&mut app, Status::Merged, merged_data(None));
+        press(&mut app, KeyCode::Char('f'));
+        assert_eq!(app.show, Show::All);
+        assert_eq!(
+            flash(&app),
+            Some("Quick filters are for open merge requests")
+        );
+        assert_eq!(iids(&app.rows(Section::Review)), [12, 11]);
+    }
+
+    #[test]
+    fn clearing_keeps_the_state() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('z'));
+        app.filter = "x".into();
+        press(&mut app, KeyCode::Char('x'));
+        assert_eq!(app.status, Status::Merged);
+        app.filter = "x".into();
+        press(&mut app, KeyCode::Esc);
+        assert!(app.filter.is_empty());
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.status, Status::Merged);
+    }
+
+    #[test]
+    fn switching_state_or_scope_forgets_the_chosen_thread() {
+        let mut app = app_in_clone(std::path::Path::new("/nowhere"));
+        app.thread = Some(2);
+        press(&mut app, KeyCode::Char('z'));
+        assert_eq!(app.thread, None, "z");
+        app.thread = Some(2);
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(app.thread, None, "a");
+    }
+
+    #[test]
+    fn a_write_makes_the_kept_merged_and_closed_lists_old() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('z'));
+        answer(&mut app, Status::Merged, merged_data(None));
+        press(&mut app, KeyCode::Char('z'));
+        press(&mut app, KeyCode::Char('z'));
+        // Merging one of the open ones moves it to the merged list.
+        app.after_write();
+        press(&mut app, KeyCode::Char('z'));
+        assert_eq!(iids(&app.rows(Section::Mine)), [13], "shown at once");
+        assert!(app.next_refresh <= Instant::now(), "and loaded again");
+    }
+
+    #[test]
+    fn a_late_answer_does_not_reload_a_fresh_list() {
+        let mut app = app();
+        app.updated_at = Some(Instant::now());
+        // A refresh of open ones runs; z goes round to open ones again.
+        app.loading = true;
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Char('z'));
+        }
+        assert_eq!(app.status, Status::Open);
+        app.loading = true;
+        answer(&mut app, Status::Merged, merged_data(None));
+        assert!(
+            app.next_refresh > Instant::now(),
+            "open ones were loaded a moment ago"
+        );
+    }
+
+    #[test]
+    fn coming_back_keeps_where_each_section_was() {
+        let mut app = app();
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Char('2'));
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Char('z'));
+        answer(&mut app, Status::Merged, merged_data(None));
+        assert_eq!(app.review_state.selected(), Some(0), "a new list");
+        press(&mut app, KeyCode::Char('z'));
+        press(&mut app, KeyCode::Char('z'));
+        assert_eq!(app.review_state.selected(), Some(1));
+        assert_eq!(app.mine_state.selected(), Some(2));
+        assert_eq!(app.selected().map(|mr| mr.iid), Some(2));
+    }
+
+    #[test]
+    fn clicking_the_title_while_searching_switches_the_state() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('/'));
+        press(&mut app, KeyCode::Char('x'));
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let title: String = (0..20).map(|x| buf[(x, 0)].symbol()).collect();
+        click(&mut app, title.find("Merge").unwrap() as u16, 0);
+        assert_eq!(app.status, Status::Merged);
+        assert_eq!(app.filter, "x", "nothing typed into the search");
+    }
+
+    #[test]
+    fn clicking_the_title_steps_the_state() {
+        let mut app = app();
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let title: String = (0..20).map(|x| buf[(x, 0)].symbol()).collect();
+        let x = title.find("Merge").expect("title") as u16;
+        click(&mut app, x, 0);
+        assert_eq!(app.status, Status::Merged);
     }
 
     #[test]

@@ -2,7 +2,7 @@
 //! details panel, and a footer. Records clickable areas for the mouse.
 
 use crate::app::{Action, Activity, App, Hit, PanelTab, Section, ThreadFilter};
-use crate::model::{Label, MergeRequest, MergeState, Pipeline, ReviewState};
+use crate::model::{Label, MergeRequest, MergeState, Pipeline, ReviewState, Status};
 use crate::text;
 use crate::theme::{
     self, Icons, ACCENT, BAR_BG, BLUE, BORDER, FAINT, GREEN, MUTED, RED, SELECTED_BG, TEXT, YELLOW,
@@ -330,6 +330,7 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
                 ("Tab  1 2 3", "mine / to review / all"),
                 ("g G", "first / last"),
                 ("a", "this project / all projects"),
+                ("z", "open / merged / closed"),
             ],
         ),
         (
@@ -344,6 +345,7 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
                 ("v", "approve / take approval back"),
                 ("m", "merge (when GitLab or GitHub allows it)"),
                 ("w", "your own: draft / ready for review"),
+                ("", "b v m w: open ones only"),
                 ("y", "copy the link"),
             ],
         ),
@@ -351,7 +353,7 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
             "List",
             &[
                 ("/", "search"),
-                ("f", "show: all, needs me, threads, failed, ready"),
+                ("f", "open ones: all, needs me, threads, failed, ready"),
                 ("s", "sort by the next key"),
                 ("x", "clear search and filter"),
                 ("r", "refresh now"),
@@ -420,27 +422,59 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
     app.hits.push((full, Hit::Help));
 }
 
+/// The list's title: "Merge requests" (or "Pull requests") for open ones,
+/// "Merged merge requests" or "Closed pull requests" for the others.
+pub fn list_title(app: &App) -> String {
+    let noun = app.plural_noun();
+    match app.status {
+        Status::Open => noun.to_string(),
+        Status::Merged => format!("Merged {}", noun.to_lowercase()),
+        Status::Closed => format!("Closed {}", noun.to_lowercase()),
+    }
+}
+
 fn draw_header(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
     let line = Rect::new(area.x + 1, area.y, area.width.saturating_sub(2), 1);
+    let icon = icons
+        .status(app.status)
+        .unwrap_or_else(|| icons.merge_state(MergeState::Ready))
+        .0;
+    let labels: Vec<(Section, String)> = Section::ORDER
+        .iter()
+        .map(|&section| {
+            // Still loading for this scope ("All", merged and closed ones;
+            // open ones count from 0 as before).
+            let loading = app.loading_section(section)
+                && (section == Section::All || app.status != Status::Open);
+            let count = if loading {
+                "…".to_string()
+            } else {
+                app.rows(section).len().to_string()
+            };
+            (section, format!(" {} {count} ", section.name()))
+        })
+        .collect();
+    // On a pane too narrow for the tabs next to "Merged merge requests",
+    // the title is only "Merged".
+    let tabs_width: usize = labels.iter().map(|(_, l)| l.chars().count() + 1).sum();
+    let mut title = format!("{icon} {}", list_title(app));
+    if app.status != Status::Open
+        && Line::from(title.as_str()).width() + 3 + tabs_width > line.width as usize
+    {
+        let state = app.status.name();
+        title = format!("{icon} {}{}", state[..1].to_uppercase(), &state[1..]);
+    }
+    // A click on the title steps the state, like its key.
+    let title_width = Line::from(title.as_str()).width() as u16;
+    app.hits
+        .push((Rect::new(line.x, line.y, title_width, 1), Hit::Status));
     let mut spans = vec![Span::styled(
-        format!(
-            "{} {}   ",
-            icons.merge_state(MergeState::Ready).0,
-            app.plural_noun()
-        ),
+        format!("{title}   "),
         Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
     )];
     let mut x = line.x + Line::from(spans.clone()).width() as u16;
-    for section in Section::ORDER {
-        let name = section.name();
-        let count = if section == Section::All && app.all_list().is_none() {
-            // Still loading for this scope.
-            "…".to_string()
-        } else {
-            app.rows(section).len().to_string()
-        };
+    for (section, label) in labels {
         let active = app.section == section;
-        let label = format!(" {name} {count} ");
         let style = if active {
             Style::new()
                 .fg(TEXT)
@@ -683,7 +717,9 @@ fn cell_line<'a>(c: Col, mr: &'a MergeRequest, app: &App, icons: &Icons) -> Line
     };
     match c {
         Col::State => {
-            let (icon, color) = icons.merge_state(mr.merge_state);
+            let (icon, color) = icons
+                .status(mr.status)
+                .unwrap_or_else(|| icons.merge_state(mr.merge_state));
             Line::from(Span::styled(icon, Style::new().fg(color)))
         }
         Col::Id => Line::from(Span::styled(mr.reference(), Style::new().fg(FAINT))),
@@ -798,15 +834,16 @@ fn draw_table(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
         Some(all) if app.section == Section::All && all.items.is_empty() => all.error.clone(),
         _ => None,
     };
-    // "All" of a scope loads after `a` while the other sections switch at once.
-    let all_loading = app.section == Section::All && app.all_list().is_none();
+    // "All" of a scope (and merged and closed lists) load after `a`, while
+    // open ones in the other sections switch at once.
+    let section_loading = app.loading_section(app.section);
     if rows_data.is_empty() {
-        let (text, color) = if app.data.is_none() || all_loading {
+        let (text, color) = if app.data.is_none() || section_loading {
             match &app.error {
                 // Nothing loads any more: say why instead of "Loading".
                 Some(e) if app.data.is_none() || !app.loading => (e.clone(), RED),
                 _ => (
-                    format!("Loading {}…", app.plural_noun().to_lowercase()),
+                    format!("Loading {}…", list_title(app).to_lowercase()),
                     MUTED,
                 ),
             }
@@ -824,23 +861,29 @@ fn draw_table(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
                 ""
             };
             let noun = app.plural_noun().to_lowercase();
-            let what = match app.section {
-                Section::Review => "Nothing to review",
-                Section::Mine => &format!("No open {noun} of yours"),
-                Section::All => &format!("No open {noun}"),
+            let state = app.status.name();
+            let what = match (app.section, app.status) {
+                (Section::Review, Status::Open) => "Nothing to review",
+                (Section::Review, _) => &format!("No {state} {noun} with you as reviewer"),
+                (Section::Mine, _) => &format!("No {state} {noun} of yours"),
+                (Section::All, _) => &format!("No {state} {noun}"),
             };
             (format!("{what}{place}{hint}"), MUTED)
         };
+        // Wrapped on narrow panes instead of cut off.
+        let lines = text::wrap(
+            vec![Span::styled(text, Style::new().fg(color))],
+            inner.width,
+            Span::raw(""),
+            Span::raw(""),
+        );
         let [_, mid, _] = Layout::vertical([
             Constraint::Fill(1),
-            Constraint::Length(1),
+            Constraint::Length(lines.len().max(1) as u16),
             Constraint::Fill(1),
         ])
         .areas(inner);
-        frame.render_widget(
-            Paragraph::new(Span::styled(text, Style::new().fg(color))).alignment(Alignment::Center),
-            mid,
-        );
+        frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), mid);
         return;
     }
 
@@ -937,6 +980,12 @@ fn draw_table(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
 }
 
 fn status_text(mr: &MergeRequest) -> (&'static str, ratatui::style::Color) {
+    // What blocks a merge means nothing once it is merged or closed.
+    match mr.status {
+        Status::Merged => return ("Merged", ACCENT),
+        Status::Closed => return ("Closed", RED),
+        Status::Open => {}
+    }
     match mr.merge_state {
         MergeState::Ready => ("Ready to merge", ACCENT),
         MergeState::Draft => ("Draft", MUTED),
@@ -1139,11 +1188,14 @@ fn draw_details(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
             lines.extend(text::wrap(value, width, pad(), pad()));
         }
     }
-    let approvals = if mr.approved {
+    let approvals = if mr.approved || (mr.status != Status::Open && !mr.approved_by.is_empty()) {
         Span::styled(
             format!("approved by {}", mr.approved_by.join(", ")),
             Style::new().fg(GREEN),
         )
+    } else if mr.status != Status::Open {
+        // Nothing waits any more.
+        Span::styled("none", Style::new().fg(FAINT))
     } else if mr.pending_rules.is_empty() {
         Span::styled("not approved yet", Style::new().fg(YELLOW))
     } else {
@@ -1220,11 +1272,13 @@ fn draw_details(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
         Span::styled("d", key),
         Span::styled(" changes   ", Style::new().fg(FAINT)),
     ];
-    if app.herdr && app.remote_of(mr).is_some() {
+    // Merged and closed ones can only be looked at.
+    let open = mr.status == Status::Open;
+    if open && app.herdr && app.remote_of(mr).is_some() {
         actions.push(Span::styled("b", key));
         actions.push(Span::styled(" branch   ", Style::new().fg(FAINT)));
     }
-    if mr.author != me {
+    if open && mr.author != me {
         let what = if mr.approved_by.contains(&me) {
             " revoke approval   "
         } else {
@@ -1233,7 +1287,7 @@ fn draw_details(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
         actions.push(Span::styled("v", key));
         actions.push(Span::styled(what, Style::new().fg(FAINT)));
     }
-    if mr.merge_state == MergeState::Ready {
+    if open && mr.merge_state == MergeState::Ready {
         actions.push(Span::styled("m", key));
         actions.push(Span::styled(" merge   ", Style::new().fg(FAINT)));
     }
@@ -1805,6 +1859,7 @@ mod tests {
             created: Some(0),
             updated: Some(iid as i64),
             merge_state: MergeState::Blocked,
+            status: crate::model::Status::Open,
             approvals_given: 0,
             approvals_required: None,
             approved_by: vec![],
@@ -1879,6 +1934,7 @@ mod tests {
         app.data = Some(Data {
             review,
             mine,
+            of: None,
             all: None,
         });
         // Not from the shell the tests run in.
@@ -2211,6 +2267,231 @@ mod tests {
         terminal.draw(|frame| draw(frame, app)).unwrap();
         let buf = terminal.backend().buffer().clone();
         (0..height).map(|y| row_text(&buf, y)).collect()
+    }
+
+    /// The list switched to `status`, with merged or closed ones in "Mine",
+    /// "To review" and "All" whose merge state still says ready or conflict,
+    /// as the forges report it.
+    fn app_in(status: Status) -> App {
+        let past = |iid, merge_state| {
+            let mut mr = sample_mr(iid, ReviewState::Approved, Pipeline::Success);
+            mr.status = status;
+            mr.merge_state = merge_state;
+            mr
+        };
+        let mut app = app_with(
+            vec![past(2, MergeState::Conflict)],
+            vec![past(1, MergeState::Ready)],
+            false,
+        );
+        app.status = status;
+        app.data.as_mut().unwrap().all = Some(AllList {
+            of: None,
+            items: vec![past(3, MergeState::Ready)],
+            total: 1,
+            newest: 1,
+            error: None,
+        });
+        app
+    }
+
+    #[test]
+    fn header_says_which_state_is_shown() {
+        let mut app = app_with(vec![], sample_rows(), false);
+        assert!(screen(&mut app, 120, 20)[0].contains("Merge requests   "));
+        let mut app = app_in(Status::Merged);
+        assert!(screen(&mut app, 120, 20)[0].contains("Merged merge requests"));
+        let mut app = app_in(Status::Closed);
+        assert!(screen(&mut app, 120, 20)[0].contains("Closed merge requests"));
+        // GitHub only: pull requests.
+        for mr in app.data.as_mut().unwrap().mine.iter_mut() {
+            mr.forge = Forge::GitHub;
+        }
+        let data = app.data.as_mut().unwrap();
+        data.review.clear();
+        data.all = None;
+        assert!(screen(&mut app, 120, 20)[0].contains("Closed pull requests"));
+    }
+
+    #[test]
+    fn narrow_header_keeps_the_state_and_the_tabs() {
+        let mut app = app_in(Status::Merged);
+        // Wide enough for every tab of the open list, not with the long title.
+        let header = &screen(&mut app, 54, 20)[0];
+        assert!(header.contains("Merged "), "{header}");
+        assert!(!header.contains("merge requests"), "{header}");
+        assert!(header.contains(" All 1 "), "{header}");
+        // Narrower still: the state shows first.
+        let header = &screen(&mut app, 30, 20)[0];
+        assert!(header.contains("Merged"), "{header}");
+        // Open ones keep their title as today.
+        let mut app = app_with(vec![], sample_rows(), false);
+        let header = &screen(&mut app, 54, 20)[0];
+        assert!(header.contains("Merge requests"), "{header}");
+    }
+
+    #[test]
+    fn merged_and_closed_rows_say_so_never_an_open_status() {
+        for (status, word, color) in [
+            (Status::Merged, "Merged", ACCENT),
+            (Status::Closed, "Closed", RED),
+        ] {
+            for section in [Section::Mine, Section::Review, Section::All] {
+                let mut app = app_in(status);
+                app.section = section;
+                let rows = screen(&mut app, 120, 20);
+                assert!(
+                    rows.iter().any(|r| r.contains(&format!("·  {word}"))),
+                    "{rows:#?}"
+                );
+                for open_only in ["Ready to merge", "Merge conflict"] {
+                    assert!(!rows.iter().any(|r| r.contains(open_only)), "{open_only}");
+                }
+            }
+            // The state icon too, also in compact rows where it is all there is.
+            let mut app = app_in(status);
+            app.config.compact = true;
+            app.config.nerd_font = false;
+            let buf = render(&mut app, 120);
+            let (icon, c) = Icons { nerd: false }.status(status).unwrap();
+            let y = (0..buf.area.height)
+                .find(|&y| row_text(&buf, y).contains("Add export"))
+                .unwrap();
+            let x = (0..buf.area.width).find(|&x| buf[(x, y)].symbol() == icon);
+            assert!(
+                x.is_some_and(|x| buf[(x, y)].fg == c),
+                "{}",
+                row_text(&buf, y)
+            );
+            assert_eq!(
+                status_text(&app.rows(Section::Mine)[0].clone()),
+                (word, color)
+            );
+        }
+    }
+
+    #[test]
+    fn details_of_a_merged_one_offer_no_writes() {
+        let with_clone = |app: &mut App| {
+            app.details = true;
+            app.mine_state.select(Some(0));
+            app.herdr = true;
+            app.workdir = Some(std::path::PathBuf::from("/src/app"));
+            app.remotes = vec![crate::repo::Remote {
+                name: "origin".into(),
+                project: Project {
+                    host: "gitlab.com".into(),
+                    path: "acme/app".into(),
+                },
+            }];
+        };
+        let actions = |app: &mut App| {
+            let rows = screen(app, 160, 40);
+            let line = rows
+                .iter()
+                .find(|r| r.contains("d changes"))
+                .cloned()
+                .expect("actions");
+            (line, rows)
+        };
+        let mut app = app_in(Status::Merged);
+        with_clone(&mut app);
+        let (line, rows) = actions(&mut app);
+        for write in ["v approve", "v revoke", "m merge", "b branch"] {
+            assert!(!line.contains(write), "{line}");
+        }
+        assert!(
+            !rows
+                .iter()
+                .any(|r| r.contains("not approved yet") || r.contains("waiting for")),
+            "{rows:#?}"
+        );
+        assert!(rows.iter().any(|r| r.contains("Merged")));
+        // Open ones keep their hints.
+        let mut ready = sample_mr(1, ReviewState::Unreviewed, Pipeline::Success);
+        ready.merge_state = MergeState::Ready;
+        let mut app = app_with(vec![], vec![ready], false);
+        with_clone(&mut app);
+        let (line, _) = actions(&mut app);
+        for write in ["v approve", "m merge", "b branch"] {
+            assert!(line.contains(write), "{line}");
+        }
+    }
+
+    #[test]
+    fn merged_and_closed_lists_say_what_is_missing_or_loading() {
+        let mut app = app_in(Status::Merged);
+        app.data = None;
+        app.loading = true;
+        assert!(shown(&mut app, "Loading merged merge requests…"));
+        assert!(!shown(&mut app, "Nothing to review"));
+        let empty = |status| {
+            let mut app = app_in(status);
+            let data = app.data.as_mut().unwrap();
+            data.review.clear();
+            data.mine.clear();
+            data.all.as_mut().unwrap().items.clear();
+            app
+        };
+        let mut app = empty(Status::Merged);
+        assert!(shown(&mut app, "No merged merge requests of yours"));
+        app.section = Section::Review;
+        assert!(shown(
+            &mut app,
+            "No merged merge requests with you as reviewer"
+        ));
+        app.section = Section::All;
+        assert!(shown(&mut app, "No merged merge requests in your projects"));
+        // This project, with the hint for all projects.
+        let mut app = empty(Status::Closed);
+        let project = Project {
+            host: "gitlab.com".into(),
+            path: "acme/app".into(),
+        };
+        app.project = Some(project.clone());
+        app.data.as_mut().unwrap().of = Some(project.clone());
+        app.data.as_mut().unwrap().all.as_mut().unwrap().of = Some(project);
+        assert!(shown(
+            &mut app,
+            "No closed merge requests of yours in app  (a shows all projects)"
+        ));
+        // Loaded for the other scope: loading, not empty.
+        app.data.as_mut().unwrap().of = None;
+        app.loading = true;
+        assert!(shown(&mut app, "Loading closed merge requests…"));
+        assert!(screen(&mut app, 120, 20)[0].contains(" Mine … "));
+    }
+
+    #[test]
+    fn a_long_empty_message_wraps_instead_of_being_cut() {
+        let mut app = app_in(Status::Closed);
+        let data = app.data.as_mut().unwrap();
+        data.mine.clear();
+        let project = Project {
+            host: "gitlab.com".into(),
+            path: "acme/herdr-git-panel".into(),
+        };
+        app.project = Some(project.clone());
+        app.data.as_mut().unwrap().of = Some(project);
+        for width in [60, 25] {
+            let rows = screen(&mut app, width, 20);
+            let words: Vec<&str> = rows.iter().flat_map(|r| r.split_whitespace()).collect();
+            let text = words.join(" ");
+            let message =
+                "No closed merge requests of yours in herdr-git-panel (a shows all projects)";
+            assert!(text.contains(message), "{rows:#?}");
+        }
+    }
+
+    #[test]
+    fn help_names_the_state_key() {
+        let mut app = app_with(vec![], vec![], false);
+        app.help = true;
+        let rows = screen(&mut app, 120, 50);
+        assert!(rows
+            .iter()
+            .any(|r| r.contains("z ") && r.contains("open / merged / closed")));
+        assert!(rows.iter().any(|r| r.contains("b v m w: open ones only")));
     }
 
     #[test]

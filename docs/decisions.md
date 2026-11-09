@@ -393,3 +393,47 @@ once as before.
 - One or two more small read requests per forge a minute through the
   official APIs under the user's own login is ordinary use under GitLab's
   and GitHub's terms, as for the other lists.
+
+## 2026-11-08: Open, merged and closed with `z`, loaded per state
+
+`z` steps the list through open, merged and closed (without merging) merge
+requests, as three states (the owner's decision on #7); a click on the
+title does the same. The issue left the key open: `C` would use a letter
+both small and capital (see "Approving from the list"), `>`, `+`, `!` and
+`Ctrl+r` are kept for replies, requested changes and new pipelines (#10 to
+#12), and `u` already means "scroll up" with Ctrl. The state is not saved:
+the list opens on open ones, like its other filters.
+
+- Each merge request carries its state from the forge (`state` in both
+  fragments; GitLab's `locked`, while it merges, counts as open). Rows,
+  icons and the details panel say "Merged" or "Closed" instead of what
+  blocks a merge, which the forges still report for them.
+- Open ones load as before. Merged and closed ones are asked for only when
+  shown, through the same requests with the state (GitHub `is:merged` /
+  `is:closed is:unmerged` and `states: MERGED` / `CLOSED`; GitLab
+  `state: merged` / `closed`), newest updated first, within the limits of
+  open ones (30 on GitHub, 100 on GitLab). Without a sort GitHub's search
+  would pick arbitrary old ones among hundreds.
+- With "this project", merged and closed ones are asked from that project's
+  forge for that project only (GitHub `repo:owner/name`, GitLab
+  `projectPath`), so the newest are its own and not whatever of it happens to
+  be among the newest of all projects. `a` loads them again; `Data.of`
+  records the project they were asked for. When that forge's tool is missing,
+  the list says so instead of showing an empty list.
+- GitHub's search string now goes in as a GraphQL variable, and a repository
+  name only goes into it when it is a plain `owner/name`, so a remote's path
+  cannot add search terms.
+- The lists of each state are kept while the list is open, with each
+  section's selected row, so going back is instant and shows them as left;
+  a kept state that is older than the refresh interval, or kept from
+  before an approve, merge or draft change, loads again when shown. An answer
+  for a state no longer on screen is kept for that state, and the shown one
+  loads at once when it is missing or old.
+- Approve, merge, draft and opening the branch are refused on merged and
+  closed ones, and their hints left out: they act on an open merge request
+  (a merged branch is often deleted). Resolving a thread stays as it is:
+  the forge decides whether it is allowed there. The quick filters (`f`)
+  are about what still needs doing, so they are off for merged and closed
+  ones.
+- `state` adds about 3 to the complexity of GitLab's "All" request over 50
+  projects, measured at 209 of the 250 allowed.

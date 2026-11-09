@@ -2,7 +2,8 @@
 
 A [Herdr](https://herdr.dev) plugin, written in Rust, that lists your GitLab
 merge requests and GitHub pull requests in a pane: your own open ones, the
-ones you have to review, and all open ones of the project. It uses whichever
+ones you have to review, and all open ones of the project, and with `z` the
+merged or closed ones instead. It uses whichever
 of `glab` and `gh` is installed and logged in; with both, the lists mix
 GitLab and GitHub, each row with its forge's logo.
 
@@ -20,7 +21,7 @@ GitLab and GitHub, each row with its forge's logo.
 Each row takes two lines: the title in white, and under it the project, the
 number (`!90` on GitLab, `#2903` on GitHub) and where it stands (ready to
 merge, draft, merge conflict, needs rebase, pipeline failed, open threads,
-waiting for approval). The columns:
+waiting for approval; merged or closed for those). The columns:
 
 | Column | Meaning |
 |---|---|
@@ -84,15 +85,39 @@ it looks at your 100 most recently active projects on each forge. Since
 "All" lists other merge requests per scope, `a` loads it again, and it shows
 "Loading" for a moment while "Mine" and "To review" switch at once.
 
+## Open, merged and closed
+
+The list shows open merge requests when it opens. `z` (or a click on the
+title) switches to merged ones, then to ones closed without merging, then
+back to open ones. The title says which: "Merge requests" for open ones,
+"Merged merge requests" or "Closed merge requests" otherwise ("pull
+requests" when everything shown is on GitHub; only "Merged" or "Closed" on
+a narrow pane). Every section follows it, each row says "Merged" or
+"Closed", and the list opens on open ones again next time.
+
+- Merged and closed ones load when you first switch to them, the most
+  recently updated first, up to the same limits as open ones (100 per list
+  on GitLab, 30 on GitHub). With "this project" they are that project's own
+  newest, asked from its forge only, so `a` loads them again.
+- The lists of each state are kept while the list is open: switching back to
+  open ones shows them at once, with the rows selected where you left them.
+  `r` and the automatic refresh load the state on screen.
+- Merged and closed ones can be opened, copied, looked at in the details
+  panel, the activity tab and the changes viewer, searched and sorted.
+  Approving (`v`), merging (`m`), draft (`w`) and opening the branch (`b`)
+  are for open ones only; the list says "!42 is merged" instead.
+- The quick filters (`f`) are for open ones; switching away from open ones
+  turns them off. `x` and `Esc` keep the state.
+
 ## Search and sort
 
 - `/` searches as you type: every word must appear in the number, title,
   project, author, branch or a label. `Enter` keeps the search, `Esc` clears
   it.
-- `f` steps through what is shown: all, needs me (to review: not approved or
-  answered by you yet; mine: open threads, failed pipeline, conflict or
-  rebase; all: your own and the ones you review by those rules, nobody
-  else's), open threads, pipeline failed, ready to merge.
+- `f` (open ones only) steps through what is shown: all, needs me (to
+  review: not approved or answered by you yet; mine: open threads, failed
+  pipeline, conflict or rebase; all: your own and the ones you review by
+  those rules, nobody else's), open threads, pipeline failed, ready to merge.
 - `s` steps through sort orders (updated, opened, open threads, size, project,
   title). Clicking a column heading sorts by it; a second click turns the
   order round.
@@ -151,9 +176,10 @@ action.
 ## Mouse
 
 Click a row to select it, double-click to open it in the browser. Click a tab,
-the project name (this project / all), a column heading (sort), a part of the
-second header line or a key hint in the footer. The wheel moves through the list, or
-scrolls the details panel when the pointer is over it.
+the title (open / merged / closed), the project name (this project / all), a
+column heading (sort), a part of the second header line or a key hint in the
+footer. The wheel moves through the list, or scrolls the details panel when
+the pointer is over it.
 
 ## Keys
 
@@ -168,18 +194,19 @@ scrolls the details panel when the pointer is over it.
 | `t` | Activity: all, open or resolved threads |
 | `n` `N` | Activity: select the next or previous thread |
 | `e` | Activity: resolve the selected thread, or open it again |
-| `v` | Approve (or take your approval back), after confirming |
-| `m` | Merge, after confirming, when GitLab or GitHub allows it |
-| `w` | Your own: mark as draft, or as ready for review again |
-| `b` | Open the branch in a new Herdr workspace (a git worktree) |
+| `v` | Open ones: approve (or take your approval back), after confirming |
+| `m` | Open ones: merge, after confirming, when GitLab or GitHub allows it |
+| `w` | Your own open ones: mark as draft, or as ready for review again |
+| `b` | Open ones: open the branch in a new Herdr workspace (a git worktree) |
 | `?` | All keys |
 | `/` | Search |
-| `f` | Show: all, needs me, open threads, pipeline failed, ready |
+| `f` | Open ones: show all, needs me, open threads, pipeline failed, ready |
 | `s` | Sort by the next key |
 | `x` | Clear search and filter |
 | `y` | Copy the link |
 | `r` | Refresh now |
 | `a` | Switch between this project and all projects |
+| `z` | Switch between open, merged and closed ones |
 | `i` | Switch between Nerd Font icons and plain symbols (saved) |
 | `Esc` | Close the panel, clear the search or filter (never closes the list) |
 | `q` | Close the list, after confirming with `y` |
@@ -264,7 +291,12 @@ When the list opens, it reads the git remote of its directory from
 - for "All", at the same time: in a project, one request to the forge it
   lives on for its open merge requests; with "all projects", two small
   requests per forge, first which of your projects have the newest open
-  ones (only their update times), then those in full.
+  ones (only their update times), then those in full;
+- for merged and closed ones, the same requests for that state, newest
+  updated first (GitHub: `is:merged` or `is:closed is:unmerged` with
+  `sort:updated-desc`; GitLab: `state: merged` or `closed` with
+  `sort: UPDATED_DESC`), and with "this project" only that project's forge,
+  for that project only.
 
 Comments load when a merge request's activity tab is open. The list only
 writes what you asked for: an approval or taking one back, a merge (both
