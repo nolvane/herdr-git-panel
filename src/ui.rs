@@ -458,9 +458,10 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
                 ("d", "show the changes (n N files, f tree, q back)"),
                 ("b", "open the branch in a new Herdr workspace"),
                 ("v", "approve / take approval back"),
+                ("!", "request changes, with a reason (then y)"),
                 ("m", "merge (when GitLab or GitHub allows it)"),
                 ("w", "your own: draft / ready for review"),
-                ("", "b v m w: open ones only"),
+                ("", "b v ! m w: open ones only"),
                 ("y", "copy the link"),
             ],
         ),
@@ -1449,6 +1450,12 @@ fn draw_details(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
         };
         actions.push(Span::styled("v", key));
         actions.push(Span::styled(what, Style::new().fg(FAINT)));
+        actions.push(Span::styled("!", key));
+        // One hint: the wrap never parts its two words.
+        actions.push(Span::styled(
+            " request\u{a0}changes   ",
+            Style::new().fg(FAINT),
+        ));
     }
     if open && mr.merge_state == MergeState::Ready {
         actions.push(Span::styled("m", key));
@@ -1992,7 +1999,17 @@ fn draw_compose_footer(frame: &mut Frame, app: &mut App, c: Compose, area: Rect)
         Stage::Preview => (
             format!(" {} ", cut(&c.question(), 70)),
             vec![
-                (button(" y post ", GREEN), Some('y')),
+                (
+                    button(
+                        if c.verb() == "send" {
+                            " y send "
+                        } else {
+                            " y post "
+                        },
+                        GREEN,
+                    ),
+                    Some('y'),
+                ),
                 (Span::raw(" "), None),
                 (plain(" n edit "), Some('n')),
                 (Span::raw(" "), None),
@@ -2648,17 +2665,24 @@ mod tests {
         };
         let actions = |app: &mut App| {
             let rows = screen(app, 160, 40);
-            let line = rows
+            // The actions, also when they wrap onto a second line.
+            let at = rows
                 .iter()
-                .find(|r| r.contains("d changes"))
-                .cloned()
+                .position(|r| r.contains("d changes"))
                 .expect("actions");
+            let line = rows[at..=at + 1].join(" ").replace('\u{a0}', " ");
             (line, rows)
         };
         let mut app = app_in(Status::Merged);
         with_clone(&mut app);
         let (line, rows) = actions(&mut app);
-        for write in ["v approve", "v revoke", "m merge", "b branch"] {
+        for write in [
+            "v approve",
+            "v revoke",
+            "request changes",
+            "m merge",
+            "b branch",
+        ] {
             assert!(!line.contains(write), "{line}");
         }
         assert!(
@@ -2674,7 +2698,7 @@ mod tests {
         let mut app = app_with(vec![], vec![ready], false);
         with_clone(&mut app);
         let (line, _) = actions(&mut app);
-        for write in ["v approve", "m merge", "b branch"] {
+        for write in ["v approve", "request changes", "m merge", "b branch"] {
             assert!(line.contains(write), "{line}");
         }
     }
@@ -2752,7 +2776,7 @@ mod tests {
         assert!(rows
             .iter()
             .any(|r| r.contains("z ") && r.contains("open / merged / closed")));
-        assert!(rows.iter().any(|r| r.contains("b v m w: open ones only")));
+        assert!(rows.iter().any(|r| r.contains("b v ! m w: open ones only")));
     }
 
     #[test]

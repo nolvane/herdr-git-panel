@@ -267,6 +267,14 @@ pub fn comment(mr: &MergeRequest, body: &str) -> Result<(), String> {
     }
 }
 
+/// Requests changes on the merge request, with `reason` as the text.
+pub fn request_changes(mr: &MergeRequest, reason: &str) -> Result<(), String> {
+    match mr.forge {
+        Forge::GitLab => gitlab::request_changes(mr, reason),
+        Forge::GitHub => github::request_changes(mr, reason),
+    }
+}
+
 pub fn set_draft(mr: &MergeRequest, draft: bool) -> Result<(), String> {
     match mr.forge {
         Forge::GitLab => gitlab::set_draft(mr, draft),

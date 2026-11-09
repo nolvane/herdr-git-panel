@@ -100,11 +100,13 @@ pub enum Hit {
 /// that never runs glab or gh.
 pub type Poster = fn(&MergeRequest, &Target, &str) -> Result<Posted, String>;
 
-/// Posts a reply or a comment through the merge request's forge.
+/// Posts a reply, a comment or a change request through the merge
+/// request's forge.
 pub fn post(mr: &MergeRequest, target: &Target, body: &str) -> Result<Posted, String> {
     match target {
         Target::Reply { thread, .. } => forge::reply(mr, thread, body),
         Target::Comment => forge::comment(mr, body).map(|()| Posted::Now),
+        Target::RequestChanges => forge::request_changes(mr, body).map(|()| Posted::Now),
     }
 }
 
@@ -704,8 +706,8 @@ impl App {
     }
 
     /// Says so when `mr` is merged or closed, where only open ones can be
-    /// approved, merged, set to draft, opened as a branch, replied to or
-    /// commented on.
+    /// approved, merged, set to draft, opened as a branch, replied to,
+    /// commented on or sent a change request.
     fn refuse_closed(&mut self, mr: &MergeRequest) -> bool {
         if mr.status == Status::Open {
             return false;
@@ -1033,6 +1035,25 @@ impl App {
         self.compose = Some(Compose::new(mr, Target::Reply { thread, place }));
     }
 
+    /// `!`: opens the text field for the reason to request changes on the
+    /// selected merge request; like approving, not on your own.
+    fn open_request_changes(&mut self) {
+        let Some(mr) = self.selected().cloned() else {
+            return;
+        };
+        if self.refuse_closed(&mr) {
+            return;
+        }
+        if mr.author == mr.viewer {
+            self.say(format!(
+                "You cannot request changes on your own {}",
+                mr.forge.noun()
+            ));
+            return;
+        }
+        self.compose = Some(Compose::new(mr, Target::RequestChanges));
+    }
+
     /// `+`: opens the text field for a comment on the selected merge request.
     fn open_comment(&mut self) {
         let Some(mr) = self.selected().cloned() else {
@@ -1066,7 +1087,7 @@ impl App {
                     c.scroll_up = 0;
                 }
                 Edit::Finish if c.field.is_blank() => {
-                    c.message = Some("Nothing to post: write something first".into());
+                    c.message = Some(c.blank().into());
                 }
                 Edit::Finish => {
                     c.message = None;
@@ -1140,7 +1161,7 @@ impl App {
             match result {
                 Ok(posted) => {
                     self.say(match posted {
-                        Posted::Now => c.done().to_string(),
+                        Posted::Now => c.done(),
                         Posted::InPendingReview => {
                             "Reply added to your pending review: submit it on GitHub".to_string()
                         }
@@ -1148,7 +1169,7 @@ impl App {
                     let key = c.mr.key();
                     let keep = match &c.target {
                         Target::Reply { thread, .. } => Some(thread.clone()),
-                        Target::Comment => {
+                        Target::Comment | Target::RequestChanges => {
                             // New comments are at the top.
                             if self.selected().map(|mr| mr.key()).as_ref() == Some(&key) {
                                 self.details_scroll = 0;
@@ -1171,8 +1192,9 @@ impl App {
                         self.activity.remove(&key);
                         self.activity_wanted.remove(&key);
                         format!(
-                            "{e}: the {} may have been posted, check above before sending again",
-                            c.noun()
+                            "{e}: the {} may have been {}, check above before sending again",
+                            c.noun(),
+                            c.past()
                         )
                     } else {
                         e
@@ -1775,6 +1797,7 @@ impl App {
                 }
             }
             KeyCode::Char('v') => self.ask_approval(),
+            KeyCode::Char('!') => self.open_request_changes(),
             KeyCode::Char('m') => self.ask_merge(),
             KeyCode::Char('w') => self.toggle_draft(),
             KeyCode::Char('b') => self.open_branch(),
@@ -2702,6 +2725,7 @@ mod tests {
         let to = match target {
             Target::Reply { thread, .. } => format!("reply {thread}"),
             Target::Comment => "comment".to_string(),
+            Target::RequestChanges => "changes".to_string(),
         };
         Err(format!("{} {} {to}: {body}", mr.project, mr.reference()))
     }
@@ -3208,6 +3232,219 @@ mod tests {
             app.compose.as_ref().unwrap().message.as_deref(),
             Some("acme/app #6 comment: thanks")
         );
+    }
+
+    /// The list on "To review" (someone else's !3 selected), with a
+    /// poster that only says what it was given.
+    fn reviewing() -> App {
+        let mut app = app();
+        app.section = Section::Review;
+        app.clamp_selection();
+        app.poster = echo;
+        app
+    }
+
+    #[test]
+    fn bang_opens_a_field_for_the_reason_in_the_list_and_the_panel() {
+        let mut app = reviewing();
+        assert_eq!(app.selected().unwrap().iid, 3);
+        press(&mut app, KeyCode::Char('!'));
+        let c = app.compose.as_ref().expect("a field");
+        assert_eq!(c.target, Target::RequestChanges);
+        assert_eq!(c.mr.iid, 3);
+        assert!(screen_text(&mut app, 120, 40).contains("Request changes on !3"));
+        // Also with the panel open, on either tab.
+        for tab in [PanelTab::Overview, PanelTab::Activity] {
+            let mut app = reviewing();
+            app.details = true;
+            app.panel_tab = tab;
+            press(&mut app, KeyCode::Char('!'));
+            assert!(app.compose.is_some(), "{tab:?}");
+        }
+    }
+
+    #[test]
+    fn own_ones_cannot_get_a_change_request() {
+        let mut app = reviewing();
+        app.section = Section::All;
+        app.clamp_selection();
+        app.move_by(1);
+        let own = app.selected().cloned().unwrap();
+        assert_eq!(own.author, own.viewer);
+        press(&mut app, KeyCode::Char('!'));
+        assert!(app.compose.is_none());
+        assert_eq!(
+            flash(&app),
+            Some("You cannot request changes on your own merge request")
+        );
+    }
+
+    #[test]
+    fn merged_and_closed_ones_cannot_get_a_change_request() {
+        let mut app = reviewing();
+        for mr in &mut app.data.as_mut().unwrap().review {
+            mr.status = Status::Merged;
+        }
+        press(&mut app, KeyCode::Char('!'));
+        assert!(app.compose.is_none());
+        assert_eq!(flash(&app), Some("!3 is merged"));
+    }
+
+    #[test]
+    fn every_key_goes_into_the_reason_and_esc_sends_nothing() {
+        let mut app = reviewing();
+        press(&mut app, KeyCode::Char('!'));
+        type_text(&mut app, "yqv!3 m\nsecond");
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(text(&app), "yqv!3 m\nsecon");
+        assert!(app.confirm.is_none());
+        assert_eq!(app.section, Section::Review);
+        press(&mut app, KeyCode::Esc);
+        assert!(app.compose.is_none());
+        assert_eq!(flash(&app), Some("Discarded the change request"));
+    }
+
+    #[test]
+    fn a_blank_reason_is_not_sent() {
+        let mut app = reviewing();
+        press(&mut app, KeyCode::Char('!'));
+        type_text(&mut app, "  \n ");
+        ctrl_s(&mut app);
+        assert_eq!(stage(&app), Some(Stage::Writing));
+        assert_eq!(
+            app.compose.as_ref().unwrap().message.as_deref(),
+            Some("Nothing to send: write what should change first")
+        );
+    }
+
+    #[test]
+    fn the_preview_names_the_merge_request_and_only_y_sends() {
+        let mut app = reviewing();
+        press(&mut app, KeyCode::Char('!'));
+        type_text(&mut app, "Please split this.\nThanks");
+        ctrl_s(&mut app);
+        assert_eq!(stage(&app), Some(Stage::Preview));
+        let shown = screen_text(&mut app, 150, 40);
+        assert!(shown.contains("Request changes on !3 Change 3?"), "{shown}");
+        assert!(shown.contains("y send"), "{shown}");
+        assert!(shown.contains("Please split this."), "{shown}");
+        assert!(shown.contains("Thanks"), "{shown}");
+        // Enter does not send; n goes back to the text.
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(stage(&app), Some(Stage::Preview));
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(stage(&app), Some(Stage::Writing));
+        ctrl_s(&mut app);
+        press(&mut app, KeyCode::Esc);
+        assert!(app.compose.is_none(), "Esc in the preview discards");
+        // y sends the text to the merge request as a change request.
+        write_and_post(&mut app, '!', "Please split this.");
+        assert_eq!(
+            app.compose.as_ref().unwrap().message.as_deref(),
+            Some("acme/app !3 changes: Please split this.")
+        );
+    }
+
+    #[test]
+    fn a_sent_change_request_says_so_and_refreshes() {
+        let mut app = reviewing();
+        app.poster = posts;
+        write_and_post(&mut app, '!', "Rename it.");
+        assert!(app.compose.is_none());
+        assert_eq!(flash(&app), Some("Changes requested on !3"));
+        assert!(app.next_refresh <= Instant::now(), "the list refreshes");
+        assert!(!app.activity.contains_key(&app.selected().unwrap().key()));
+    }
+
+    #[test]
+    fn a_failed_change_request_keeps_the_reason_and_says_why() {
+        let mut app = reviewing();
+        write_and_post(&mut app, '!', "\"Grösse\" 👍 /merge later");
+        assert_eq!(stage(&app), Some(Stage::Writing));
+        assert_eq!(text(&app), "\"Grösse\" 👍 /merge later");
+        let why = "acme/app !3 changes: \"Grösse\" 👍 /merge later";
+        assert_eq!(app.compose.as_ref().unwrap().message.as_deref(), Some(why));
+        // Out of time: it may have gone through.
+        app.poster = times_out;
+        ctrl_s(&mut app);
+        press(&mut app, KeyCode::Char('y'));
+        wait_posted(&mut app);
+        let why = app.compose.as_ref().unwrap().message.clone().unwrap();
+        assert!(
+            why.contains("the change request may have been sent"),
+            "{why}"
+        );
+    }
+
+    #[test]
+    fn one_i_approved_can_still_get_a_change_request() {
+        let mut app = reviewing();
+        let data = app.data.as_mut().unwrap();
+        let mr = data.review.iter_mut().find(|m| m.iid == 3).unwrap();
+        mr.approved_by = vec!["me".into()];
+        mr.reviewers[0].state = ReviewState::Approved;
+        press(&mut app, KeyCode::Char('!'));
+        assert_eq!(
+            app.compose.as_ref().map(|c| &c.target),
+            Some(&Target::RequestChanges)
+        );
+    }
+
+    #[test]
+    fn a_long_reason_wraps_in_the_box_and_the_footer_stays_one_line() {
+        let mut app = reviewing();
+        press(&mut app, KeyCode::Char('!'));
+        let long = "word ".repeat(120);
+        type_text(&mut app, &long);
+        ctrl_s(&mut app);
+        for width in [150, 60] {
+            let shown = screen_text(&mut app, width, 40);
+            let last = shown.lines().last().unwrap();
+            assert!(last.contains("y send"), "{width}: {last}");
+            assert!(last.contains("Request changes"), "{width}: {last}");
+        }
+    }
+
+    #[test]
+    fn a_github_pull_request_gets_a_change_request_too() {
+        let mut app = reviewing();
+        for mr in &mut app.data.as_mut().unwrap().review {
+            mr.forge = Forge::GitHub;
+            mr.host = "github.com".into();
+        }
+        write_and_post(&mut app, '!', "ok");
+        assert_eq!(
+            app.compose.as_ref().unwrap().message.as_deref(),
+            Some("acme/app #3 changes: ok")
+        );
+        press(&mut app, KeyCode::Esc);
+        let mut app = reviewing();
+        app.section = Section::All;
+        app.clamp_selection();
+        app.move_by(1);
+        app.data.as_mut().unwrap().all.as_mut().unwrap().items[1].forge = Forge::GitHub;
+        press(&mut app, KeyCode::Char('!'));
+        assert_eq!(
+            flash(&app),
+            Some("You cannot request changes on your own pull request")
+        );
+    }
+
+    #[test]
+    fn help_names_the_change_request_key() {
+        for (w, h) in [(150, 60), (150, 30), (70, 60)] {
+            let mut app = app();
+            app.help = true;
+            let shown = screen_text(&mut app, w, h);
+            assert!(
+                shown.contains("request changes, with a reason (then y)"),
+                "{w}x{h}\n{shown}"
+            );
+            assert!(
+                shown.contains("b v ! m w: open ones only"),
+                "{w}x{h}\n{shown}"
+            );
+        }
     }
 
     #[test]

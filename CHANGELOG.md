@@ -8,6 +8,13 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `!` requests changes on someone else's open merge request or pull
+  request, with a reason written in the same box as replies and comments
+  (`Ctrl+s` shows it, only `y` sends it). On GitHub it is a review with
+  "Request changes" on the commit shown; on GitLab a comment that submits
+  your review as "requested changes". A line of the reason that starts
+  with `/` never runs as a GitLab command (#11).
+
 - A third section "All" lists every open merge request or pull request of
   the project, also other people's where you are not a reviewer; with "all
   projects" those of the projects you are a member of. `3` selects it, and

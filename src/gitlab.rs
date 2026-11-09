@@ -651,6 +651,36 @@ pub fn post_note(mr: &MergeRequest, thread: Option<&str>, body: &str) -> Result<
     }
 }
 
+/// The quick action that submits your review as "requested changes".
+const REQUEST_CHANGES: &str = "/submit_review requested_changes";
+
+/// The note that requests changes with `reason`: the quick action first,
+/// then the reason. GitLab runs every line that starts with `/` as a quick
+/// action, so each such line of the reason gets a backslash in front
+/// (`\/merge later`), which GitLab leaves as text and Markdown shows as
+/// `/merge later`. The quick action comes first, so nothing in the reason
+/// (an open code block, an HTML block) can hide it; GitLab takes it out
+/// of the posted note.
+fn request_changes_note(reason: &str) -> String {
+    let escaped: Vec<String> = reason
+        .split('\n')
+        .map(|line| {
+            if line.starts_with('/') {
+                format!("\\{line}")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect();
+    format!("{REQUEST_CHANGES}\n\n{}", escaped.join("\n"))
+}
+
+/// Requests changes with `reason`: a comment on the merge request that
+/// also submits your review as "requested changes".
+pub fn request_changes(mr: &MergeRequest, reason: &str) -> Result<(), String> {
+    post_note(mr, None, &request_changes_note(reason))
+}
+
 /// Merges the merge request with its own settings (squash, delete branch),
 /// only if its head is still the one the list showed.
 pub fn merge(mr: &MergeRequest) -> Result<(), String> {
@@ -912,6 +942,50 @@ mod tests {
         ] {
             let sent: Value = serde_json::from_slice(&note_body(body)).unwrap();
             assert_eq!(sent, json!({ "body": body }));
+        }
+    }
+
+    #[test]
+    fn a_change_request_submits_the_review_before_the_reason() {
+        assert_eq!(
+            request_changes_note("Please rename it."),
+            "/submit_review requested_changes\n\nPlease rename it."
+        );
+        // The quick action leads, also when the reason opens a block that
+        // GitLab would read commands in as text.
+        let note = request_changes_note("```\nunclosed");
+        assert!(note.starts_with("/submit_review requested_changes\n"));
+    }
+
+    #[test]
+    fn a_reason_runs_no_quick_action() {
+        let note = request_changes_note("/merge later\nok /approve here\n/approve\n /close");
+        assert_eq!(
+            note,
+            "/submit_review requested_changes\n\n\\/merge later\nok /approve here\n\\/approve\n /close"
+        );
+        // Also inside a code block, where GitLab would not run it: there
+        // the backslash shows (recorded in docs/decisions.md).
+        assert!(request_changes_note("```\n/usr/bin/env\n```").contains("\n\\/usr/bin/env\n"));
+        // Only the quick action of the list starts a line with `/`.
+        let commands: Vec<&str> = note.lines().filter(|l| l.starts_with('/')).collect();
+        assert_eq!(commands, ["/submit_review requested_changes"]);
+    }
+
+    #[test]
+    fn a_reason_is_sent_as_typed_otherwise() {
+        for reason in [
+            "\"quotes\" and 'single' and \\ backslashes",
+            "Bitte ändern: Grösse, Übersicht 👍",
+            "@alex see :branch and @/etc/passwd",
+            &"long ".repeat(200),
+        ] {
+            let note = request_changes_note(reason);
+            let sent: Value = serde_json::from_slice(&note_body(&note)).unwrap();
+            assert_eq!(
+                sent["body"].as_str().unwrap(),
+                format!("/submit_review requested_changes\n\n{reason}")
+            );
         }
     }
 

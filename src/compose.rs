@@ -1,5 +1,6 @@
 //! Writing text for a forge from the list: a text field of several lines
-//! and what it is for (a reply to a thread, a comment on the merge request).
+//! and what it is for (a reply to a thread, a comment on the merge request,
+//! the reason for requesting changes).
 //! The field knows nothing about forges or drawing, so other writes that
 //! need text can reuse it.
 
@@ -86,6 +87,8 @@ pub enum Target {
     },
     /// A comment on the merge request itself.
     Comment,
+    /// The reason for requesting changes on the merge request.
+    RequestChanges,
 }
 
 /// Where the text is in its life.
@@ -135,11 +138,21 @@ impl Compose {
         self.scroll_up = up as u16;
     }
 
-    /// "reply" or "comment".
+    /// "reply", "comment" or "change request".
     pub fn noun(&self) -> &'static str {
         match self.target {
             Target::Reply { .. } => "reply",
             Target::Comment => "comment",
+            Target::RequestChanges => "change request",
+        }
+    }
+
+    /// What `y` does in the preview: "post", or "send" for a change
+    /// request.
+    pub fn verb(&self) -> &'static str {
+        match self.target {
+            Target::RequestChanges => "send",
+            _ => "post",
         }
     }
 
@@ -153,11 +166,13 @@ impl Compose {
             } => format!("Reply to thread on {place} · {r}"),
             Target::Reply { place: None, .. } => format!("Reply to thread · {r}"),
             Target::Comment => format!("Comment on {r}"),
+            Target::RequestChanges => format!("Request changes on {r}"),
         }
     }
 
     /// The preview's question, with where the text goes: "Post reply to
-    /// thread on src/a.rs:7 · !90?" or "Post comment on !90?".
+    /// thread on src/a.rs:7 · !90?", "Post comment on !90?" or "Request
+    /// changes on !90 Add a cache?".
     pub fn question(&self) -> String {
         let r = self.mr.reference();
         match &self.target {
@@ -166,14 +181,33 @@ impl Compose {
             } => format!("Post reply to thread on {place} · {r}?"),
             Target::Reply { place: None, .. } => format!("Post reply to thread · {r}?"),
             Target::Comment => format!("Post comment on {r}?"),
+            Target::RequestChanges => format!("Request changes on {r} {}?", self.mr.title),
+        }
+    }
+
+    /// Why `Ctrl+s` on a blank text shows nothing.
+    pub fn blank(&self) -> &'static str {
+        match self.target {
+            Target::RequestChanges => "Nothing to send: write what should change first",
+            _ => "Nothing to post: write something first",
+        }
+    }
+
+    /// What `y` did, for a post whose answer did not come: "posted", or
+    /// "sent" for a change request.
+    pub fn past(&self) -> &'static str {
+        match self.target {
+            Target::RequestChanges => "sent",
+            _ => "posted",
         }
     }
 
     /// What the list says once the forge took it.
-    pub fn done(&self) -> &'static str {
+    pub fn done(&self) -> String {
         match self.target {
-            Target::Reply { .. } => "Reply posted",
-            Target::Comment => "Comment posted",
+            Target::Reply { .. } => "Reply posted".into(),
+            Target::Comment => "Comment posted".into(),
+            Target::RequestChanges => format!("Changes requested on {}", self.mr.reference()),
         }
     }
 }
