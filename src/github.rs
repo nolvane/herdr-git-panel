@@ -909,7 +909,7 @@ fn failed_runs(
     for suite in suites.into_iter().flatten() {
         let failed = suite["conclusion"]
             .as_str()
-            .is_some_and(|c| !matches!(c, "SUCCESS" | "NEUTRAL" | "SKIPPED" | "STALE"));
+            .is_some_and(|c| matches!(c, "FAILURE" | "TIMED_OUT" | "CANCELLED"));
         let Some(id) = suite["workflowRun"]["databaseId"].as_u64() else {
             continue;
         };
@@ -927,7 +927,7 @@ fn failed_runs(
     }
     if runs.is_empty() {
         return Err(format!(
-            "The failed checks of {r} are not GitHub Actions runs: they can't be started again from the list"
+            "No failed GitHub Actions run of {r} to start again: its other failed checks can't be started again from the list"
         ));
     }
     Ok(runs)
@@ -1357,6 +1357,10 @@ mod tests {
             suite(Some("FAILURE"), None),
             // Still running.
             suite(None, Some(16)),
+            // Waiting for a maintainer's approval, or a broken workflow
+            // file: a re-run can't start them.
+            suite(Some("ACTION_REQUIRED"), Some(17)),
+            suite(Some("STARTUP_FAILURE"), Some(18)),
         ]);
         let runs = failed_runs(&retry_head("abc123", suites), "abc123", "acme/app", "#2903");
         let ids: Vec<u64> = runs.unwrap().into_iter().map(|(_, id)| id).collect();
@@ -1383,7 +1387,7 @@ mod tests {
             suite(Some("SUCCESS"), Some(3))
         ]);
         let expected = Err(
-            "The failed checks of #2903 are not GitHub Actions runs: they can't be started again from the list"
+            "No failed GitHub Actions run of #2903 to start again: its other failed checks can't be started again from the list"
                 .to_string(),
         );
         assert_eq!(

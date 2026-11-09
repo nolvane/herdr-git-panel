@@ -165,8 +165,8 @@ the failed jobs of every failed GitHub Actions run of the newest commit.
 Other apps' checks and outside CI services' statuses can't be started from
 here, and the list says so. On any other pipeline it asks nothing and says
 why there is nothing to start. Like a merge, it only goes through if nobody
-pushed since the list loaded it; the refresh after it shows the CI dot
-running.
+pushed since the list loaded it. The CI dot shows it running at the latest
+at the next refresh.
 
 `w` marks your own merge request as a draft, or as ready for review again,
 without asking (the same key undoes it).

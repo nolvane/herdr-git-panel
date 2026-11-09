@@ -600,7 +600,8 @@ the keys of #9 to #11). Herdr's prefix is `Ctrl+b` by default and Herdr
 binds no `Ctrl+r` of its own, so it reaches the list like `Ctrl+d`,
 `Ctrl+u` and `Ctrl+s`. It is a confirmed write like approve and merge
 (`Action::Retry`): the footer asks, `y` starts it in the background, and
-the refresh after it shows the CI dot running. Refused on merged and
+the refresh after it shows the CI dot running (on GitHub at the latest at
+the next refresh, once GitHub updated its rollup). Refused on merged and
 closed ones, like every write since #7.
 
 - What a retry needs is loaded when it is confirmed, not with the list: one
@@ -614,7 +615,8 @@ closed ones, like every write since #7.
   starts its failed and cancelled jobs again; its `errors` are shown.
 - GitHub: only GitHub Actions runs (check suites with a `workflowRun`) can
   be started again with the user's `gh` login. Each failed one (conclusion
-  other than success, neutral, skipped or stale) gets `POST
+  failure, timed out or cancelled; not "action required" or "startup
+  failure", which a re-run can't start) gets `POST
   repos/{repo}/actions/runs/{id}/rerun-failed-jobs` in the repository of
   its suite. When some start and others are refused, it counts as started
   (the list refreshes) and says how many and why. When only other apps'

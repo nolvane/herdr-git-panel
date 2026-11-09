@@ -460,7 +460,7 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
                 ("v", "approve / take approval back"),
                 ("!", "request changes, with a reason (then y)"),
                 ("m", "merge (when GitLab or GitHub allows it)"),
-                ("Ctrl+r", "start a failed pipeline again (then y)"),
+                ("Ctrl+r", "open ones: start failed jobs again (then y)"),
                 ("w", "your own: draft / ready for review"),
                 ("", "b v ! m w: open ones only"),
                 ("y", "copy the link"),
@@ -2888,9 +2888,8 @@ mod tests {
         app.help = true;
         let rows = screen(&mut app, 120, 50);
         assert!(
-            rows.iter()
-                .any(|r| r.contains("Ctrl+r")
-                    && r.contains("start a failed pipeline again (then y)")),
+            rows.iter().any(|r| r.contains("Ctrl+r")
+                && r.contains("open ones: start failed jobs again (then y)")),
             "{rows:#?}"
         );
     }

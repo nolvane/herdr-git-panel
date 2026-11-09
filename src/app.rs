@@ -940,7 +940,8 @@ impl App {
             Action::Approve => "Approving…",
             Action::Revoke => "Revoking…",
             Action::Merge => "Merging…",
-            Action::Retry => "Starting the failed jobs again…",
+            Action::Retry if c.mr.forge == Forge::GitLab => "Starting the failed jobs again…",
+            Action::Retry => "Starting the failed checks again…",
         });
         std::thread::spawn(move || {
             let r = c.mr.reference();
