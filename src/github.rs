@@ -367,17 +367,27 @@ impl From<Failure> for String {
 }
 
 /// Runs a GraphQL query through gh. Variables starting with `$int:` are sent
-/// as numbers.
+/// as numbers, so text someone typed never goes in here (see
+/// [`reply_args`]).
 fn graphql(query: &str, vars: &[(&str, &str)]) -> Result<Value, Failure> {
-    let mut cmd = cli::command("gh");
-    cmd.args(["api", "graphql", "--hostname", HOST, "-f"])
-        .arg(format!("query={query}"));
+    let mut args: Vec<String> = ["api", "graphql", "--hostname", HOST, "-f"]
+        .map(String::from)
+        .to_vec();
+    args.push(format!("query={query}"));
     for (k, v) in vars {
         match v.strip_prefix("$int:") {
-            Some(n) => cmd.arg("-F").arg(format!("{k}={n}")),
-            None => cmd.arg("-f").arg(format!("{k}={v}")),
+            Some(n) => args.extend(["-F".to_string(), format!("{k}={n}")]),
+            None => args.extend(["-f".to_string(), format!("{k}={v}")]),
         };
     }
+    run_graphql(args)
+}
+
+/// Runs `gh` with the arguments of a GraphQL request and returns GitHub's
+/// JSON answer.
+fn run_graphql(args: Vec<String>) -> Result<Value, Failure> {
+    let mut cmd = cli::command("gh");
+    cmd.args(args);
     let out = cli::run("gh", cmd, HOST).map_err(Failure::Other)?;
     if !out.success && cli::not_logged_in(&out.stderr) {
         return Err(Failure::NotLoggedIn);
@@ -707,6 +717,69 @@ pub fn set_resolved(thread: &str, resolve: bool) -> Result<(), String> {
     }
 }
 
+const REPLY: &str = "mutation($thread: ID!, $body: String!) { addPullRequestReviewThreadReply(input: {pullRequestReviewThreadId: $thread, body: $body}) { comment { state } } }";
+
+/// The arguments of `gh api graphql` that reply `body` to the review thread
+/// `thread`. Every value is a raw field (`-f`): `-F` would read a text
+/// starting with `@` as a file name.
+fn reply_args(thread: &str, body: &str) -> Vec<String> {
+    vec![
+        "api".into(),
+        "graphql".into(),
+        "--hostname".into(),
+        HOST.into(),
+        "-f".into(),
+        format!("query={REPLY}"),
+        "-f".into(),
+        format!("thread={thread}"),
+        "-f".into(),
+        format!("body={body}"),
+    ]
+}
+
+/// Replies to a review thread. `Ok(true)` when GitHub kept the reply in a
+/// review of yours that is not submitted yet, so nobody sees it until then.
+pub fn reply(thread: &str, body: &str) -> Result<bool, String> {
+    let value = run_graphql(reply_args(thread, body))?;
+    if let Some(msg) = cli::graphql_errors(&value) {
+        return Err(format!("GitHub: {msg}"));
+    }
+    let state = value
+        .pointer("/data/addPullRequestReviewThreadReply/comment/state")
+        .and_then(Value::as_str)
+        .ok_or("GitHub did not confirm the reply")?;
+    Ok(state == "PENDING")
+}
+
+/// The arguments of `gh api` that post `body` as a comment on pull request
+/// `iid`, in its conversation. The text is a raw field (`-f`).
+fn comment_args(project: &str, iid: u64, body: &str) -> Vec<String> {
+    [
+        "api",
+        "--hostname",
+        HOST,
+        "--method",
+        "POST",
+        &format!("repos/{project}/issues/{iid}/comments"),
+        "-f",
+        &format!("body={body}"),
+    ]
+    .map(String::from)
+    .to_vec()
+}
+
+/// Posts a comment on the pull request.
+pub fn comment(mr: &MergeRequest, body: &str) -> Result<(), String> {
+    let mut cmd = cli::command("gh");
+    cmd.args(comment_args(&mr.project, mr.iid, body));
+    let out = cli::run("gh", cmd, HOST)?;
+    if out.success {
+        Ok(())
+    } else {
+        Err(cli::api_error("gh", HOST, "GitHub", &out))
+    }
+}
+
 /// Merges the pull request with the repository's default method, only if
 /// its head is still the one the list showed.
 pub fn merge(mr: &MergeRequest) -> Result<(), String> {
@@ -794,6 +867,59 @@ mod tests {
             ]
         );
         assert_eq!(approve_args("acme/app", 7, "").len(), 8);
+    }
+
+    #[test]
+    fn a_reply_names_its_thread_and_a_comment_its_pull_request() {
+        assert_eq!(
+            reply_args("PRRT_kwDOabc", "Done."),
+            [
+                "api",
+                "graphql",
+                "--hostname",
+                "github.com",
+                "-f",
+                &format!("query={REPLY}"),
+                "-f",
+                "thread=PRRT_kwDOabc",
+                "-f",
+                "body=Done.",
+            ]
+        );
+        assert_eq!(
+            comment_args("acme/app", 2903, "Looks good"),
+            [
+                "api",
+                "--hostname",
+                "github.com",
+                "--method",
+                "POST",
+                "repos/acme/app/issues/2903/comments",
+                "-f",
+                "body=Looks good",
+            ]
+        );
+    }
+
+    #[test]
+    fn reply_and_comment_text_is_sent_as_typed() {
+        for body in [
+            "@alex please check",
+            "$int:5",
+            "$int:@/etc/passwd",
+            "two\nlines",
+        ] {
+            for args in [
+                reply_args("PRRT_x", body),
+                comment_args("acme/app", 7, body),
+            ] {
+                assert_eq!(
+                    &args[args.len() - 2..],
+                    ["-f".to_string(), format!("body={body}")]
+                );
+                assert!(!args.iter().any(|a| a == "-F"), "{args:?}");
+            }
+        }
     }
 
     fn pr(number: u64, author: &str) -> Value {

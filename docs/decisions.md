@@ -437,3 +437,46 @@ the list opens on open ones, like its other filters.
   ones.
 - `state` adds about 3 to the complexity of GitLab's "All" request over 50
   projects, measured at 209 of the 250 allowed.
+
+## 2026-11-09: Replies and comments from the activity tab
+
+`>` replies to the selected thread and `+` writes a comment on the merge
+request (the owner's decision on #10); both keys only act in the activity
+tab, like `t`, `n` and `e`. The text field takes several lines: `Enter` adds a
+line break, `Ctrl+s` finishes, `Esc` throws the text away (also the owner's
+decision). Finishing shows the text and where it goes; only `y` (or a click
+on its button) posts, never `Enter`, so a second `Enter` can't post unread
+text. `n` goes back to the text instead of throwing it away, since a reply
+can be long.
+
+- The field lives in `src/compose.rs` with no forge or drawing code, and its
+  target is an enum (`Reply`, `Comment`), so requesting changes with a text
+  (#11) adds a target and reuses the field and the preview.
+- The field keeps a copy of the merge request and the thread's forge id,
+  not their places in the lists, so a refresh while writing can't send the
+  text elsewhere. While it is open every key goes into it; clicks only work
+  on its own buttons and the wheel only scrolls the panel.
+- GitLab gets REST through `glab api` (`…/discussions/<id>/notes` for a
+  reply, `…/notes` for a comment), which needs no new field in the list's
+  query; the thread id must be a GitLab discussion id before it goes into
+  the path. GitHub gets `addPullRequestReviewThreadReply` (GraphQL, with the
+  thread id already loaded) and the conversation's REST comments endpoint.
+  A GitHub reply that lands in a review of yours that is not submitted yet
+  says so instead of "Reply posted".
+- The text always goes as a raw field (`-f body=…`): `-F` reads `@…` as a
+  file. The GitHub GraphQL helper sends values starting with `$int:` as
+  `-F`, so text never goes through it; the reply has its own argument
+  builder.
+- Bracketed paste is on: pasted text arrives in one piece, so a line break
+  or a `y` in it can't finish or confirm anything. The search field takes a
+  paste on one line.
+- Replies and comments are refused on merged and closed ones, like approve,
+  merge, draft and the branch, so the merged and closed lists stay for
+  looking back. Both forges would accept them; this is easy to turn around.
+- After a post the merge request's comments load again (answers of loads
+  started before it are dropped), the list refreshes, and the same merge
+  request and thread stay selected by key and id: they move to the top,
+  since both lists are sorted newest first. The list now keeps each
+  section's merge request selected by key on every refresh, not by its row.
+- Posting runs through the logged-in `glab` and `gh` under the forges'
+  terms, like approving and resolving.

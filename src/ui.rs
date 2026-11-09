@@ -2,6 +2,7 @@
 //! details panel, and a footer. Records clickable areas for the mouse.
 
 use crate::app::{Action, Activity, App, Hit, PanelTab, Section, ThreadFilter};
+use crate::compose::{Compose, Stage};
 use crate::model::{Label, MergeRequest, MergeState, Pipeline, ReviewState, Status};
 use crate::text;
 use crate::theme::{
@@ -73,13 +74,119 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             (t, p)
         };
         draw_table(frame, app, &icons, table_area);
+        // A reply or comment is written at the bottom of the panel.
+        let (panel_area, compose_area) = split_compose(app, panel_area);
         draw_details(frame, app, &icons, panel_area);
+        if let Some(area) = compose_area {
+            draw_compose(frame, app, area);
+        }
     } else {
+        // Also when its merge request left the list while writing.
+        let (body, compose_area) = split_compose(app, body);
         draw_table(frame, app, &icons, body);
+        if let Some(area) = compose_area {
+            draw_compose(frame, app, area);
+        }
     }
     draw_footer(frame, app, &icons, footer);
     if app.help {
         draw_help(frame, app);
+    }
+}
+
+/// Room inside the text field's box: its border and one cell of padding on
+/// each side.
+const COMPOSE_FRAME: u16 = 4;
+
+/// Takes the text field's box off the bottom of `area` while a reply or
+/// comment is written: as tall as its text, at most half of `area`.
+fn split_compose(app: &App, area: Rect) -> (Rect, Option<Rect>) {
+    let Some(c) = &app.compose else {
+        return (area, None);
+    };
+    let (lines, _) = compose_lines(c, area.width.saturating_sub(COMPOSE_FRAME));
+    let wanted = lines.len() as u16 + 2;
+    let height = wanted.clamp(4, (area.height / 2).max(4)).min(area.height);
+    let [rest, field] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(height)]).areas(area);
+    (rest, Some(field))
+}
+
+/// The text as it is drawn in the box, wrapped at `width`, with the reason
+/// of a failed attempt in red at the end; and where the cursor goes
+/// (column, line) after the text.
+fn compose_lines(c: &Compose, width: u16) -> (Vec<Line<'static>>, (u16, usize)) {
+    let width = width.max(1);
+    let style = Style::new().fg(TEXT);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for paragraph in c.field.text.split('\n') {
+        if paragraph.is_empty() {
+            lines.push(Line::from(""));
+        } else {
+            lines.extend(text::wrap(
+                vec![Span::styled(paragraph.to_string(), style)],
+                width,
+                Span::raw(""),
+                Span::raw(""),
+            ));
+        }
+    }
+    // The cursor after the last character; on the next line when that one
+    // is full.
+    let last = lines.last().map(|l| l.width() as u16).unwrap_or(0);
+    let cursor = if last >= width {
+        lines.push(Line::from(""));
+        (0, lines.len() - 1)
+    } else {
+        (last, lines.len() - 1)
+    };
+    if c.field.text.is_empty() {
+        lines[0] = Line::from(Span::styled(
+            "⏎ new line · Ctrl+s send · Esc discard",
+            Style::new().fg(FAINT),
+        ));
+    }
+    if let Some(m) = &c.message {
+        lines.extend(text::wrap(
+            vec![Span::styled(m.clone(), Style::new().fg(RED))],
+            width,
+            Span::raw(""),
+            Span::raw(""),
+        ));
+    }
+    (lines, cursor)
+}
+
+/// The box a reply or comment is written in. Titled with where the text
+/// goes; in the preview it shows the text as it will be posted.
+fn draw_compose(frame: &mut Frame, app: &mut App, area: Rect) {
+    let Some(c) = &app.compose else {
+        return;
+    };
+    let (color, title) = match c.stage {
+        Stage::Writing => (ACCENT, format!(" {} ", c.title())),
+        Stage::Preview => (GREEN, format!(" {} · as it will be posted ", c.title())),
+        Stage::Posting => (MUTED, format!(" {} · posting… ", c.title())),
+    };
+    let block = Block::new()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(color))
+        .padding(ratatui::widgets::Padding::horizontal(1))
+        .title(Span::styled(
+            cut(&title, area.width.saturating_sub(2) as usize),
+            Style::new().fg(color).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    let (lines, (cx, cy)) = compose_lines(c, inner.width);
+    // The end of the text stays in view, where the typing happens.
+    let scroll = (lines.len() as u16).saturating_sub(inner.height);
+    let writing = c.stage == Stage::Writing;
+    frame.render_widget(ratatui::widgets::Clear, area);
+    frame.render_widget(Paragraph::new(lines).block(block).scroll((scroll, 0)), area);
+    let row = cy as u16;
+    if writing && row >= scroll && row - scroll < inner.height {
+        frame.set_cursor_position((inner.x + cx, inner.y + row - scroll));
     }
 }
 
@@ -322,7 +429,7 @@ fn draw_file_tree(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
 
 /// Every key, in a box over the list. Any key or click closes it.
 fn draw_help(frame: &mut Frame, app: &mut App) {
-    let groups: [(&str, &[(&str, &str)]); 4] = [
+    let groups: [(&'static str, &'static [(&'static str, &'static str)]); 5] = [
         (
             "Move",
             &[
@@ -350,6 +457,18 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
             ],
         ),
         (
+            "Activity (c)",
+            &[
+                ("t", "all / open / resolved threads"),
+                ("n N", "select the next / previous thread"),
+                ("e", "resolve the thread / open it again"),
+                (">", "reply to the selected thread"),
+                ("+", "write a comment"),
+                ("", "> +: open ones only"),
+                ("⏎  Ctrl+s  Esc", "in the text: new line / send / discard"),
+            ],
+        ),
+        (
             "List",
             &[
                 ("/", "search"),
@@ -371,54 +490,74 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
             ],
         ),
     ];
-    let mut lines: Vec<Line> = Vec::new();
-    for (i, (title, keys)) in groups.iter().enumerate() {
-        if i > 0 {
-            lines.push(Line::from(""));
+    type Group = (&'static str, &'static [(&'static str, &'static str)]);
+    let group_lines = |groups: &[Group]| -> Vec<Line<'static>> {
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        for (i, (title, keys)) in groups.iter().enumerate() {
+            if i > 0 {
+                lines.push(Line::from(""));
+            }
+            lines.push(Line::from(Span::styled(
+                *title,
+                Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+            )));
+            for (k, what) in keys.iter() {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("  {k:<15}"),
+                        Style::new().fg(TEXT).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(*what, Style::new().fg(MUTED)),
+                ]));
+            }
         }
-        lines.push(Line::from(Span::styled(
-            *title,
-            Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
-        )));
-        for (k, what) in keys.iter() {
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("  {k:<15}"),
-                    Style::new().fg(TEXT).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(*what, Style::new().fg(MUTED)),
-            ]));
-        }
-    }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "Any key or click closes this.",
-        Style::new().fg(FAINT),
-    )));
+        lines
+    };
+    let closing = || {
+        Line::from(Span::styled(
+            "Any key or click closes this.",
+            Style::new().fg(FAINT),
+        ))
+    };
+    const COLUMN: u16 = 64;
     let full = frame.area();
-    let width = 64.min(full.width);
-    let height = (lines.len() as u16 + 2).min(full.height);
+    let mut one = group_lines(&groups);
+    one.extend([Line::from(""), closing()]);
+    // Two columns side by side when one is taller than the screen and the
+    // screen is wide enough.
+    let two = one.len() as u16 + 2 > full.height && full.width >= 2 * COLUMN;
+    let columns: Vec<Vec<Line>> = if two {
+        let mut right = group_lines(&groups[2..]);
+        right.extend([Line::from(""), closing()]);
+        vec![group_lines(&groups[..2]), right]
+    } else {
+        vec![one]
+    };
+    let tallest = columns.iter().map(Vec::len).max().unwrap_or(0) as u16;
+    let width = (COLUMN * columns.len() as u16).min(full.width);
+    let height = (tallest + 2).min(full.height);
     let area = Rect::new(
         full.x + (full.width - width) / 2,
         full.y + (full.height - height) / 2,
         width,
         height,
     );
+    let block = Block::new()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(ACCENT))
+        .padding(ratatui::widgets::Padding::horizontal(1))
+        .title(Span::styled(
+            " Keys ",
+            Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
     frame.render_widget(ratatui::widgets::Clear, area);
-    frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::new()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::new().fg(ACCENT))
-                .padding(ratatui::widgets::Padding::horizontal(1))
-                .title(Span::styled(
-                    " Keys ",
-                    Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
-                )),
-        ),
-        area,
-    );
+    frame.render_widget(block, area);
+    let parts = Layout::horizontal(vec![Constraint::Fill(1); columns.len()]).split(inner);
+    for (lines, part) in columns.into_iter().zip(parts.iter()) {
+        frame.render_widget(Paragraph::new(lines), *part);
+    }
     app.hits.push((full, Hit::Help));
 }
 
@@ -1087,6 +1226,7 @@ fn draw_details(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
             width,
             app.thread_filter,
             app.thread,
+            mr.status == Status::Open,
         );
         // Bring a thread chosen with n or N into view.
         if app.scroll_to_thread {
@@ -1388,13 +1528,15 @@ type ActivityHit = (usize, u16, u16, Hit);
 
 /// The activity tab: a filter line (all, open, resolved), then the
 /// discussions, newest first, with their replies. Threads can be selected
-/// and resolved; the clickable places come back with the lines.
+/// and resolved; the clickable places come back with the lines. Replies
+/// and comments are offered when `writable` (open ones).
 fn activity_lines(
     activity: Option<&Activity>,
     me: &str,
     width: u16,
     filter: ThreadFilter,
     selected: Option<usize>,
+    writable: bool,
 ) -> (
     Vec<Line<'static>>,
     Vec<ActivityHit>,
@@ -1461,16 +1603,23 @@ fn activity_lines(
         ]
     };
     let mut keys = Vec::new();
-    for (k, w) in [
+    let mut hints = vec![
         ("t", " filter   "),
         ("n", " next thread   "),
         ("N", " previous   "),
-        ("e", " resolve / reopen"),
-    ] {
+        ("e", " resolve / reopen   "),
+    ];
+    if writable {
+        hints.extend([(">", " reply   "), ("+", " comment")]);
+    }
+    for (k, w) in hints {
         keys.extend(hint(k, w));
     }
-    lines.push(Line::from(keys));
+    lines.extend(text::wrap(keys, width, Span::raw(""), Span::raw("")));
     lines.push(Line::from(""));
+    // Where the discussions start; each one but the first gets a blank
+    // line before it.
+    let top = lines.len() - 1;
     let mut selected_line = None;
 
     let shown: Vec<(usize, &crate::model::Discussion)> = list
@@ -1496,7 +1645,7 @@ fn activity_lines(
     for (index, d) in shown {
         // GitLab's own notes: one dim line each, grouped.
         if d.notes.len() == 1 && d.notes[0].system {
-            if lines.len() > 2 && !last_was_system {
+            if lines.len() > top && !last_was_system {
                 lines.push(Line::from(""));
             }
             last_was_system = true;
@@ -1515,7 +1664,7 @@ fn activity_lines(
             continue;
         }
         last_was_system = false;
-        if lines.len() > 2 {
+        if lines.len() > top {
             lines.push(Line::from(""));
         }
         let is_selected = selected == Some(index);
@@ -1644,6 +1793,10 @@ fn draw_footer(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
         app.hits
             .push((Rect::new(area.x + qw + 10, area.y, 21, 1), Hit::Key('n')));
         frame.render_widget(Paragraph::new(line), area);
+        return;
+    }
+    if let Some(c) = &app.compose {
+        draw_compose_footer(frame, app, c.clone(), area);
         return;
     }
     if let Some(c) = &app.confirm {
@@ -1778,6 +1931,67 @@ fn draw_footer(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
         Paragraph::new(right).alignment(Alignment::Right),
         right_area,
     );
+}
+
+/// The footer while a reply or comment is written: its keys, and in the
+/// preview the question with clickable buttons (only `y` posts).
+fn draw_compose_footer(frame: &mut Frame, app: &mut App, c: Compose, area: Rect) {
+    let bold = Style::new().fg(TEXT).add_modifier(Modifier::BOLD);
+    let button = |text: &'static str, bg| {
+        Span::styled(
+            text,
+            Style::new()
+                .fg(theme::on(bg))
+                .bg(bg)
+                .add_modifier(Modifier::BOLD),
+        )
+    };
+    let plain = |text: &'static str| Span::styled(text, Style::new().fg(TEXT).bg(BORDER));
+    // Buttons first in the room left after the text, each with its key.
+    let (head, buttons): (String, Vec<(Span<'static>, Option<char>)>) = match c.stage {
+        Stage::Writing => (
+            format!(" {}  ", cut(&c.title(), 60)),
+            vec![
+                (button(" Ctrl+s send ", GREEN), Some('s')),
+                (Span::raw(" "), None),
+                (plain(" Esc discard "), Some('\u{1b}')),
+                (Span::styled("   ⏎ new line ", Style::new().fg(FAINT)), None),
+            ],
+        ),
+        Stage::Preview => (
+            format!(" {} ", cut(&c.question(), 70)),
+            vec![
+                (button(" y post ", GREEN), Some('y')),
+                (Span::raw(" "), None),
+                (plain(" n edit "), Some('n')),
+                (Span::raw(" "), None),
+                (plain(" Esc discard "), Some('\u{1b}')),
+            ],
+        ),
+        Stage::Posting => (
+            format!(" Posting the {} to {}… ", c.noun(), c.mr.reference()),
+            Vec::new(),
+        ),
+    };
+    // A narrow footer shortens the text, never the buttons.
+    let buttons_width: usize = buttons.iter().map(|(s, _)| s.width()).sum();
+    let head = cut(
+        &head,
+        (area.width as usize).saturating_sub(buttons_width).max(4),
+    );
+    let mut x = area.x + head.chars().count() as u16;
+    let mut spans = vec![Span::styled(head, bold)];
+    for (span, key) in buttons {
+        let w = span.width() as u16;
+        if let Some(k) = key {
+            if x + w <= area.x + area.width {
+                app.hits.push((Rect::new(x, area.y, w, 1), Hit::Compose(k)));
+            }
+        }
+        x += w;
+        spans.push(span);
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// A label as GitLab shows it: its colour as background, with rounded ends
