@@ -465,7 +465,7 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
                 (">", "reply to the selected thread"),
                 ("+", "write a comment"),
                 ("", "> +: open ones only"),
-                ("⏎  Ctrl+s  Esc", "in the text: new line / send / discard"),
+                ("⏎ Ctrl+s Esc", "in the text: new line / send / discard"),
             ],
         ),
         (
@@ -519,13 +519,16 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
             Style::new().fg(FAINT),
         ))
     };
-    const COLUMN: u16 = 64;
+    // The widest line (`f` and its filters) fits a column.
+    const COLUMN: u16 = 67;
     let full = frame.area();
     let mut one = group_lines(&groups);
     one.extend([Line::from(""), closing()]);
     // Two columns side by side when one is taller than the screen and the
     // screen is wide enough.
-    let two = one.len() as u16 + 2 > full.height && full.width >= 2 * COLUMN;
+    // A column with its share of the border and padding.
+    let width_for = |n: u16| COLUMN * n + 2;
+    let two = one.len() as u16 + 2 > full.height && full.width >= width_for(2);
     let columns: Vec<Vec<Line>> = if two {
         let mut right = group_lines(&groups[2..]);
         right.extend([Line::from(""), closing()]);
@@ -534,7 +537,7 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
         vec![one]
     };
     let tallest = columns.iter().map(Vec::len).max().unwrap_or(0) as u16;
-    let width = (COLUMN * columns.len() as u16).min(full.width);
+    let width = width_for(columns.len() as u16).min(full.width);
     let height = (tallest + 2).min(full.height);
     let area = Rect::new(
         full.x + (full.width - width) / 2,
@@ -1602,7 +1605,6 @@ fn activity_lines(
             Span::styled(what, Style::new().fg(FAINT)),
         ]
     };
-    let mut keys = Vec::new();
     let mut hints = vec![
         ("t", " filter   "),
         ("n", " next thread   "),
@@ -1612,10 +1614,19 @@ fn activity_lines(
     if writable {
         hints.extend([(">", " reply   "), ("+", " comment")]);
     }
+    // On as many lines as needed, each hint whole.
+    let mut keys: Vec<Span<'static>> = Vec::new();
+    let mut used = 0;
     for (k, w) in hints {
+        let size = (k.chars().count() + w.trim_end().chars().count()) as u16;
+        if used > 0 && used + size > width {
+            lines.push(Line::from(std::mem::take(&mut keys)));
+            used = 0;
+        }
         keys.extend(hint(k, w));
+        used += (k.chars().count() + w.chars().count()) as u16;
     }
-    lines.extend(text::wrap(keys, width, Span::raw(""), Span::raw("")));
+    lines.push(Line::from(keys));
     lines.push(Line::from(""));
     // Where the discussions start; each one but the first gets a blank
     // line before it.

@@ -3158,6 +3158,10 @@ mod tests {
         let shown = screen_text(&mut app, 150, 40);
         assert!(shown.contains("> reply"), "{shown}");
         assert!(shown.contains("+ comment"), "{shown}");
+        assert!(
+            shown.contains("e resolve / reopen"),
+            "each hint whole\n{shown}"
+        );
         // A narrow panel wraps the hints instead of cutting them.
         let shown = screen_text(&mut app, 60, 40);
         assert!(shown.contains("+ comment"), "{shown}");
@@ -3170,6 +3174,8 @@ mod tests {
             app.help = true;
             let shown = screen_text(&mut app, w, h);
             for k in [
+                "open ones: all, needs me, threads, failed, ready",
+                "close panel, search or filter (never the list)",
                 "reply to the selected thread",
                 "write a comment",
                 "in the text: new line / send / discard",
