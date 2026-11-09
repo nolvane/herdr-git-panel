@@ -584,6 +584,41 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
         frame.render_widget(Paragraph::new(lines), *part);
     }
     app.hits.push((full, Hit::Help));
+    // The version in the bottom border, linked to the repository. It takes
+    // no row, so it stays when the box is cut to a short pane; a narrow box
+    // drops the address, then the name, and one too narrow for the version
+    // itself shows nothing. Pushed after `Hit::Help`, so a
+    // click on it finds the link first.
+    if area.height >= 3 {
+        let version = env!("CARGO_PKG_VERSION");
+        let url = env!("CARGO_PKG_REPOSITORY");
+        let address = url.trim_start_matches("https://");
+        // Both corners, a dash on each side and the spaces around it.
+        let room = area.width.saturating_sub(4) as usize;
+        let shown = [
+            format!("Herdr Git Panel {version} · {address}"),
+            format!("Herdr Git Panel {version}"),
+            version.to_string(),
+        ]
+        .into_iter()
+        .map(|t| {
+            Line::from(vec![
+                Span::raw(" "),
+                Span::styled(t, Style::new().fg(BLUE).add_modifier(Modifier::UNDERLINED)),
+                Span::raw(" "),
+            ])
+        })
+        .find(|l| l.width() <= room);
+        if let Some(shown) = shown {
+            let width = shown.width() as u16;
+            let y = area.bottom() - 1;
+            frame.render_widget(shown, Rect::new(area.x + 2, y, width, 1));
+            // Only the words, not the spaces around them.
+            let spot = Rect::new(area.x + 3, y, width - 2, 1);
+            app.hits.push((spot, Hit::Link(app.links.len())));
+            app.links.push(url.to_string());
+        }
+    }
 }
 
 /// The list's title: "Merge requests" (or "Pull requests") for open ones,
@@ -2800,6 +2835,108 @@ mod tests {
                 "No closed merge requests of yours in herdr-git-panel (a shows all projects)";
             assert!(text.contains(message), "{rows:#?}");
         }
+    }
+
+    /// The help drawn on a pane of this size: every row as text, and where
+    /// the link to the repository is (its area and its target).
+    fn help_link(app: &mut App, width: u16, height: u16) -> (Vec<String>, Option<(Rect, String)>) {
+        app.help = true;
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let rows = (0..height).map(|y| row_text(&buf, y)).collect();
+        let link = app.hits.iter().rev().find_map(|(r, h)| match h {
+            Hit::Link(i) => Some((*r, app.links[*i].clone())),
+            _ => None,
+        });
+        (rows, link)
+    }
+
+    const REPOSITORY: &str = "https://github.com/nolvane/herdr-git-panel";
+
+    #[test]
+    fn help_shows_the_version_linked_in_its_bottom_border() {
+        let version = env!("CARGO_PKG_VERSION");
+        for (w, h) in [(120, 50), (100, 42), (70, 60)] {
+            let mut app = app_with(vec![], vec![], false);
+            let (rows, link) = help_link(&mut app, w, h);
+            let (spot, url) = link.unwrap_or_else(|| panic!("{w}x{h}: no link\n{rows:#?}"));
+            assert_eq!(url, REPOSITORY, "{w}x{h}");
+            let row = &rows[spot.y as usize];
+            assert!(
+                row.contains('╰') && row.contains('╯'),
+                "{w}x{h}: on the bottom border: {row}"
+            );
+            let shown: String = row
+                .chars()
+                .skip(spot.x as usize)
+                .take(spot.width as usize)
+                .collect();
+            assert_eq!(
+                shown,
+                format!("Herdr Git Panel {version} · github.com/nolvane/herdr-git-panel"),
+                "{w}x{h}"
+            );
+        }
+    }
+
+    #[test]
+    fn help_keeps_the_version_on_short_and_narrow_panes() {
+        let version = env!("CARGO_PKG_VERSION");
+        // Shorter than the help: the box is cut, its border stays.
+        let mut app = app_with(vec![], vec![], false);
+        let (rows, link) = help_link(&mut app, 70, 20);
+        let (spot, url) = link.expect("link on a short pane");
+        assert_eq!(url, REPOSITORY);
+        assert_eq!(spot.y, 19, "the last row is the border");
+        assert!(
+            rows[19].contains(&format!("Herdr Git Panel {version}")),
+            "{}",
+            rows[19]
+        );
+        // Narrower than the whole line: the version stays, inside the box.
+        for w in [40, 20, 12] {
+            let mut app = app_with(vec![], vec![], false);
+            let (rows, link) = help_link(&mut app, w, 30);
+            let (spot, url) = link.unwrap_or_else(|| panic!("{w}: no link\n{rows:#?}"));
+            assert_eq!(url, REPOSITORY);
+            let row = &rows[spot.y as usize];
+            let shown: String = row
+                .chars()
+                .skip(spot.x as usize)
+                .take(spot.width as usize)
+                .collect();
+            assert!(shown.contains(version), "{w}: {row}");
+            assert!(
+                spot.x > 0 && spot.right() < w,
+                "{w}: inside the corners: {spot:?}"
+            );
+            assert!(row.ends_with('╯'), "{w}: border whole: {row}");
+        }
+        // Too small for a border of its own: no line, no link.
+        let mut app = app_with(vec![], vec![], false);
+        assert!(help_link(&mut app, 70, 2).1.is_none());
+    }
+
+    #[test]
+    fn help_version_line_is_the_same_with_plain_icons() {
+        let mut nerd = app_with(vec![], vec![], false);
+        let mut plain = app_with(vec![], vec![], false);
+        plain.config.nerd_font = false;
+        let (a, la) = help_link(&mut nerd, 120, 50);
+        let (b, lb) = help_link(&mut plain, 120, 50);
+        let (spot, _) = la.clone().unwrap();
+        assert_eq!(la, lb);
+        assert_eq!(a[spot.y as usize], b[spot.y as usize]);
+    }
+
+    #[test]
+    fn closed_help_shows_no_version() {
+        let mut app = app_with(sample_rows(), sample_rows(), false);
+        let rows = screen(&mut app, 120, 20);
+        let version = format!("Herdr Git Panel {}", env!("CARGO_PKG_VERSION"));
+        assert!(rows.iter().all(|r| !r.contains(&version)), "{rows:#?}");
+        assert!(app.links.iter().all(|l| l != REPOSITORY));
     }
 
     #[test]

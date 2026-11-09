@@ -15,6 +15,10 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   nothing to start or the forge refuses. The details panel shows the key
   next to a failed pipeline (#12).
 
+- The help (`?`) shows the plugin's version in its bottom border; a click
+  on it opens the plugin's repository on GitHub, for example to report a
+  bug (#14).
+
 - `!` requests changes on someone else's open merge request or pull
   request, with a reason written in the same box as replies and comments
   (`Ctrl+s` shows it, only `y` sends it). On GitHub it is a review with

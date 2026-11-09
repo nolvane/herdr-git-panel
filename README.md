@@ -209,6 +209,9 @@ column heading (sort), a part of the second header line or a key hint in the
 footer. The wheel moves through the list, or scrolls the details panel when
 the pointer is over it.
 
+The help (`?`) shows the plugin's version in its bottom border; a click on
+it opens the plugin's repository on GitHub.
+
 ## Keys
 
 | Key | What it does |

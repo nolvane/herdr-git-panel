@@ -689,3 +689,16 @@ closed ones, like every write since #7.
   checks or commit statuses failed, nothing starts. The CI dot is GitHub's
   rollup of all of them, so it can stay red after the Actions runs started
   when another app's check failed too.
+
+## 2026-11-09: The version and the repository link sit in the help's border
+
+The help overlay (`?`) shows "Herdr Git Panel <version> ·
+github.com/nolvane/herdr-git-panel" in its bottom border (#14), so it takes
+no row from the list or the help text and stays visible when the box is cut
+to a short pane. A narrow box drops the address, then the name, and keeps
+the version as long as it fits between the corners. A click on it opens the repository through the same web-link
+check as links in the details panel and closes the help; every other click
+still only closes it. The version is `CARGO_PKG_VERSION`, the same value as
+`--version`, and the address is `repository` in `Cargo.toml`, so neither is
+written twice. `App::opener` starts the browser, so tests can put in one that
+starts nothing, like `App::poster` for posting.
