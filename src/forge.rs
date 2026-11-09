@@ -74,7 +74,7 @@ pub fn fetch_all(
         });
         let lab_all = scope.spawn(|| {
             if use_gitlab && all_gitlab {
-                gitlab::fetch_all_of(gitlab_host, status, path).map(Some)
+                gitlab::fetch_all_of(gitlab_host, status, path)
             } else {
                 Ok(None)
             }
@@ -87,7 +87,7 @@ pub fn fetch_all(
             }
         });
         let lab = if use_gitlab && lists_gitlab {
-            gitlab::fetch(gitlab_host, status, lists_of).map(Some)
+            gitlab::fetch(gitlab_host, status, lists_of)
         } else {
             Ok(None)
         };
@@ -100,12 +100,22 @@ pub fn fetch_all(
             hub_all.join().unwrap_or_else(|_| Err("gh crashed".into())),
         )
     });
-    combine(status, all_of, [lab, hub], [lab_all, hub_all])
+    combine(
+        gitlab_host,
+        [use_gitlab, use_github],
+        status,
+        all_of,
+        [lab, hub],
+        [lab_all, hub_all],
+    )
 }
 
-/// Puts the forges' answers together: `lists` and `all` are GitLab's and
-/// GitHub's, in that order. "All" failing never fails the other lists.
+/// Puts the forges' answers together: `installed`, `lists` and `all` are
+/// GitLab's and GitHub's, in that order. "All" failing never fails the
+/// other lists.
 fn combine(
+    gitlab_host: &str,
+    installed: [bool; 2],
     status: Status,
     all_of: Option<&Project>,
     lists: [Result<Option<Data>, String>; 2],
@@ -132,7 +142,7 @@ fn combine(
             // Only this project's forge was asked.
             not_available(p)
         } else {
-            "gh is not logged in to github.com: run gh auth login".into()
+            not_logged_in(gitlab_host, installed)
         });
     }
     // Merged and closed ones were asked for this project only.
@@ -188,6 +198,19 @@ fn combine(
         data,
         warning: (!errors.is_empty()).then(|| errors.join(" · ")),
     })
+}
+
+/// Why no forge answered although a tool is installed: each installed one
+/// is not logged in, and how to log in.
+fn not_logged_in(gitlab_host: &str, installed: [bool; 2]) -> String {
+    let mut hints = Vec::new();
+    if installed[0] {
+        hints.push(cli::login_hint("glab", gitlab_host));
+    }
+    if installed[1] {
+        hints.push(cli::login_hint("gh", github::HOST));
+    }
+    hints.join(" · ")
 }
 
 /// Why nothing could be asked about `p`: its forge's tool is missing or not
@@ -389,6 +412,8 @@ mod tests {
     fn merged_lists_remember_their_project() {
         let p = project("gitlab.com");
         let fetched = combine(
+            "gitlab.com",
+            BOTH,
             Status::Merged,
             Some(&p),
             [Ok(Some(lists())), Ok(None)],
@@ -398,6 +423,8 @@ mod tests {
         assert_eq!(fetched.data.of, Some(p.clone()));
         // Open ones are for every project.
         let fetched = combine(
+            "gitlab.com",
+            BOTH,
             Status::Open,
             Some(&p),
             [Ok(Some(lists())), Ok(None)],
@@ -411,6 +438,8 @@ mod tests {
     fn merged_ones_of_a_project_nobody_could_be_asked_about_say_why() {
         // glab missing, in a GitLab project: GitHub is not asked either.
         let Err(e) = combine(
+            "gitlab.com",
+            BOTH,
             Status::Merged,
             Some(&project("gitlab.com")),
             [Ok(None), Ok(None)],
@@ -421,6 +450,8 @@ mod tests {
         assert_eq!(e, "glab is not installed or not logged in to gitlab.com");
         // Your projects: a forge without its tool is left out quietly.
         let fetched = combine(
+            "gitlab.com",
+            BOTH,
             Status::Closed,
             None,
             [Ok(None), Ok(Some(lists()))],
@@ -431,6 +462,8 @@ mod tests {
         assert_eq!(fetched.data.mine.len(), 1);
         // One forge failing keeps the other's, with the error in the footer.
         let fetched = combine(
+            "gitlab.com",
+            BOTH,
             Status::Closed,
             None,
             [Err("glab: no network".into()), Ok(Some(lists()))],
@@ -444,6 +477,8 @@ mod tests {
     #[test]
     fn all_failing_keeps_the_other_lists() {
         let fetched = combine(
+            "gitlab.com",
+            BOTH,
             Status::Open,
             Some(&project("gitlab.com")),
             [Ok(Some(lists())), Ok(None)],
@@ -472,6 +507,8 @@ mod tests {
             projects: vec!["gitlab.com/acme/app".into()],
         };
         let fetched = combine(
+            "gitlab.com",
+            BOTH,
             Status::Open,
             Some(&project("gitlab.com")),
             [Ok(Some(data)), Ok(None)],
@@ -489,6 +526,8 @@ mod tests {
     fn a_project_nobody_was_asked_about_says_why() {
         // gh only, in a GitLab project.
         let fetched = combine(
+            "gitlab.com",
+            BOTH,
             Status::Open,
             Some(&project("gitlab.com")),
             [Ok(None), Ok(Some(lists()))],
@@ -502,6 +541,8 @@ mod tests {
         );
         // Your projects: a forge without its tool is simply left out.
         let fetched = combine(
+            "gitlab.com",
+            BOTH,
             Status::Open,
             None,
             [Ok(None), Ok(Some(lists()))],
@@ -514,6 +555,8 @@ mod tests {
     #[test]
     fn a_forge_that_failed_says_it_once() {
         let fetched = combine(
+            "gitlab.com",
+            BOTH,
             Status::Open,
             None,
             [Err("glab: not logged in".into()), Ok(Some(lists()))],
@@ -521,6 +564,85 @@ mod tests {
         )
         .unwrap();
         assert_eq!(fetched.warning.as_deref(), Some("glab: not logged in"));
+    }
+
+    /// glab and gh both installed.
+    const BOTH: [bool; 2] = [true, true];
+
+    #[test]
+    fn gitlab_not_logged_in_is_left_out_quietly() {
+        // glab not logged in (`Ok(None)` for its lists and "All"), gh
+        // answering: GitHub's lists, nothing in the footer.
+        for status in [Status::Open, Status::Merged] {
+            let fetched = combine(
+                "gitlab.com",
+                BOTH,
+                status,
+                None,
+                [Ok(None), Ok(Some(lists()))],
+                [Ok(None), Ok(Some(AllPart::default()))],
+            )
+            .unwrap();
+            assert_eq!(fetched.warning, None, "{status:?}");
+            assert_eq!(fetched.data.mine.len(), 1);
+            assert_eq!(fetched.data.all.unwrap().error, None);
+        }
+        // In a clone of a GitLab project, "All" says why it is empty.
+        let fetched = combine(
+            "gitlab.com",
+            BOTH,
+            Status::Open,
+            Some(&project("gitlab.com")),
+            [Ok(None), Ok(Some(lists()))],
+            [Ok(None), Ok(None)],
+        )
+        .unwrap();
+        assert_eq!(fetched.warning, None);
+        assert_eq!(
+            fetched.data.all.unwrap().error.as_deref(),
+            Some("glab is not installed or not logged in to gitlab.com")
+        );
+        // And the other way round: gh not logged in, GitLab answering.
+        let fetched = combine(
+            "gitlab.com",
+            BOTH,
+            Status::Open,
+            None,
+            [Ok(Some(lists())), Ok(None)],
+            [Ok(Some(AllPart::default())), Ok(None)],
+        )
+        .unwrap();
+        assert_eq!(fetched.warning, None);
+        assert_eq!(fetched.data.review.len(), 1);
+    }
+
+    #[test]
+    fn nobody_logged_in_names_the_tools_that_are_installed() {
+        let nobody = |installed: [bool; 2]| {
+            combine(
+                "git.acme.test",
+                installed,
+                Status::Open,
+                None,
+                [Ok(None), Ok(None)],
+                [Ok(None), Ok(None)],
+            )
+            .err()
+            .unwrap()
+        };
+        assert_eq!(
+            nobody([true, false]),
+            "glab is not logged in to git.acme.test: run glab auth login"
+        );
+        assert_eq!(
+            nobody([false, true]),
+            "gh is not logged in to github.com: run gh auth login"
+        );
+        assert_eq!(
+            nobody(BOTH),
+            "glab is not logged in to git.acme.test: run glab auth login · \
+             gh is not logged in to github.com: run gh auth login"
+        );
     }
 
     #[test]
@@ -536,6 +658,8 @@ mod tests {
             projects: Vec::new(),
         };
         let fetched = combine(
+            "gitlab.com",
+            BOTH,
             Status::Open,
             None,
             [Ok(Some(lists())), Ok(Some(Data::default()))],

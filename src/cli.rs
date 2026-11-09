@@ -158,6 +158,14 @@ pub fn not_logged_in(stderr: &str) -> bool {
         || lower.contains("not authenticated")
         || lower.contains("auth login")
         || lower.contains("not logged in")
+        // GitLab refusing the token: none, revoked, or an expired OAuth one.
+        || lower.contains("invalid token")
+        || lower.contains("invalid_token")
+}
+
+/// What to do about a tool that is not logged in to `host`.
+pub fn login_hint(name: &str, host: &str) -> String {
+    format!("{name} is not logged in to {host}: run {name} auth login")
 }
 
 /// A one-line reason from a tool's error output, which may start with a
@@ -165,7 +173,7 @@ pub fn not_logged_in(stderr: &str) -> bool {
 pub fn explain_failure(name: &str, host: &str, stderr: &str) -> String {
     let lower = stderr.to_lowercase();
     if not_logged_in(stderr) {
-        return format!("{name} is not logged in to {host}: run {name} auth login");
+        return login_hint(name, host);
     }
     if lower.contains("no such host") || lower.contains("dial tcp") {
         return format!("Cannot reach {host}: check the connection");
@@ -384,5 +392,16 @@ mod tests {
             "To get started with GitHub CLI, please run:  gh auth login"
         )
         .contains("gh auth login"));
+        // GitLab refusing the token (none, revoked or expired).
+        for stderr in ["glab: Invalid token", "glab: invalid_token"] {
+            assert_eq!(
+                explain_failure("glab", "gitlab.com", stderr),
+                "glab is not logged in to gitlab.com: run glab auth login"
+            );
+        }
+        assert_eq!(
+            login_hint("glab", "git.acme.test"),
+            "glab is not logged in to git.acme.test: run glab auth login"
+        );
     }
 }

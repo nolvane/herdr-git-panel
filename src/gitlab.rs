@@ -84,6 +84,7 @@ query($project: ID!) {
 /// (`STATE`) were updated, but none of their details (complexity about 30).
 const MEMBER_PROJECTS: &str = r#"
 query {
+  currentUser { username }
   projects(membership: true, archived: EXCLUDE, withMergeRequestsEnabled: true, sort: "latest_activity_desc", first: 100) {
     nodes {
       fullPath
@@ -185,35 +186,48 @@ pub fn member_query(paths: &[String], after: Option<&str>, status: Status) -> St
 
 /// "All": every merge request in `status` of `project`, or of the projects
 /// you are a member of when it is `None`, newest first, at most
-/// [`ALL_LIMIT`].
-pub fn fetch_all_of(host: &str, status: Status, project: Option<&str>) -> Result<AllPart, String> {
+/// [`ALL_LIMIT`]. `Ok(None)` when glab is not logged in.
+pub fn fetch_all_of(
+    host: &str,
+    status: Status,
+    project: Option<&str>,
+) -> Result<Option<AllPart>, String> {
     if let Some(path) = project {
         let query = PROJECT_ALL.replace("STATE", state_word(status));
-        let value = graphql(host, &query, &[("project", path)])?;
-        return parse_project_all(&value, host);
+        let Some(value) = user_graphql(host, &query, &[("project", path)])? else {
+            return Ok(None);
+        };
+        return parse_project_all(&value, host).map(Some);
     }
     let query = MEMBER_PROJECTS.replace("STATE", state_word(status));
-    let pick = pick_members(&graphql(host, &query, &[])?, ALL_LIMIT)?;
-    let answers: Vec<Result<Value, String>> = std::thread::scope(|scope| {
+    let Some(members) = user_graphql(host, &query, &[])? else {
+        return Ok(None);
+    };
+    let pick = pick_members(&members, ALL_LIMIT)?;
+    let answers: Vec<Result<Option<Value>, String>> = std::thread::scope(|scope| {
         let runs: Vec<_> = pick
             .paths
             .chunks(PROJECTS_PER_REQUEST)
             .map(|chunk| {
                 let query = member_query(chunk, pick.after.as_deref(), status);
-                scope.spawn(move || graphql(host, &query, &[]))
+                scope.spawn(move || user_graphql(host, &query, &[]))
             })
             .collect();
         runs.into_iter()
             .map(|r| r.join().unwrap_or_else(|_| Err("glab crashed".into())))
             .collect()
     });
+    // Logged out between the steps: quiet like the first step.
+    if answers.iter().any(|a| matches!(a, Ok(None))) {
+        return Ok(None);
+    }
     let mut items = Vec::new();
-    for answer in answers {
+    for answer in answers.into_iter().flat_map(Result::transpose) {
         items.extend(parse_members(&answer?, host)?);
     }
     let mut part = newest(items, pick.total, ALL_LIMIT);
     part.projects = pick.members.iter().map(|p| format!("{host}/{p}")).collect();
-    Ok(part)
+    Ok(Some(part))
 }
 
 /// Newest first, each merge request once, at most `limit`.
@@ -280,8 +294,10 @@ pub fn parse_members(value: &Value, host: &str) -> Result<Vec<MergeRequest>, Str
 }
 
 /// Your merge requests and those you review in `status`, of `project` only
-/// when it is given (merged and closed ones).
-pub fn fetch(host: &str, status: Status, project: Option<&str>) -> Result<Data, String> {
+/// when it is given (merged and closed ones). `Ok(None)` when glab is not
+/// logged in: then GitLab is simply not used, like GitHub without gh's
+/// login.
+pub fn fetch(host: &str, status: Status, project: Option<&str>) -> Result<Option<Data>, String> {
     // Both lists at the same time.
     let (review, mine) = std::thread::scope(|scope| {
         let mine = scope.spawn(|| query(host, "authoredMergeRequests", status, project));
@@ -291,8 +307,11 @@ pub fn fetch(host: &str, status: Status, project: Option<&str>) -> Result<Data, 
             mine.join().unwrap_or_else(|_| Err("glab crashed".into())),
         )
     });
-    let mut merged = review?;
-    let mine = mine?;
+    let (mut merged, mine) = match (review, mine) {
+        (Ok(Some(review)), Ok(Some(mine))) => (review, mine),
+        (Ok(None), _) | (_, Ok(None)) => return Ok(None),
+        (Err(e), _) | (_, Err(e)) => return Err(e),
+    };
     if merged.get("errors").is_none() && mine.get("errors").is_some() {
         merged = mine;
     } else if let Some(list) = mine
@@ -306,35 +325,92 @@ pub fn fetch(host: &str, status: Status, project: Option<&str>) -> Result<Data, 
             user.insert("authoredMergeRequests".into(), list);
         }
     }
-    parse(&merged, host)
+    parse(&merged, host).map(Some)
 }
 
-/// Runs one list query through glab and returns GitLab's JSON answer.
-fn query(host: &str, list: &str, status: Status, project: Option<&str>) -> Result<Value, String> {
+/// Runs one list query through glab and returns GitLab's JSON answer,
+/// `None` when glab is not logged in.
+fn query(
+    host: &str,
+    list: &str,
+    status: Status,
+    project: Option<&str>,
+) -> Result<Option<Value>, String> {
     // Only a query that declares `$project` may get it.
     let project = project.filter(|_| status != Status::Open);
     let vars: Vec<(&str, &str)> = project.map(|p| ("project", p)).into_iter().collect();
-    graphql(host, &list_query(list, status, project.is_some()), &vars)
+    user_graphql(host, &list_query(list, status, project.is_some()), &vars)
+}
+
+/// Why a GitLab request failed.
+enum Failure {
+    /// glab has no token for the host, or GitLab refused it.
+    NotLoggedIn,
+    Other(String),
 }
 
 /// Runs a GraphQL query through glab, with variables, and returns GitLab's
 /// JSON answer.
-fn graphql(host: &str, query: &str, vars: &[(&str, &str)]) -> Result<Value, String> {
+fn request(host: &str, query: &str, vars: &[(&str, &str)]) -> Result<Value, Failure> {
     let mut cmd = cli::command("glab");
     cmd.args(["api", "graphql", "--hostname", host, "-f"])
         .arg(format!("query={query}"));
     for (k, v) in vars {
         cmd.arg("-f").arg(format!("{k}={v}"));
     }
-    let out = cli::run("glab", cmd, host)?;
+    let out = cli::run("glab", cmd, host).map_err(Failure::Other)?;
+    answer(&out, host)
+}
+
+/// GitLab's answer in glab's output.
+fn answer(out: &cli::Output, host: &str) -> Result<Value, Failure> {
+    // Without a token GitLab answers 401 with a JSON error ("Invalid
+    // token"); glab says it on stderr too, so this comes first.
+    if !out.success && cli::not_logged_in(&out.stderr) {
+        return Err(Failure::NotLoggedIn);
+    }
     // GitLab's own errors come as JSON, also when glab exits with an error.
     if let Ok(value) = serde_json::from_slice::<Value>(&out.stdout) {
         return Ok(value);
     }
     if !out.success {
-        return Err(cli::explain_failure("glab", host, &out.stderr));
+        return Err(Failure::Other(cli::explain_failure(
+            "glab",
+            host,
+            &out.stderr,
+        )));
     }
-    Err("unreadable answer from GitLab".into())
+    Err(Failure::Other("unreadable answer from GitLab".into()))
+}
+
+/// [`request`] for one merge request the user acts on: not being logged in
+/// is an error that says so.
+fn graphql(host: &str, query: &str, vars: &[(&str, &str)]) -> Result<Value, String> {
+    request(host, query, vars).map_err(|f| match f {
+        Failure::NotLoggedIn => cli::login_hint("glab", host),
+        Failure::Other(e) => e,
+    })
+}
+
+/// [`request`] for the lists: `Ok(None)` when glab is not logged in to
+/// `host`, which then leaves GitLab out quietly, like gh.
+fn user_graphql(host: &str, query: &str, vars: &[(&str, &str)]) -> Result<Option<Value>, String> {
+    match request(host, query, vars) {
+        Ok(value) if anonymous(&value) => Ok(None),
+        Ok(value) => Ok(Some(value)),
+        Err(Failure::NotLoggedIn) => Ok(None),
+        Err(Failure::Other(e)) => Err(e),
+    }
+}
+
+/// Whether GitLab answered without a user and without an error: glab sent
+/// no token, as for a host it was never logged in to. Every list query asks
+/// for `currentUser`, so this can tell.
+fn anonymous(value: &Value) -> bool {
+    cli::graphql_errors(value).is_none()
+        && value
+            .pointer("/data/currentUser")
+            .is_some_and(Value::is_null)
 }
 
 /// Runs a `glab mr …` command on the merge request and returns its output.
@@ -953,6 +1029,93 @@ mod tests {
             "authoredMergeRequests(state: closed, sort: UPDATED_DESC, projectPath: $project, first: 100)"
         ));
         assert!(closed.contains("fragment mr on MergeRequest"));
+    }
+
+    fn output(success: bool, stdout: &str, stderr: &str) -> cli::Output {
+        cli::Output {
+            success,
+            code: Some(if success { 0 } else { 1 }),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.into(),
+        }
+    }
+
+    #[test]
+    fn a_refused_token_is_not_logged_in() {
+        // What glab 1.128 does on gitlab.com without a token, or with one
+        // GitLab refuses (HTTP 401).
+        let refused = output(
+            false,
+            r#"{"errors":[{"message":"Invalid token"}]}"#,
+            "glab: Invalid token",
+        );
+        assert!(matches!(
+            answer(&refused, "gitlab.com"),
+            Err(Failure::NotLoggedIn)
+        ));
+        let expired = output(
+            false,
+            r#"{"error":"invalid_token","error_description":"Token is expired. You can either do re-authorization or token refresh."}"#,
+            "glab: invalid_token",
+        );
+        assert!(matches!(
+            answer(&expired, "gitlab.com"),
+            Err(Failure::NotLoggedIn)
+        ));
+        let unauthorized = output(false, "", "glab: 401 Unauthorized");
+        assert!(matches!(
+            answer(&unauthorized, "gitlab.com"),
+            Err(Failure::NotLoggedIn)
+        ));
+    }
+
+    #[test]
+    fn real_gitlab_errors_stay_errors() {
+        // A GraphQL error while logged in: GitLab's own answer, read as such.
+        let wrong = output(
+            false,
+            r#"{"errors":[{"message":"Field 'nope' doesn't exist on type 'CurrentUser'"}]}"#,
+            "glab: Field 'nope' doesn't exist on type 'CurrentUser'",
+        );
+        let Ok(value) = answer(&wrong, "gitlab.com") else {
+            panic!("GitLab's answer");
+        };
+        assert!(parse(&value, "gitlab.com")
+            .unwrap_err()
+            .starts_with("GitLab: Field"));
+        let offline = output(
+            false,
+            "",
+            "ERROR\n  Post \"https://git.acme.test/api/graphql\": dial tcp: lookup git.acme.test: no such host.",
+        );
+        assert!(matches!(
+            answer(&offline, "git.acme.test"),
+            Err(Failure::Other(e)) if e == "Cannot reach git.acme.test: check the connection"
+        ));
+    }
+
+    #[test]
+    fn an_answer_without_a_user_is_not_logged_in() {
+        // glab has no token for a self-hosted host and asks anonymously.
+        assert!(anonymous(&json!({"data": {"currentUser": null}})));
+        assert!(anonymous(
+            &json!({"data": {"currentUser": null, "projects": {"nodes": []}}})
+        ));
+        assert!(!anonymous(
+            &json!({"data": {"currentUser": {"username": "me"}}})
+        ));
+        // An error is GitLab's to say, and a query without a user can't tell.
+        assert!(!anonymous(
+            &json!({"errors": [{"message": "boom"}], "data": {"currentUser": null}})
+        ));
+        assert!(!anonymous(&json!({"data": {"project": null}})));
+        // Every list query asks who you are, so an anonymous answer shows.
+        for status in [Status::Open, Status::Merged, Status::Closed] {
+            assert!(list_query("authoredMergeRequests", status, true).contains("currentUser"));
+            assert!(PROJECT_ALL.contains("currentUser"));
+            assert!(MEMBER_PROJECTS.contains("currentUser { username }"));
+            assert!(member_query(&["acme/app".into()], None, status).contains("currentUser"));
+        }
     }
 
     #[test]

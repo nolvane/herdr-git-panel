@@ -360,7 +360,7 @@ impl From<String> for Failure {
 impl From<Failure> for String {
     fn from(f: Failure) -> String {
         match f {
-            Failure::NotLoggedIn => format!("gh is not logged in to {HOST}: run gh auth login"),
+            Failure::NotLoggedIn => cli::login_hint("gh", HOST),
             Failure::Other(e) => e,
         }
     }
