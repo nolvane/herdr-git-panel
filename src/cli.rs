@@ -151,10 +151,12 @@ fn run_with(
 }
 
 /// The forges' whole answers when they refuse the token: GitHub's "Bad
-/// credentials", GitLab's "401 Unauthorized" (REST), "Invalid token"
-/// (GraphQL) and `invalid_token` (an expired OAuth token).
-const REFUSALS: [&str; 4] = [
+/// credentials" and "Requires authentication" (a request without one),
+/// GitLab's "401 Unauthorized" (REST), "Invalid token" (GraphQL) and
+/// `invalid_token` (an expired OAuth token).
+const REFUSALS: [&str; 5] = [
     "bad credentials",
+    "requires authentication",
     "401 unauthorized",
     "invalid token",
     "invalid_token",
@@ -162,19 +164,33 @@ const REFUSALS: [&str; 4] = [
 
 /// Whether the tool's error output says it is not logged in: the HTTP
 /// status 401 as gh and glab write it ("(HTTP 401)", "HTTP 401:", glab's
-/// "<url>: 401 {message: …}"), the tools' own words, or a refusal as the
+/// "<url>: 401 {message: …}" and "status code: 401"), the tools' own words, or a refusal as the
 /// whole message of a line. Not a bare "401" or "unauthorized": a number,
 /// a name or an integration's message may hold those (#29).
 pub fn not_logged_in(stderr: &str) -> bool {
     let lower = stderr.to_lowercase();
-    let status = ["http 401", ": 401 {"].iter().any(|w| lower.contains(w));
+    // glab's client libraries: "<METHOD> <url>: 401 …" and "status code:
+    // 401"; a "401" after anything else is not the status.
+    let after_url = lower.match_indices(": 401").any(|(i, _)| {
+        lower[..i]
+            .rsplit(char::is_whitespace)
+            .next()
+            .is_some_and(|w| w.starts_with("http"))
+    });
+    let status = after_url
+        || ["http 401", "status code: 401"]
+            .iter()
+            .any(|w| lower.contains(w));
     let words = ["not logged in", "not authenticated", "auth login"]
         .iter()
         .any(|w| lower.contains(w));
     let whole = lower.lines().any(|line| {
         let mut line = line.trim();
-        for prefix in ["glab:", "gh:", "error:"] {
-            line = line.strip_prefix(prefix).unwrap_or(line).trim();
+        while let Some(rest) = ["glab:", "gh:", "error:"]
+            .iter()
+            .find_map(|p| line.strip_prefix(p))
+        {
+            line = rest.trim();
         }
         REFUSALS.contains(&line.trim_end_matches('.'))
     });
@@ -401,6 +417,9 @@ mod tests {
             "ERROR\n\n  401 Unauthorized\n",
             "PUT https://gitlab.com/api/v4/projects/acme%2Fapp/merge_requests/7/merge: 401 {message: 401 Unauthorized}",
             "glab: HTTP 401",
+            "error: glab: 401 Unauthorized",
+            "POST https://git.acme.test/api/graphql: 401 failed to parse unknown error format: <html>",
+            "non-200 OK status code: 401 Unauthorized body: \"\"",
         ] {
             assert!(not_logged_in(stderr), "{stderr}");
         }
@@ -490,6 +509,17 @@ mod tests {
             ),
         );
         assert_eq!(e, "GitHub: Issue #401 is locked");
+        // GitHub without a token answers "Requires authentication" (401).
+        let e = api_error(
+            "gh",
+            "github.com",
+            "GitHub",
+            &failed(
+                r#"{"message":"Requires authentication","status":"401"}"#,
+                "gh: Requires authentication (HTTP 401)",
+            ),
+        );
+        assert_eq!(e, "gh is not logged in to github.com: run gh auth login");
         // GitLab's refusal as its whole answer still says how to log in.
         let e = api_error(
             "glab",

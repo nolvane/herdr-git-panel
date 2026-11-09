@@ -390,6 +390,11 @@ fn answer(out: &cli::Output) -> Result<Value, Failure> {
         if !out.success && cli::refused(&value) {
             return Err(Failure::NotLoggedIn);
         }
+        // A REST error answer (`{"message": …}`, such as a rate limit) has
+        // neither GraphQL data nor errors: it is the error, in GitHub's words.
+        if !out.success && value.get("data").is_none() && value.get("errors").is_none() {
+            return Err(Failure::Other(cli::api_error("gh", HOST, "GitHub", out)));
+        }
         return Ok(value);
     }
     if !out.success && cli::not_logged_in(&out.stderr) {
@@ -1237,6 +1242,16 @@ mod tests {
         assert_eq!(
             parse(&value).unwrap_err(),
             "GitHub: Query has complexity of 401, which exceeds max complexity of 400"
+        );
+        // A REST error answer is the error, also when it mentions 401.
+        let rest = output(
+            false,
+            r#"{"message":"Rate limit of 401 requests exceeded","status":"403"}"#,
+            "gh: Rate limit of 401 requests exceeded (HTTP 403)",
+        );
+        assert_eq!(
+            error_of(&rest),
+            "GitHub: Rate limit of 401 requests exceeded"
         );
         // Without JSON, the tool's error output is the error.
         let unauthorized = output(false, "", "gh: Unauthorized to view repository acme/app401");
