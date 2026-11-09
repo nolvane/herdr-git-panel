@@ -230,7 +230,9 @@ the forge the merge request lives on. GitHub mappings:
 
 `gh` not installed or not logged in leaves GitHub out quietly: many people
 have `gh` without using GitHub for work. Both forges failing shows the error;
-one failing shows it in the footer while the other's list stays.
+one failing shows it in the footer while the other's list stays. Since
+2026-11-09 GitLab is left out the same way when `glab` is not logged in (see
+that entry).
 
 The header says "Pull requests" when everything in view is on GitHub, else
 "Merge requests"; numbers are written `#n` and `!n` like the forges do.
@@ -498,3 +500,50 @@ can be long.
   2026-11-09: docs.github.com/en/site-policy/github-terms/github-terms-of-service,
   docs.github.com/en/site-policy/acceptable-use-policies/github-acceptable-use-policies,
   handbook.gitlab.com/handbook/legal/acceptable-use-policy/).
+
+## 2026-11-09: GitLab without a login is left out quietly, like GitHub
+
+`glab` installed but not logged in showed "GitLab: Invalid token" in the
+footer on every refresh, while `gh` without a login was left out quietly.
+Now both forges work the same way (#19).
+
+- What glab does (1.128): for a host in its config without a token, or with
+  one GitLab refuses, GitLab answers 401 and glab exits 1 with
+  `{"errors":[{"message":"Invalid token"}]}` on stdout and `glab: Invalid
+  token` on stderr. For a host it was never logged in to it sends no token,
+  and GitLab answers anonymously with `currentUser: null`.
+- GitLab's JSON answer decides when there is one: exactly "Invalid token",
+  `invalid_token` (an expired OAuth token) or "401 Unauthorized" as GitLab's
+  whole error message means not logged in, so an error that merely mentions
+  401 or a token (a query's complexity, an integration) still shows. Without
+  JSON, glab's stderr decides, by words such as "(HTTP 401)" or "auth
+  login" but not a bare "401", which may be part of a host name; such an
+  error shows instead of leaving GitLab out. `cli::explain_failure` now
+  names a network error before it looks for login words, and
+  `cli::not_logged_in`, which the messages of writes and of gh use, also
+  knows "invalid token". Its loose "401" and "unauthorized" stay for now
+  (#29).
+- When one request of a refresh fails without an answer (no network, the
+  time limit) and another looks logged out, the error wins and shows. A
+  GraphQL error next to a logged-out answer means the login changed during
+  the refresh; the next refresh shows the real state.
+- The list queries (open, merged and closed, "All" in one project and in
+  your projects) return `None` when not logged in or answered anonymously;
+  every one of them asks for `currentUser`, so "All" in your projects can
+  tell an anonymous answer from "no projects".
+- Always quiet, also for a self-hosted `gitlab_host` (the owner's decision
+  on #19): "All" in a clone of that server's project still says that glab is
+  not installed or not logged in there.
+- When no forge answers, the list names each installed tool that is not
+  logged in, with its `auth login` command, instead of always naming `gh`;
+  for a GitLab host other than gitlab.com with `--hostname <host>`, since a
+  plain `glab auth login` logs in to gitlab.com.
+- Not done: one login check per refresh before the lists (such as `glab
+  auth status`). It would cost a request on every refresh while logged in
+  and change nothing the user sees.
+- Activity and resolving a thread act on one merge request the user chose,
+  so they say "glab is not logged in to …: run glab auth login" (with
+  `--hostname`) instead of "GitLab: Invalid token"; that never reaches the
+  footer.
+- A real GitLab error (no network, a GraphQL error while logged in, the time
+  limit) still shows in the footer while GitHub's lists stay.

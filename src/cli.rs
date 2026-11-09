@@ -158,17 +158,32 @@ pub fn not_logged_in(stderr: &str) -> bool {
         || lower.contains("not authenticated")
         || lower.contains("auth login")
         || lower.contains("not logged in")
+        // GitLab refusing the token: none, revoked, or an expired OAuth one.
+        || lower.contains("invalid token")
+        || lower.contains("invalid_token")
+}
+
+/// What to do about a tool that is not logged in to `host`. glab logs in
+/// to gitlab.com unless it is told another host.
+pub fn login_hint(name: &str, host: &str) -> String {
+    let hostname = if name == "glab" && !host.eq_ignore_ascii_case("gitlab.com") {
+        format!(" --hostname {host}")
+    } else {
+        String::new()
+    };
+    format!("{name} is not logged in to {host}: run {name} auth login{hostname}")
 }
 
 /// A one-line reason from a tool's error output, which may start with a
 /// banner line such as "ERROR".
 pub fn explain_failure(name: &str, host: &str, stderr: &str) -> String {
     let lower = stderr.to_lowercase();
-    if not_logged_in(stderr) {
-        return format!("{name} is not logged in to {host}: run {name} auth login");
-    }
+    // First: a host name may hold "401", and no network is never a login.
     if lower.contains("no such host") || lower.contains("dial tcp") {
         return format!("Cannot reach {host}: check the connection");
+    }
+    if not_logged_in(stderr) {
+        return login_hint(name, host);
     }
     let reason = stderr
         .lines()
@@ -384,5 +399,25 @@ mod tests {
             "To get started with GitHub CLI, please run:  gh auth login"
         )
         .contains("gh auth login"));
+        // GitLab refusing the token (none, revoked or expired).
+        for stderr in ["glab: Invalid token", "glab: invalid_token"] {
+            assert_eq!(
+                explain_failure("glab", "gitlab.com", stderr),
+                "glab is not logged in to gitlab.com: run glab auth login"
+            );
+        }
+        // A self-hosted GitLab needs its host, or glab logs in to gitlab.com.
+        assert_eq!(
+            login_hint("glab", "git.acme.test"),
+            "glab is not logged in to git.acme.test: run glab auth login --hostname git.acme.test"
+        );
+        assert_eq!(
+            login_hint("glab", "GitLab.com"),
+            "glab is not logged in to GitLab.com: run glab auth login"
+        );
+        assert_eq!(
+            login_hint("gh", "github.com"),
+            "gh is not logged in to github.com: run gh auth login"
+        );
     }
 }

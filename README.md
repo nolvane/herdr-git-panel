@@ -230,8 +230,9 @@ Needs:
 - For GitHub: the GitHub CLI [`gh`](https://cli.github.com), logged in with
   `gh auth login`.
 - One of the two is enough. The plugin asks through these tools, so it never
-  sees your token. A tool that is not installed, or `gh` when it is not
-  logged in, is left out quietly.
+  sees your token. A tool that is not installed or not logged in is left
+  out quietly, `glab` as well as `gh`; when neither can be used, the list
+  says what to install or log in to.
 - **A [Nerd Font](https://www.nerdfonts.com) as the terminal's font** for the
   icons and the rounded labels. In macOS Terminal take the "S" variant (for
   example MesloLGS Nerd Font Mono): fonts with a large line gap make box

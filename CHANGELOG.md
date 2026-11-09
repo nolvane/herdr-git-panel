@@ -45,6 +45,11 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- With `glab` installed but not logged in, GitLab is now left out quietly,
+  like GitHub without `gh`'s login, instead of showing "GitLab: Invalid
+  token" in the footer on every refresh. When no forge can be used, the list
+  names the tools that need `auth login`, for a self-hosted GitLab with
+  `glab auth login --hostname <host>` (#19).
 - The "Review" and "CI" dots and their headings start at the left edge of
   their column, like every other column, instead of sitting centred.
 
