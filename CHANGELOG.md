@@ -62,6 +62,10 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   token" in the footer on every refresh. When no forge can be used, the list
   names the tools that need `auth login`, for a self-hosted GitLab with
   `glab auth login --hostname <host>` (#19).
+- An error that only mentions 401 or "unauthorized", such as one about
+  merge request !401, now shows as itself instead of leaving GitHub out
+  without a word or saying "run … auth login"; only a refused login counts
+  as not logged in (#29).
 - The "Review" and "CI" dots and their headings start at the left edge of
   their column, like every other column, instead of sitting centred.
 

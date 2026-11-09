@@ -521,8 +521,8 @@ Now both forges work the same way (#19).
   error shows instead of leaving GitLab out. `cli::explain_failure` now
   names a network error before it looks for login words, and
   `cli::not_logged_in`, which the messages of writes and of gh use, also
-  knows "invalid token". Its loose "401" and "unauthorized" stay for now
-  (#29).
+  knows "invalid token". Since #29 it is the one strict check for both
+  forges (see below).
 - When one request of a refresh fails without an answer (no network, the
   time limit) and another looks logged out, the error wins and shows. A
   GraphQL error next to a logged-out answer means the login changed during
@@ -621,3 +621,40 @@ as GitHub does when it doesn't say), so the column shows no "of needed".
 - Checked on 2026-11-09 without a login against a public Community Edition
   server: the query without those fields is accepted and returns
   `approved` and `approvedBy`.
+
+## 2026-11-09: Only a refused login counts as not logged in
+
+`cli::not_logged_in` took any error output with "401" or "unauthorized" in
+it as a refused login, so an error about merge request !401, a query's
+"complexity of 401" or "Jira integration: 401 Unauthorized" left GitHub out
+without a word or showed "run … auth login" for a write (#29).
+
+- One strict check for both forges and every caller (GitHub's lists,
+  replies and resolving, the messages of all writes, GitLab's lists):
+  `cli::not_logged_in` for the tools' error output, `cli::refused` for the
+  forges' JSON answers, one word list (`cli::REFUSALS`) for both. GitLab's
+  own `refused` and `refused_stderr` from #19 went into them.
+- Error output counts as not logged in only for the HTTP status as the tools
+  write it ("(HTTP 401)", "HTTP 401:", glab's "<url>: 401 …" and "status
+  code: 401"),
+  the tools' own words ("not logged in", "not authenticated", "auth
+  login"), or "Bad credentials", "401 Unauthorized", "Invalid token" or
+  `invalid_token` as the whole message of a line, with or without a
+  `glab:`, `gh:` or `error:` in front; GitHub's "Requires authentication"
+  (its 401 answer to a request without a token) too. In a JSON answer any
+  of these words counts as the whole `message`, `error` or GraphQL error
+  message, whichever forge sent it.
+- The JSON answer decides when there is one, for GitHub's GraphQL requests
+  as for GitLab's and for REST writes (`cli::api_error`): a refusal as its
+  whole message gives the login hint, any other message shows as the
+  forge's own words, also when gh's error output says "HTTP 401". A failed
+  GitHub GraphQL request whose JSON is a REST error (no `data`, no
+  `errors`, such as a rate limit) is that error, not an empty answer.
+- Recorded on 2026-11-09 with an invalid `GH_TOKEN`: `gh api graphql`
+  prints `{"message":"Bad credentials",…,"status":"401"}` and `gh: Bad
+  credentials (HTTP 401)`; `gh pr view` prints `HTTP 401: Bad credentials
+  (https://api.github.com/graphql)` and `Try authenticating with:  gh auth
+  login -h github.com`.
+- GitHub got an `answer` helper like GitLab's, so the decision is tested
+  with recorded output. They stay two: GitLab also treats a refusal next to
+  data differently, and the word lists are what they share.

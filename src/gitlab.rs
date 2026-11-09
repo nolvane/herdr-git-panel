@@ -396,12 +396,12 @@ fn answer(out: &cli::Output, host: &str) -> Result<Value, Failure> {
     if let Ok(value) = serde_json::from_slice::<Value>(&out.stdout) {
         // A refusal comes without data; one error next to data is not one.
         let no_data = value.get("data").is_none_or(Value::is_null);
-        if refused(&value) && (!out.success || no_data) {
+        if cli::refused(&value) && (!out.success || no_data) {
             return Err(Failure::NotLoggedIn);
         }
         return Ok(value);
     }
-    if !out.success && refused_stderr(&out.stderr) {
+    if !out.success && cli::not_logged_in(&out.stderr) {
         return Err(Failure::NotLoggedIn);
     }
     if !out.success {
@@ -412,44 +412,6 @@ fn answer(out: &cli::Output, host: &str) -> Result<Value, Failure> {
         )));
     }
     Err(Failure::Other("unreadable answer from GitLab".into()))
-}
-
-/// Whether GitLab's JSON answer refuses the token: without one, or with
-/// one it no longer takes, it answers 401 with exactly "Invalid token"
-/// (GraphQL), `invalid_token` (an expired OAuth token) or "401
-/// Unauthorized" (REST). Whole messages only, so an error that merely
-/// mentions 401 or a token (a query's complexity, an integration) stays an
-/// error.
-fn refused(value: &Value) -> bool {
-    let is = |v: Option<&Value>, word: &str| {
-        v.and_then(Value::as_str)
-            .is_some_and(|m| m.trim().eq_ignore_ascii_case(word))
-    };
-    let errors = value.get("errors").and_then(Value::as_array);
-    errors
-        .into_iter()
-        .flatten()
-        .any(|e| is(e.get("message"), "Invalid token"))
-        || is(value.get("error"), "invalid_token")
-        || is(value.get("message"), "401 Unauthorized")
-}
-
-/// Whether glab's error output, without a JSON answer, says it is not
-/// logged in. Stricter than [`cli::not_logged_in`]: a bare "401" may be
-/// part of a host name, and here it would hide GitLab without a word.
-fn refused_stderr(stderr: &str) -> bool {
-    let lower = stderr.to_lowercase();
-    [
-        "(http 401)",
-        "401 unauthorized",
-        "invalid token",
-        "invalid_token",
-        "not logged in",
-        "not authenticated",
-        "auth login",
-    ]
-    .iter()
-    .any(|w| lower.contains(w))
 }
 
 /// [`request`] for one merge request the user acts on: not being logged in
@@ -1348,6 +1310,22 @@ mod tests {
             answer(&offline, "git.acme.test"),
             Err(Failure::Other(e)) if e == "Cannot reach git.acme.test: check the connection"
         ));
+    }
+
+    #[test]
+    fn glab_errors_that_mention_401_stay_errors() {
+        let jira = output(false, "", "glab: Jira integration: 401 Unauthorized");
+        assert!(matches!(
+            answer(&jira, "gitlab.com"),
+            Err(Failure::Other(e)) if e == "glab failed: glab: Jira integration: 401 Unauthorized"
+        ));
+        // A GraphQL error that mentions 401 is GitLab's answer, read as such.
+        let complex = output(
+            false,
+            r#"{"errors":[{"message":"Query has complexity of 401, which exceeds max complexity of 250"}]}"#,
+            "glab: Query has complexity of 401, which exceeds max complexity of 250",
+        );
+        assert!(answer(&complex, "gitlab.com").is_ok());
     }
 
     #[test]
