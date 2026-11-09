@@ -52,6 +52,10 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- On a narrow pane, the footer leaves out whole key hints from the right
+  end instead of cutting one in the middle of its word, and always keeps
+  two blanks before "r refresh" (#18).
+
 - With `glab` installed but not logged in, GitLab is now left out quietly,
   like GitHub without `gh`'s login, instead of showing "GitLab: Invalid
   token" in the footer on every refresh. When no forge can be used, the list

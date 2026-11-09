@@ -3629,4 +3629,52 @@ mod tests {
         press(&mut app, KeyCode::Char('2'));
         assert_eq!(app.review_state.selected(), Some(1));
     }
+
+    #[test]
+    fn left_out_footer_hints_keep_their_keys() {
+        let mut app = app();
+        app.updated_at = Some(Instant::now());
+        let screen = screen_text(&mut app, 60, 20);
+        let footer = screen.lines().last().unwrap();
+        assert!(!footer.contains("q close"), "{footer}");
+        assert!(!footer.contains("all keys"), "{footer}");
+        press(&mut app, KeyCode::Char('q'));
+        assert!(app.ask_quit, "q still asks to close");
+        let screen = screen_text(&mut app, 60, 20);
+        assert!(screen.contains("Close the git panel?"), "{screen}");
+        press(&mut app, KeyCode::Char('n'));
+        assert!(!app.ask_quit);
+        press(&mut app, KeyCode::Char('?'));
+        assert!(app.help, "? still opens all keys");
+    }
+
+    #[test]
+    fn a_shown_footer_hint_still_clicks_on_a_narrow_pane() {
+        let mut app = app();
+        app.updated_at = Some(Instant::now());
+        let screen = screen_text(&mut app, 70, 20);
+        let footer = screen.lines().last().unwrap();
+        let x = footer[..footer.find("? all").unwrap()].chars().count() as u16;
+        assert!(!footer.contains("q close"), "{footer}");
+        click(&mut app, x, 19);
+        assert!(app.help, "{footer}");
+    }
+
+    #[test]
+    fn confirm_bar_is_unchanged_on_a_narrow_pane() {
+        let mut app = app();
+        app.updated_at = Some(Instant::now());
+        let mr = sample_mr(1);
+        app.confirm = Some(Confirm {
+            action: Action::Approve,
+            mr,
+        });
+        let screen = screen_text(&mut app, 60, 20);
+        let footer = screen.lines().last().unwrap();
+        assert!(
+            footer.contains("y yes") && footer.contains("n no"),
+            "{footer}"
+        );
+        assert!(!footer.contains("open"), "{footer}");
+    }
 }
