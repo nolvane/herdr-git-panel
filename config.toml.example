@@ -26,4 +26,5 @@ icons = "nerd"
 compact = false
 
 # The GitLab host; glab must be logged in there.
+# Without a port: a GitLab on another port gets it as glab's --api-host.
 gitlab_host = "gitlab.com"

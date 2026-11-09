@@ -52,6 +52,11 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- A `gitlab_host` with a port (such as `git.acme.test:8443`), which `glab`
+  refuses, now makes the list say to set the host name without the port and
+  to give `glab` the port with `--api-host`, instead of showing `glab`'s
+  "invalid hostname". The README says how to set up a GitLab on another
+  port (#25).
 - With `glab` installed but not logged in, GitLab is now left out quietly,
   like GitHub without `gh`'s login, instead of showing "GitLab: Invalid
   token" in the footer on every refresh. When no forge can be used, the list

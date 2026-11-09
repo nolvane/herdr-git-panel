@@ -362,9 +362,25 @@ enum Failure {
     Other(String),
 }
 
+/// Why `host` cannot go to glab: it ends in a port, which glab refuses in
+/// `--hostname` and keeps in its own login as the API host instead.
+fn port_error(host: &str) -> Option<String> {
+    let (name, port) = host.rsplit_once(':')?;
+    if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(format!(
+        "gitlab_host takes the host name without the port: set gitlab_host = \"{name}\" \
+         and log glab in with glab auth login --hostname {name} --api-host {host}"
+    ))
+}
+
 /// Runs a GraphQL query through glab, with variables, and returns GitLab's
 /// JSON answer.
 fn request(host: &str, query: &str, vars: &[(&str, &str)]) -> Result<Value, Failure> {
+    if let Some(e) = port_error(host) {
+        return Err(Failure::Other(e));
+    }
     let mut cmd = cli::command("glab");
     cmd.args(["api", "graphql", "--hostname", host, "-f"])
         .arg(format!("query={query}"));
@@ -1494,6 +1510,26 @@ mod tests {
         let part = newest(items, 5, 1);
         assert_eq!(part.items[0].project, "acme/lib", "newest first, cut");
         assert_eq!(part.total, 5);
+    }
+
+    #[test]
+    fn a_port_in_gitlab_host_says_how_to_fix_it() {
+        // glab takes no port in --hostname; the list says what to set
+        // instead, without starting glab (#25).
+        let Err(e) = fetch("git.acme.test:8443", Status::Open, None) else {
+            panic!("no error");
+        };
+        assert_eq!(
+            e,
+            "gitlab_host takes the host name without the port: set gitlab_host = \"git.acme.test\" \
+             and log glab in with glab auth login --hostname git.acme.test --api-host git.acme.test:8443"
+        );
+        assert!(!e.contains("invalid hostname"));
+        // Hosts without a port, and values that are no port, go to glab.
+        assert_eq!(port_error("gitlab.com"), None);
+        assert_eq!(port_error("git.acme.test"), None);
+        assert_eq!(port_error("https://git.acme.test"), None);
+        assert_eq!(port_error("git.acme.test:"), None);
     }
 
     #[test]

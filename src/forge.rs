@@ -370,6 +370,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_clone_of_a_gitlab_on_another_port_is_this_project() {
+        // `gitlab_host` without the port, as glab knows the host; the
+        // remote's port is dropped (#25).
+        for url in [
+            "https://git.acme.test:8443/acme/app.git",
+            "ssh://git@git.acme.test:2222/acme/app.git",
+            "git@git.acme.test:acme/app.git",
+        ] {
+            let p = crate::repo::parse_remote(url).unwrap();
+            assert!(known(&p, "git.acme.test"), "{url}");
+            assert_eq!(all_forges(Some(&p), "git.acme.test"), (true, false));
+        }
+    }
+
+    #[test]
+    fn a_port_in_gitlab_host_says_how_to_fix_it() {
+        // GitLab's answer, which comes without starting glab.
+        let host = "git.acme.test:8443";
+        let fix = gitlab::fetch(host, Status::Open, None).err().unwrap();
+        let all = gitlab::fetch_all_of(host, Status::Open, None)
+            .err()
+            .unwrap();
+        assert!(fix.starts_with("gitlab_host takes the host name without the port"));
+        // GitHub answering: its lists, the message in the footer.
+        let fetched = combine(
+            host,
+            BOTH,
+            Status::Open,
+            None,
+            [Err(fix.clone()), Ok(Some(lists()))],
+            [Err(all.clone()), Ok(None)],
+        )
+        .unwrap();
+        assert_eq!(fetched.warning.as_deref(), Some(fix.as_str()));
+        assert_eq!(fetched.data.mine.len(), 1);
+        // Without GitHub: the list's error.
+        let e = combine(
+            host,
+            [true, false],
+            Status::Open,
+            None,
+            [Err(fix.clone()), Ok(None)],
+            [Err(all), Ok(None)],
+        )
+        .err()
+        .unwrap();
+        assert_eq!(e, fix);
+    }
+
     fn mr(forge: Forge, iid: u64, updated: i64) -> MergeRequest {
         let mut d = crate::gitlab::parse(
             &serde_json::json!({"data": {"currentUser": {"username": "me", "authoredMergeRequests": {"nodes": [
