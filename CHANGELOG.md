@@ -10,8 +10,8 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - On GitLab, a line starting with `/` that the list posted as text now shows
   as `/merge later` in the activity tab, as on GitLab's page, instead of
-  `\/merge later`. Inside code the backslash still shows. GitHub comments
-  and descriptions follow the same rule (#35).
+  `\/merge later`. Inside code the backslash still shows. Descriptions and
+  comments on both forges follow the same rule (#35).
 
 ## [1.1.0] - 2026-11-09
 

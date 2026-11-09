@@ -179,10 +179,15 @@ fn inline(text: &str, base: Style) -> Vec<(Span<'static>, Option<String>)> {
         // (`\/` is how the list sends a GitLab line starting with `/`).
         // Backslashes before anything else are shown as written.
         let run = rest.len() - rest.trim_start_matches('\\').len();
-        if run > 0 && rest[run..].starts_with('/') {
-            plain.push_str(&"\\".repeat(run / 2));
-            plain.push('/');
-            rest = &rest[run + 1..];
+        if run > 0 {
+            if rest[run..].starts_with('/') {
+                plain.push_str(&"\\".repeat(run / 2));
+                plain.push('/');
+                rest = &rest[run + 1..];
+            } else {
+                plain.push_str(&rest[..run]);
+                rest = &rest[run..];
+            }
             continue;
         }
         plain.push(ch);

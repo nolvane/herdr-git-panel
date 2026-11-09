@@ -3343,11 +3343,11 @@ mod tests {
 
         // The preview still shows the text as typed.
         let mut c = Compose::new(mr, crate::compose::Target::Comment);
-        c.field.text = "/merge later".into();
+        c.field.text = "/merge later \\/kept".into();
         c.stage = Stage::Preview;
         let (lines, _) = compose_lines(&c, 40);
         let first: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(first, "/merge later");
+        assert_eq!(first, "/merge later \\/kept");
     }
 
     #[test]
