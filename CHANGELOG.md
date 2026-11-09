@@ -83,6 +83,9 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   to give `glab` the port with `--api-host`, instead of showing `glab`'s
   "invalid hostname". The README says how to set up a GitLab on another
   port (#25).
+- On GitLab a line of a reply or comment from the activity tab that starts
+  with `/` is posted as text instead of running as a GitLab command such as
+  `/merge` or `/approve` (#31).
 - With `glab` installed but not logged in, GitLab is now left out quietly,
   like GitHub without `gh`'s login, instead of showing "GitLab: Invalid
   token" in the footer on every refresh. When no forge can be used, the list

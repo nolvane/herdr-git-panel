@@ -1118,6 +1118,7 @@ mod tests {
             "$int:@/etc/passwd",
             "two\nlines",
             "\"quotes\" and {owner}",
+            "/merge later",
         ] {
             let sent: Value = serde_json::from_slice(&reply_body("PRRT_x", body)).unwrap();
             assert_eq!(sent["variables"]["body"], body);

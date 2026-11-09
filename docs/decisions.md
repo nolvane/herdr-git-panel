@@ -746,3 +746,27 @@ and `first: 100` the newest threads.
   keeping it would break SSH clones of every self-hosted GitLab.
 - Rejected: taking `host:port` and handing the port to glab ourselves
   (`GITLAB_API_HOST`), which would duplicate glab's own login setup.
+
+  Replies and comments escape such lines the same way since #31.
+
+## 2026-11-09: Replies and comments run no GitLab command
+
+A line of a GitLab reply or comment that starts with `/` is posted as text,
+not run as a quick action (the owner's decision on #31), although GitLab's
+own comment box would run it: a reply should post what it says, and a
+hidden `/merge` or `/approve` in it would be a surprise.
+
+- `post_note` sends the text through `escape_quick_actions`, the escape
+  that change requests use (#11): a backslash before every line that starts
+  with `/` in its first column, nothing else changed. The same limits hold:
+  inside a code block the backslash shows, which is more common in
+  replies than in change requests (a path or command at a line start), but
+  skipping code blocks would need to find them exactly as GitLab does, and
+  a mismatch would run a command. The preview shows the text as typed.
+- Every line starting with `/` is escaped, not only known command names:
+  the commands differ between GitLab versions and editions.
+- An exception to "Replies and comments from the activity tab", which sends
+  the text as typed otherwise. GitHub has no quick actions and is unchanged.
+- The list's own rendering of the posted note shows the backslash
+  (`\/merge later`), as it does for change requests; GitLab's web shows
+  `/merge later`.
