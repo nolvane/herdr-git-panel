@@ -638,12 +638,36 @@ fn note_body(body: &str) -> Vec<u8> {
     serde_json::json!({ "body": body }).to_string().into_bytes()
 }
 
+/// `text` with a backslash in front of every line that starts with `/`
+/// (`\/merge later`). GitLab runs such lines of a note as quick actions;
+/// escaped, it leaves them as text and Markdown shows `/merge later`.
+fn escape_quick_actions(text: &str) -> String {
+    let escaped: Vec<String> = text
+        .split('\n')
+        .map(|line| {
+            if line.starts_with('/') {
+                format!("\\{line}")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect();
+    escaped.join("\n")
+}
+
+/// The request body of a reply or comment: the text as typed, as JSON,
+/// with lines starting with `/` escaped so GitLab runs no command from
+/// them.
+fn text_note_body(body: &str) -> Vec<u8> {
+    note_body(&escape_quick_actions(body))
+}
+
 /// Posts `body` as a reply to a thread (`Some`) or as a comment on the
 /// merge request.
 pub fn post_note(mr: &MergeRequest, thread: Option<&str>, body: &str) -> Result<(), String> {
     let mut cmd = cli::command("glab");
     cmd.args(note_args(&mr.host, &mr.project, mr.iid, thread)?);
-    let out = cli::run_input("glab", cmd, &mr.host, note_body(body))?;
+    let out = cli::run_input("glab", cmd, &mr.host, text_note_body(body))?;
     if out.success {
         Ok(())
     } else {
@@ -662,17 +686,7 @@ const REQUEST_CHANGES: &str = "/submit_review requested_changes";
 /// (an open code block, an HTML block) can hide it; GitLab takes it out
 /// of the posted note.
 fn request_changes_note(reason: &str) -> String {
-    let escaped: Vec<String> = reason
-        .split('\n')
-        .map(|line| {
-            if line.starts_with('/') {
-                format!("\\{line}")
-            } else {
-                line.to_string()
-            }
-        })
-        .collect();
-    format!("{REQUEST_CHANGES}\n\n{}", escaped.join("\n"))
+    format!("{REQUEST_CHANGES}\n\n{}", escape_quick_actions(reason))
 }
 
 /// Whether GitLab ran the quick action of a change request: it takes the
@@ -957,6 +971,7 @@ mod tests {
 
     #[test]
     fn note_text_is_sent_as_typed() {
+        // The plain JSON wrapper; replies and comments also escape `/` lines.
         for body in [
             "@alex please check",
             "@/etc/passwd",
@@ -966,6 +981,35 @@ mod tests {
             "\"quotes\" and \\ backslashes",
         ] {
             let sent: Value = serde_json::from_slice(&note_body(body)).unwrap();
+            assert_eq!(sent, json!({ "body": body }));
+        }
+    }
+
+    #[test]
+    fn a_reply_or_comment_runs_no_quick_action() {
+        let sent: Value = serde_json::from_slice(&text_note_body(
+            "/merge later\nok /approve here\n/approve\n /close",
+        ))
+        .unwrap();
+        assert_eq!(
+            sent["body"],
+            "\\/merge later\nok /approve here\n\\/approve\n /close"
+        );
+        let body = sent["body"].as_str().unwrap();
+        assert!(!body.lines().any(|l| l.starts_with('/')));
+    }
+
+    #[test]
+    fn a_reply_or_comment_is_sent_as_typed_otherwise() {
+        for body in [
+            "@alex please check",
+            "@/etc/passwd and a/b",
+            "line one\nline two",
+            "see :branch and :id",
+            "\"quotes\" and \\ backslashes",
+            "Bitte ändern: Grösse, Übersicht 👍",
+        ] {
+            let sent: Value = serde_json::from_slice(&text_note_body(body)).unwrap();
             assert_eq!(sent, json!({ "body": body }));
         }
     }

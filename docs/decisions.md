@@ -589,6 +589,21 @@ failure keeps the text in the open box with the reason.
   nothing; a line starting with a space runs nothing either, so only the
   first column is escaped). Inside a code block the backslash shows; finding
   code blocks the way GitLab does would be fragile for a rare case.
-  Replies and comments from #10 send their text as typed, so there a line
-  starting with `/` does run as a GitLab command, as in GitLab's own
-  comment box; whether that should change is its own issue.
+  Replies and comments escape such lines the same way since #31.
+
+## 2026-11-09: Replies and comments run no GitLab command
+
+A line of a GitLab reply or comment that starts with `/` is posted as text,
+not run as a quick action (the owner's decision on #31), although GitLab's
+own comment box would run it: the preview shows the text as it will be
+posted, and a hidden `/merge` or `/approve` in a reply would be a surprise.
+
+- `post_note` sends the text through `escape_quick_actions`, the escape
+  that change requests use (#11): a backslash before every line that starts
+  with `/` in its first column, nothing else changed. The same limits hold:
+  inside a code block the backslash shows.
+- An exception to "Replies and comments from the activity tab", which sends
+  the text as typed otherwise. GitHub has no quick actions and is unchanged.
+- The list's own rendering of the posted note shows the backslash
+  (`\/merge later`), as it does for change requests; GitLab's web shows
+  `/merge later`.
