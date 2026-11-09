@@ -46,7 +46,8 @@ impl TextField {
                 self.text.pop();
                 Edit::Changed
             }
-            KeyCode::Char(c) if !ctrl && !mods.contains(KeyModifiers::ALT) && !c.is_control() => {
+            // With Alt too: some keyboards type `@` or `|` with Option.
+            KeyCode::Char(c) if !ctrl && !c.is_control() => {
                 self.text.push(c);
                 Edit::Changed
             }
@@ -109,6 +110,10 @@ pub struct Compose {
     /// Why the last attempt did not post, shown in the box until the text
     /// changes.
     pub message: Option<String>,
+    /// How many lines the box is scrolled up from the end of the text.
+    pub scroll_up: u16,
+    /// Lines that do not fit the box, set while drawing.
+    pub hidden: u16,
 }
 
 impl Compose {
@@ -119,7 +124,15 @@ impl Compose {
             field: TextField::default(),
             stage: Stage::Writing,
             message: None,
+            scroll_up: 0,
+            hidden: 0,
         }
+    }
+
+    /// Scrolls the box up (`lines` above 0) or down, within the text.
+    pub fn scroll(&mut self, lines: i32) {
+        let up = (self.scroll_up as i32 + lines).clamp(0, self.hidden as i32);
+        self.scroll_up = up as u16;
     }
 
     /// "reply" or "comment".
@@ -206,11 +219,12 @@ mod tests {
     }
 
     #[test]
-    fn capitals_and_symbols_with_shift_are_typed() {
+    fn capitals_and_symbols_with_shift_or_alt_are_typed() {
         let mut f = TextField::default();
         f.key(KeyCode::Char('A'), KeyModifiers::SHIFT);
         f.key(KeyCode::Char('>'), KeyModifiers::SHIFT);
-        assert_eq!(f.text, "A>");
+        f.key(KeyCode::Char('@'), KeyModifiers::ALT);
+        assert_eq!(f.text, "A>@");
     }
 
     #[test]

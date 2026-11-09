@@ -463,16 +463,22 @@ can be long.
   thread id already loaded) and the conversation's REST comments endpoint.
   A GitHub reply that lands in a review of yours that is not submitted yet
   says so instead of "Reply posted".
-- The text always goes as a raw field (`-f body=…`): `-F` reads `@…` as a
-  file. The GitHub GraphQL helper sends values starting with `$int:` as
-  `-F`, so text never goes through it; the reply has its own argument
-  builder.
+- The text never goes into an argument: it is the JSON body of the request
+  on the tool's standard input (`--input -`). As an argument, `-F` would
+  read `@…` as a file, glab fills in `:placeholders` for `-F`, the GitHub
+  GraphQL helper sends values starting with `$int:` as `-F`, Linux allows at
+  most 128 KiB in one argument, and the text would show in the process list.
 - Bracketed paste is on: pasted text arrives in one piece, so a line break
   or a `y` in it can't finish or confirm anything. The search field takes a
   paste on one line.
 - Replies and comments are refused on merged and closed ones, like approve,
   merge, draft and the branch, so the merged and closed lists stay for
   looking back. Both forges would accept them; this is easy to turn around.
+- A text taller than the box scrolls (`↑` `↓`, the wheel over the box); the
+  preview starts at its top, so all of it can be read before `y`. A post
+  that runs out of time may still have reached the forge, so the list says
+  so and loads the comments again instead of inviting a second post. What
+  other writes report (a merge that failed) still shows next to the box.
 - After a post the merge request's comments load again (answers of loads
   started before it are dropped), the list refreshes, and the same merge
   request and thread stay selected by key and id: they move to the top,

@@ -92,6 +92,8 @@ pub enum Hit {
     /// A button of the text field in the footer, by its key (`s` for
     /// `Ctrl+s`, `\u{1b}` for `Esc`); the only clicks while it is open.
     Compose(char),
+    /// The text field's box (the wheel scrolls it).
+    ComposeBox,
 }
 
 /// Sends a text to the forge: the list's own is [`post`]; tests put in one
@@ -986,8 +988,23 @@ impl App {
         if self.selected().map(|mr| mr.key()).as_ref() != Some(key) {
             return;
         }
-        self.thread = list.iter().position(|d| d.id == id && d.resolvable);
+        // Only when the filter shows it; otherwise `e` or `>` would act on
+        // a thread nobody sees.
+        self.thread = list
+            .iter()
+            .position(|d| d.id == id && d.resolvable && self.thread_filter.keeps(d));
         self.scroll_to_thread = self.thread.is_some();
+    }
+
+    /// The selected thread, when it is one that takes replies.
+    fn selected_thread(&self) -> Option<&crate::model::Discussion> {
+        match self.selected_activity() {
+            Some(Activity::Loaded(list)) => self
+                .thread
+                .and_then(|i| list.get(i))
+                .filter(|d| d.resolvable && !d.id.is_empty()),
+            _ => None,
+        }
     }
 
     /// The forge's id of the selected thread, when it belongs to `key`.
@@ -995,14 +1012,7 @@ impl App {
         if self.selected().map(|mr| mr.key()).as_ref() != Some(key) {
             return None;
         }
-        match self.selected_activity() {
-            Some(Activity::Loaded(list)) => self
-                .thread
-                .and_then(|i| list.get(i))
-                .filter(|d| d.resolvable && !d.id.is_empty())
-                .map(|d| d.id.clone()),
-            _ => None,
-        }
+        self.selected_thread().map(|d| d.id.clone())
     }
 
     /// `>`: opens the text field for a reply to the selected thread.
@@ -1013,14 +1023,9 @@ impl App {
         if self.refuse_closed(&mr) {
             return;
         }
-        let thread = match self.selected_activity() {
-            Some(Activity::Loaded(list)) => self
-                .thread
-                .and_then(|i| list.get(i))
-                .filter(|d| d.resolvable && !d.id.is_empty())
-                .map(|d| (d.id.clone(), d.place.clone())),
-            _ => None,
-        };
+        let thread = self
+            .selected_thread()
+            .map(|d| (d.id.clone(), d.place.clone()));
         let Some((thread, place)) = thread else {
             self.say("Choose a thread first: n");
             return;
@@ -1044,15 +1049,30 @@ impl App {
         let Some(c) = self.compose.as_mut() else {
             return;
         };
+        // A text taller than the box scrolls, also in the preview, so all
+        // of it can be read before it is posted.
+        match code {
+            KeyCode::Up => return c.scroll(1),
+            KeyCode::Down => return c.scroll(-1),
+            KeyCode::PageUp => return c.scroll(5),
+            KeyCode::PageDown => return c.scroll(-5),
+            _ => {}
+        }
         match c.stage {
             Stage::Writing => match c.field.key(code, mods) {
-                Edit::Changed => c.message = None,
+                Edit::Changed => {
+                    c.message = None;
+                    // Back to the end, where the typing is.
+                    c.scroll_up = 0;
+                }
                 Edit::Finish if c.field.is_blank() => {
                     c.message = Some("Nothing to post: write something first".into());
                 }
                 Edit::Finish => {
                     c.message = None;
                     c.stage = Stage::Preview;
+                    // The preview starts at the top of the text.
+                    c.scroll_up = u16::MAX;
                 }
                 Edit::Discard => self.discard_compose(),
                 Edit::Ignored => {}
@@ -1144,6 +1164,19 @@ impl App {
                     self.refresh_soon();
                 }
                 Err(e) => {
+                    // Out of time: the forge may have taken it all the same,
+                    // so load its comments again to see.
+                    let e = if e.contains("did not answer within") {
+                        let key = c.mr.key();
+                        self.activity.remove(&key);
+                        self.activity_wanted.remove(&key);
+                        format!(
+                            "{e}: the {} may have been posted, check above before sending again",
+                            c.noun()
+                        )
+                    } else {
+                        e
+                    };
                     c.stage = Stage::Writing;
                     c.message = Some(e.clone());
                     self.compose = Some(c);
@@ -1160,6 +1193,7 @@ impl App {
             if c.stage == Stage::Writing {
                 c.field.paste(text);
                 c.message = None;
+                c.scroll_up = 0;
             }
             return;
         }
@@ -1387,6 +1421,12 @@ impl App {
                     if let Some(Hit::Compose(c)) = hit {
                         self.compose_click(c);
                     }
+                }
+                MouseEventKind::ScrollDown if hit == Some(Hit::ComposeBox) => {
+                    self.compose_key(KeyCode::Down, KeyModifiers::NONE)
+                }
+                MouseEventKind::ScrollUp if hit == Some(Hit::ComposeBox) => {
+                    self.compose_key(KeyCode::Up, KeyModifiers::NONE)
                 }
                 MouseEventKind::ScrollDown if over_panel => {
                     self.details_scroll = self.details_scroll.saturating_add(2)
@@ -3034,6 +3074,7 @@ mod tests {
         assert_eq!(app.thread, Some(2));
         write_and_post(&mut app, '>', "Still fine.");
         assert_eq!(flash(&app), Some("Reply posted"));
+        assert!(app.resolve_rx.try_recv().is_err(), "no resolve or reopen");
         let key = app.selected().unwrap().key();
         assert!(!app.activity.contains_key(&key), "loads again");
         reload(&mut app, &key, discussions());
@@ -3190,6 +3231,113 @@ mod tests {
         let shown = screen_text(&mut app, 150, 30);
         assert!(shown.contains("Any key or click closes this."), "{shown}");
         assert!(shown.contains("double-click"), "{shown}");
+    }
+
+    fn times_out(_: &MergeRequest, _: &Target, _: &str) -> Result<Posted, String> {
+        Err("gitlab.com did not answer within 30 s".into())
+    }
+
+    #[test]
+    fn a_long_text_can_be_read_whole_in_the_preview() {
+        let mut app = in_activity();
+        press(&mut app, KeyCode::Char('+'));
+        let text: Vec<String> = (1..=30).map(|i| format!("row {i:02}")).collect();
+        app.event(Event::Paste(text.join("\n")));
+        let shown = screen_text(&mut app, 150, 40);
+        assert!(
+            shown.contains("row 30") && !shown.contains("row 01"),
+            "the end while writing"
+        );
+        ctrl_s(&mut app);
+        let shown = screen_text(&mut app, 150, 40);
+        assert!(
+            shown.contains("row 01") && !shown.contains("row 30"),
+            "the start in the preview"
+        );
+        assert!(shown.contains("↑↓ scroll"), "{shown}");
+        for _ in 0..40 {
+            press(&mut app, KeyCode::Down);
+        }
+        let shown = screen_text(&mut app, 150, 40);
+        assert!(shown.contains("row 30"), "{shown}");
+        // The wheel over the box scrolls it too.
+        let (area, _) = *app
+            .hits
+            .iter()
+            .find(|(_, h)| *h == Hit::ComposeBox)
+            .unwrap();
+        for _ in 0..40 {
+            app.mouse(MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: area.x + 2,
+                row: area.y + 1,
+                modifiers: KeyModifiers::NONE,
+            });
+        }
+        let shown = screen_text(&mut app, 150, 40);
+        assert!(shown.contains("row 01"), "{shown}");
+        assert_eq!(stage(&app), Some(Stage::Preview), "scrolling posts nothing");
+    }
+
+    #[test]
+    fn a_post_out_of_time_may_have_gone_through() {
+        let mut app = in_activity();
+        app.poster = times_out;
+        write_and_post(&mut app, '+', "ok");
+        let why = app.compose.as_ref().unwrap().message.clone().unwrap();
+        assert_eq!(
+            why,
+            "gitlab.com did not answer within 30 s: the comment may have been posted, check above before sending again"
+        );
+        let key = app.selected().unwrap().key();
+        assert!(!app.activity.contains_key(&key), "its comments load again");
+        assert_eq!(text(&app), "ok");
+    }
+
+    #[test]
+    fn what_other_writes_say_still_shows_while_writing() {
+        let mut app = in_activity();
+        press(&mut app, KeyCode::Char('+'));
+        app.act_tx
+            .send(Err("GitLab: pipeline must succeed".into()))
+            .unwrap();
+        app.receive_actions();
+        let shown = screen_text(&mut app, 150, 40);
+        let footer = shown.lines().last().unwrap();
+        assert!(footer.contains("Ctrl+s send"), "{footer}");
+        assert!(footer.contains("GitLab: pipeline must succeed"), "{footer}");
+    }
+
+    #[test]
+    fn a_kept_thread_the_filter_hides_is_not_selected() {
+        let mut app = in_activity();
+        app.thread_filter = ThreadFilter::Open;
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(app.thread, Some(0));
+        let key = app.selected().unwrap().key();
+        app.keep_thread = Some((key.clone(), "gid://gitlab/Discussion/aaa".into()));
+        // Someone resolved it meanwhile.
+        let mut list = discussions();
+        list[0].resolved = true;
+        reload(&mut app, &key, list);
+        assert_eq!(app.thread, None);
+        press(&mut app, KeyCode::Char('>'));
+        assert!(app.compose.is_none());
+    }
+
+    #[test]
+    fn help_fits_a_middle_sized_pane() {
+        let mut app = app();
+        app.help = true;
+        let shown = screen_text(&mut app, 100, 42);
+        for k in [
+            "Any key or click closes this.",
+            "double-click",
+            "reply to the selected thread",
+            "ready",
+        ] {
+            assert!(shown.contains(k), "{k}\n{shown}");
+        }
     }
 
     #[test]

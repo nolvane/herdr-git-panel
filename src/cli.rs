@@ -56,15 +56,30 @@ pub fn run(name: &str, cmd: Command, host: &str) -> Result<Output, String> {
     run_for(name, cmd, host, TIMEOUT)
 }
 
+/// Like [`run`], with `input` on the tool's standard input, such as a
+/// request body for `--input -`: a long text there meets no limit on the
+/// length of one argument and does not show in the process list.
+pub fn run_input(name: &str, cmd: Command, host: &str, input: Vec<u8>) -> Result<Output, String> {
+    run_with(name, cmd, host, TIMEOUT, Some(input))
+}
+
 /// Runs the command with this time limit. When it runs out, the tool is
 /// stopped together with its process group, if it leads one (git with the
 /// ssh it started).
-pub fn run_for(
+pub fn run_for(name: &str, cmd: Command, host: &str, limit: Duration) -> Result<Output, String> {
+    run_with(name, cmd, host, limit, None)
+}
+
+fn run_with(
     name: &str,
     mut cmd: Command,
     host: &str,
     limit: Duration,
+    input: Option<Vec<u8>>,
 ) -> Result<Output, String> {
+    if input.is_some() {
+        cmd.stdin(Stdio::piped());
+    }
     let mut child = cmd
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -77,6 +92,13 @@ pub fn run_for(
             _ => format!("{name} could not start: {e}"),
         })?;
 
+    // Write the input on a thread too, and close it so the tool reads to
+    // the end; a tool that stops early only ends the write.
+    if let (Some(data), Some(mut pipe)) = (input, child.stdin.take()) {
+        std::thread::spawn(move || {
+            let _ = std::io::Write::write_all(&mut pipe, &data);
+        });
+    }
     // Read the pipes on threads so a large answer cannot block the tool.
     let mut out_pipe = child.stdout.take();
     let mut err_pipe = child.stderr.take();
@@ -314,6 +336,17 @@ mod tests {
             &failed("", "dial tcp: lookup x.com: no such host"),
         );
         assert_eq!(e, "Cannot reach x.com: check the connection");
+    }
+
+    #[test]
+    fn input_reaches_the_tool_whole() {
+        let mut cmd = Command::new("wc");
+        cmd.arg("-c");
+        let text = "é".repeat(200_000);
+        let out = run_input("wc", cmd, "example.org", text.clone().into_bytes()).unwrap();
+        assert!(out.success);
+        let count: usize = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
+        assert_eq!(count, text.len());
     }
 
     #[test]

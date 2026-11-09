@@ -179,8 +179,11 @@ fn draw_compose(frame: &mut Frame, app: &mut App, area: Rect) {
         ));
     let inner = block.inner(area);
     let (lines, (cx, cy)) = compose_lines(c, inner.width);
-    // The end of the text stays in view, where the typing happens.
-    let scroll = (lines.len() as u16).saturating_sub(inner.height);
+    // The end of the text is in view, where the typing happens, unless the
+    // box was scrolled up.
+    let hidden = (lines.len() as u16).saturating_sub(inner.height);
+    let up = c.scroll_up.min(hidden);
+    let scroll = hidden - up;
     let writing = c.stage == Stage::Writing;
     frame.render_widget(ratatui::widgets::Clear, area);
     frame.render_widget(Paragraph::new(lines).block(block).scroll((scroll, 0)), area);
@@ -188,6 +191,11 @@ fn draw_compose(frame: &mut Frame, app: &mut App, area: Rect) {
     if writing && row >= scroll && row - scroll < inner.height {
         frame.set_cursor_position((inner.x + cx, inner.y + row - scroll));
     }
+    if let Some(c) = app.compose.as_mut() {
+        c.hidden = hidden;
+        c.scroll_up = up;
+    }
+    app.hits.push((area, Hit::ComposeBox));
 }
 
 /// The changes viewer: a header with the merge request and the current
@@ -494,7 +502,7 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
         ),
     ];
     type Group = (&'static str, &'static [(&'static str, &'static str)]);
-    let group_lines = |groups: &[Group]| -> Vec<Line<'static>> {
+    let group_lines = |groups: &[Group], width: u16| -> Vec<Line<'static>> {
         let mut lines: Vec<Line<'static>> = Vec::new();
         for (i, (title, keys)) in groups.iter().enumerate() {
             if i > 0 {
@@ -504,14 +512,17 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
                 *title,
                 Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
             )));
+            // A long description wraps under itself instead of being cut.
             for (k, what) in keys.iter() {
-                lines.push(Line::from(vec![
+                lines.extend(text::wrap(
+                    vec![Span::styled(*what, Style::new().fg(MUTED))],
+                    width,
                     Span::styled(
                         format!("  {k:<15}"),
                         Style::new().fg(TEXT).add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(*what, Style::new().fg(MUTED)),
-                ]));
+                    Span::raw(" ".repeat(17)),
+                ));
             }
         }
         lines
@@ -522,25 +533,29 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
             Style::new().fg(FAINT),
         ))
     };
-    // The widest line (`f` and its filters) fits a column.
-    const COLUMN: u16 = 67;
+    // The widest line (`f` and its filters) fits a column of this width;
+    // narrower ones wrap their descriptions.
+    const COLUMN: u16 = 65;
+    // Border and padding of the box.
+    const FRAME: u16 = 4;
     let full = frame.area();
-    let mut one = group_lines(&groups);
+    let one_width = (COLUMN + FRAME).min(full.width);
+    let mut one = group_lines(&groups, one_width.saturating_sub(FRAME));
     one.extend([Line::from(""), closing()]);
-    // Two columns side by side when one is taller than the screen and the
-    // screen is wide enough.
-    // A column with its share of the border and padding.
-    let width_for = |n: u16| COLUMN * n + 2;
-    let two = one.len() as u16 + 2 > full.height && full.width >= width_for(2);
-    let columns: Vec<Vec<Line>> = if two {
-        let mut right = group_lines(&groups[2..]);
+    // Two columns side by side when one is taller than the screen and two
+    // of at least 46 cells fit next to each other.
+    let two_width = (2 * COLUMN + 2 + FRAME).min(full.width);
+    let two = one.len() as u16 + 2 > full.height && two_width >= 2 * 46 + 2 + FRAME;
+    let (columns, width): (Vec<Vec<Line>>, u16) = if two {
+        // Each column, with a gap of two cells between them.
+        let column = (two_width - FRAME - 2) / 2;
+        let mut right = group_lines(&groups[2..], column);
         right.extend([Line::from(""), closing()]);
-        vec![group_lines(&groups[..2]), right]
+        (vec![group_lines(&groups[..2], column), right], two_width)
     } else {
-        vec![one]
+        (vec![one], one_width)
     };
     let tallest = columns.iter().map(Vec::len).max().unwrap_or(0) as u16;
-    let width = width_for(columns.len() as u16).min(full.width);
     let height = (tallest + 2).min(full.height);
     let area = Rect::new(
         full.x + (full.width - width) / 2,
@@ -560,7 +575,9 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
     let inner = block.inner(area);
     frame.render_widget(ratatui::widgets::Clear, area);
     frame.render_widget(block, area);
-    let parts = Layout::horizontal(vec![Constraint::Fill(1); columns.len()]).split(inner);
+    let parts = Layout::horizontal(vec![Constraint::Fill(1); columns.len()])
+        .spacing(2)
+        .split(inner);
     for (lines, part) in columns.into_iter().zip(parts.iter()) {
         frame.render_widget(Paragraph::new(lines), *part);
     }
@@ -1988,6 +2005,10 @@ fn draw_compose_footer(frame: &mut Frame, app: &mut App, c: Compose, area: Rect)
         ),
     };
     // A narrow footer shortens the text, never the buttons.
+    let mut buttons = buttons;
+    if c.hidden > 0 {
+        buttons.push((Span::styled("   ↑↓ scroll ", Style::new().fg(FAINT)), None));
+    }
     let buttons_width: usize = buttons.iter().map(|(s, _)| s.width()).sum();
     let head = cut(
         &head,
@@ -2006,6 +2027,18 @@ fn draw_compose_footer(frame: &mut Frame, app: &mut App, c: Compose, area: Rect)
         spans.push(span);
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    // What other writes said (a merge that failed) shows on the right.
+    if let Some((text, _)) = &app.flash {
+        let room = (area.x + area.width).saturating_sub(x + 2);
+        let text = format!("{text} ");
+        if room as usize >= text.chars().count() {
+            frame.render_widget(
+                Paragraph::new(Span::styled(text, Style::new().fg(ACCENT)))
+                    .alignment(Alignment::Right),
+                Rect::new(x + 2, area.y, room, 1),
+            );
+        }
+    }
 }
 
 /// A label as GitLab shows it: its colour as background, with rounded ends

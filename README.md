@@ -53,8 +53,8 @@ resolves the selected thread or opens it again. On open ones, `>` replies to
 the selected thread and `+` writes a comment on the merge request itself: a
 box at the bottom of the panel takes the text, over several lines (`Enter`
 adds a line break, pasted text goes in whole). `Ctrl+s` shows what will be
-posted and where, `y` posts it (`n` goes back to the text, `Esc` throws it
-away). The new reply or comment then shows in the tab; when posting fails,
+posted and where (`↑` `↓` scroll a long text), `y` posts it (`n` goes back to
+the text, `Esc` throws it away). The new reply or comment then shows in the tab; when posting fails,
 the box says why and keeps the text. Links in both tabs (the merge
 request's link, Markdown links and plain URLs in descriptions and comments)
 open in the browser with a click.
@@ -312,7 +312,7 @@ writes what you asked for: an approval or taking one back, a merge, a reply
 to a thread or a comment (all after confirming), and resolving a thread or
 opening it again. Replies and comments go through `glab api` (GitLab's REST
 API) and `gh api` (GitHub's GraphQL API for replies, REST for comments),
-with the text as typed. `b` runs
+with the text as typed, sent to them on standard input. `b` runs
 `git fetch` against the clone's remote, creates or moves forward a local
 branch that is not checked out anywhere, sets its upstream when it has
 none, and asks Herdr to create the folder. Nothing else is stored and

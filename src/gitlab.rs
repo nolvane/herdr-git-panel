@@ -469,17 +469,16 @@ fn encode_path(path: &str) -> String {
         .collect()
 }
 
-/// The arguments of `glab api` that post `body` as a note on merge request
-/// `iid`: a reply to the discussion `thread` (GraphQL's global id, such as
+/// The arguments of `glab api` that post a note on merge request `iid`: a
+/// reply to the discussion `thread` (GraphQL's global id, such as
 /// `gid://gitlab/Discussion/<hex>`), or a comment on the merge request
-/// itself. The text goes as a raw field (`-f`), which glab sends as it is:
-/// it never reads `@…` as a file or fills in `:placeholders`.
+/// itself. The text goes on standard input ([`note_body`]), never in an
+/// argument, so glab reads nothing in it as a file or `:placeholder`.
 fn note_args(
     host: &str,
     project: &str,
     iid: u64,
     thread: Option<&str>,
-    body: &str,
 ) -> Result<Vec<String>, String> {
     let mut endpoint = format!("projects/{}/merge_requests/{iid}", encode_path(project));
     if let Some(thread) = thread {
@@ -497,19 +496,24 @@ fn note_args(
         "--method",
         "POST",
         &endpoint,
-        "-f",
-        &format!("body={body}"),
+        "--input",
+        "-",
     ]
     .map(String::from)
     .to_vec())
+}
+
+/// The request body of a note: the text as typed, as JSON.
+fn note_body(body: &str) -> Vec<u8> {
+    serde_json::json!({ "body": body }).to_string().into_bytes()
 }
 
 /// Posts `body` as a reply to a thread (`Some`) or as a comment on the
 /// merge request.
 pub fn post_note(mr: &MergeRequest, thread: Option<&str>, body: &str) -> Result<(), String> {
     let mut cmd = cli::command("glab");
-    cmd.args(note_args(&mr.host, &mr.project, mr.iid, thread, body)?);
-    let out = cli::run("glab", cmd, &mr.host)?;
+    cmd.args(note_args(&mr.host, &mr.project, mr.iid, thread)?);
+    let out = cli::run_input("glab", cmd, &mr.host, note_body(body))?;
     if out.success {
         Ok(())
     } else {
@@ -746,7 +750,6 @@ mod tests {
             "acme/web app",
             90,
             Some("gid://gitlab/Discussion/3f2a9c"),
-            "Done.",
         )
         .unwrap();
         assert_eq!(
@@ -758,11 +761,11 @@ mod tests {
                 "--method",
                 "POST",
                 "projects/acme%2Fweb%20app/merge_requests/90/discussions/3f2a9c/notes",
-                "-f",
-                "body=Done.",
+                "--input",
+                "-",
             ]
         );
-        let comment = note_args("git.acme.test", "acme/app", 7, None, "Looks good").unwrap();
+        let comment = note_args("git.acme.test", "acme/app", 7, None).unwrap();
         assert_eq!(comment[2], "git.acme.test");
         assert_eq!(comment[5], "projects/acme%2Fapp/merge_requests/7/notes");
     }
@@ -774,10 +777,11 @@ mod tests {
             "@/etc/passwd",
             "line one\nline two",
             "see :branch and :id",
+            "[a,b]",
+            "\"quotes\" and \\ backslashes",
         ] {
-            let args = note_args("gitlab.com", "acme/app", 7, None, body).unwrap();
-            assert_eq!(&args[6..], ["-f".to_string(), format!("body={body}")]);
-            assert!(!args.iter().any(|a| a == "-F" || a == "--field"));
+            let sent: Value = serde_json::from_slice(&note_body(body)).unwrap();
+            assert_eq!(sent, json!({ "body": body }));
         }
     }
 
@@ -791,7 +795,7 @@ mod tests {
             "gid://gitlab/Note/12",
         ] {
             assert!(
-                note_args("gitlab.com", "acme/app", 7, Some(thread), "x").is_err(),
+                note_args("gitlab.com", "acme/app", 7, Some(thread)).is_err(),
                 "{thread}"
             );
         }
