@@ -199,6 +199,23 @@ mod tests {
     }
 
     #[test]
+    fn a_self_hosted_gitlab_on_another_port_is_its_bare_host() {
+        // The port of a remote is the web or SSH server's, never part of
+        // the host glab is logged in to (#25).
+        let want = Project {
+            host: "git.acme.test".into(),
+            path: "acme/app".into(),
+        };
+        for url in [
+            "https://git.acme.test:8443/acme/app.git",
+            "ssh://git@git.acme.test:2222/acme/app.git",
+            "git@git.acme.test:acme/app.git",
+        ] {
+            assert_eq!(parse_remote(url), Some(want.clone()), "{url}");
+        }
+    }
+
+    #[test]
     fn origin_wins() {
         let cfg = "[core]\n\tbare = false\n[remote \"upstream\"]\n\turl = git@a.com:x/y.git\n[remote \"origin\"]\n\turl = git@b.com:p/q.git\n";
         assert_eq!(remote_url(cfg).as_deref(), Some("git@b.com:p/q.git"));

@@ -86,7 +86,8 @@ pub enum Hit {
     Threads(ThreadFilter),
     /// A file in the changes viewer's tree.
     File(usize),
-    /// A link in the details panel (index into `App::links`).
+    /// A link in the details panel or the help's border (index into
+    /// `App::links`).
     Link(usize),
     /// Anywhere while the help is open: closes it.
     Help,
@@ -100,6 +101,28 @@ pub enum Hit {
 /// Sends a text to the forge: the list's own is [`post`]; tests put in one
 /// that never runs glab or gh.
 pub type Poster = fn(&MergeRequest, &Target, &str) -> Result<Posted, String>;
+
+/// Runs the system's opener (first argument) on a web link, true when it
+/// started; tests put in one that starts nothing.
+pub type Opener = fn(&str, &str) -> bool;
+
+/// The system's program that opens a link in the browser.
+const OPENER: &str = if cfg!(target_os = "macos") {
+    "open"
+} else {
+    "xdg-open"
+};
+
+/// Starts `opener` (`open`, `xdg-open`) on `url`.
+pub fn open_in_browser(opener: &str, url: &str) -> bool {
+    Command::new(opener)
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .is_ok()
+}
 
 /// Loads the lists: the list's own is [`forge::fetch_all`]; tests put in one
 /// that never runs glab or gh.
@@ -125,12 +148,30 @@ pub fn post(mr: &MergeRequest, target: &Target, body: &str) -> Result<Posted, St
     }
 }
 
+/// Why there is nothing to start again on `mr`, unless its pipeline failed.
+pub fn nothing_to_retry(mr: &MergeRequest) -> Option<String> {
+    use crate::model::Pipeline;
+    let r = mr.reference();
+    let why = match mr.pipeline {
+        Pipeline::Failed => return None,
+        Pipeline::None => return Some(format!("Nothing to start again: {r} has no pipeline")),
+        Pipeline::Success => "passed",
+        Pipeline::Running => "is running",
+        Pipeline::Canceled => "was cancelled or skipped",
+        Pipeline::Manual => "is waiting for a manual job",
+    };
+    Some(format!("Nothing to start again: the pipeline of {r} {why}"))
+}
+
 /// What waits for confirmation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     Approve,
     Revoke,
     Merge,
+    /// Start the failed jobs of the pipeline (GitLab) or the failed checks
+    /// (GitHub) again.
+    Retry,
 }
 
 /// An action on a merge request waiting for y or n.
@@ -336,6 +377,7 @@ pub struct App {
     /// A reply or comment being written; while open, every key goes into it.
     pub compose: Option<Compose>,
     pub poster: Poster,
+    pub opener: Opener,
     post_tx: Sender<Result<Posted, String>>,
     post_rx: Receiver<Result<Posted, String>>,
     /// Refresh again as soon as the one running now has answered.
@@ -440,6 +482,7 @@ impl App {
             activity_rx,
             compose: None,
             poster: post,
+            opener: open_in_browser,
             post_tx,
             post_rx,
             refresh_again: false,
@@ -870,6 +913,25 @@ impl App {
         });
     }
 
+    /// Asks for confirmation before starting a failed pipeline again; on any
+    /// other pipeline says why there is nothing to start.
+    fn ask_retry(&mut self) {
+        let Some(mr) = self.selected().cloned() else {
+            return;
+        };
+        if self.refuse_closed(&mr) {
+            return;
+        }
+        if let Some(why) = nothing_to_retry(&mr) {
+            self.say(why);
+            return;
+        }
+        self.confirm = Some(Confirm {
+            action: Action::Retry,
+            mr,
+        });
+    }
+
     /// Marks your own merge request as draft, or as ready again. No
     /// confirmation: it is undone with the same key.
     fn toggle_draft(&mut self) {
@@ -986,6 +1048,8 @@ impl App {
             Action::Approve => "Approving…",
             Action::Revoke => "Revoking…",
             Action::Merge => "Merging…",
+            Action::Retry if c.mr.forge == Forge::GitLab => "Starting the failed jobs again…",
+            Action::Retry => "Starting the failed checks again…",
         });
         std::thread::spawn(move || {
             let r = c.mr.reference();
@@ -993,6 +1057,7 @@ impl App {
                 Action::Approve => forge::approve(&c.mr).map(|()| format!("{r} approved")),
                 Action::Revoke => forge::revoke(&c.mr).map(|()| format!("Approval of {r} revoked")),
                 Action::Merge => forge::merge(&c.mr).map(|()| format!("{r} merged")),
+                Action::Retry => forge::retry_pipeline(&c.mr),
             };
             let _ = tx.send(result);
         });
@@ -1508,8 +1573,14 @@ impl App {
             return;
         }
         if self.help {
-            if let MouseEventKind::Down(_) = m.kind {
+            if let MouseEventKind::Down(button) = m.kind {
                 self.help = false;
+                // The version in the border opens the repository.
+                if let (MouseButton::Left, Some(Hit::Link(i))) = (button, hit) {
+                    if let Some(url) = self.links.get(i).cloned() {
+                        self.open_url(&url);
+                    }
+                }
             }
             return;
         }
@@ -1704,22 +1775,10 @@ impl App {
             self.say("Only web links can be opened");
             return;
         }
-        let opener = if cfg!(target_os = "macos") {
-            "open"
-        } else {
-            "xdg-open"
-        };
-        let ok = Command::new(opener)
-            .arg(url)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .is_ok();
-        self.say(if ok {
+        self.say(if (self.opener)(OPENER, url) {
             "Opened in the browser".to_string()
         } else {
-            format!("Could not run {opener}")
+            format!("Could not run {OPENER}")
         });
     }
 
@@ -1941,6 +2000,7 @@ impl App {
             }
             KeyCode::Enter | KeyCode::Char('o') => self.open_selected(),
             KeyCode::Char('y') => self.copy_selected(),
+            KeyCode::Char('r') if mods.contains(KeyModifiers::CONTROL) => self.ask_retry(),
             KeyCode::Char('r') => {
                 self.forget_failed_activity();
                 if self.loading {
@@ -2041,6 +2101,8 @@ mod tests {
         let mut app = App::new(config, None, None);
         // Not from the shell the tests run in.
         app.herdr = false;
+        // Tests never start the browser.
+        app.opener = opens;
         // Never glab or gh, never the real glab config.
         app.fetcher = says_how_gitlab_was_asked;
         app.login_stamp = || stamp(1);
@@ -2798,6 +2860,7 @@ mod tests {
                 resolved: false,
                 place: Some("src/a.rs:7".into()),
                 notes: vec![note("sam", "Why?", 30)],
+                hidden: 0,
             },
             crate::model::Discussion {
                 id: String::new(),
@@ -2805,6 +2868,7 @@ mod tests {
                 resolved: false,
                 place: None,
                 notes: vec![note("alex", "Nice.", 20)],
+                hidden: 0,
             },
             crate::model::Discussion {
                 id: "gid://gitlab/Discussion/bbb".into(),
@@ -2812,6 +2876,7 @@ mod tests {
                 resolved: true,
                 place: None,
                 notes: vec![note("sam", "Typo.", 10)],
+                hidden: 0,
             },
         ]
     }
@@ -3194,6 +3259,7 @@ mod tests {
                     created: Some(50),
                     system: false,
                 }],
+                hidden: 0,
             },
         );
         reload(&mut app, &key, list);
@@ -3707,6 +3773,105 @@ mod tests {
         assert!(app.compose.is_none());
     }
 
+    thread_local! {
+        /// What the test opener was asked to open, per test thread.
+        static OPENED: std::cell::RefCell<Vec<(String, String)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// An opener that starts nothing and only notes what it got.
+    fn opens(opener: &str, url: &str) -> bool {
+        OPENED.with(|o| o.borrow_mut().push((opener.into(), url.into())));
+        true
+    }
+
+    fn cannot_open(opener: &str, url: &str) -> bool {
+        opens(opener, url);
+        false
+    }
+
+    fn opened() -> Vec<String> {
+        OPENED.with(|o| o.borrow().iter().map(|(_, url)| url.clone()).collect())
+    }
+
+    /// The help open on a 100x42 pane, drawn once, and where its link to
+    /// the repository is.
+    fn help_with_link(opener: Opener) -> (App, Rect) {
+        let mut app = app();
+        app.opener = opener;
+        app.help = true;
+        screen_text(&mut app, 100, 42);
+        let spot = app
+            .hits
+            .iter()
+            .find_map(|(r, h)| matches!(h, Hit::Link(_)).then_some(*r))
+            .expect("a link in the help");
+        (app, spot)
+    }
+
+    #[test]
+    fn clicking_the_version_in_the_help_opens_the_repository() {
+        let (mut app, spot) = help_with_link(opens);
+        click(&mut app, spot.x + spot.width - 1, spot.y);
+        assert_eq!(opened(), ["https://github.com/nolvane/herdr-git-panel"]);
+        assert_eq!(OPENED.with(|o| o.borrow()[0].0.clone()), OPENER);
+        assert!(!app.help, "the help closes");
+        assert_eq!(flash(&app), Some("Opened in the browser"));
+        // Its first cell counts too.
+        let (mut app, spot) = help_with_link(opens);
+        click(&mut app, spot.x, spot.y);
+        assert_eq!(opened().len(), 2);
+        assert!(!app.help);
+    }
+
+    #[test]
+    fn a_failing_opener_is_named_and_the_list_goes_on() {
+        let (mut app, spot) = help_with_link(cannot_open);
+        click(&mut app, spot.x, spot.y);
+        assert!(!app.help);
+        assert_eq!(
+            flash(&app),
+            Some(format!("Could not run {OPENER}").as_str())
+        );
+        press(&mut app, KeyCode::Down);
+        assert!(!app.quit);
+    }
+
+    #[test]
+    fn other_clicks_and_keys_only_close_the_help() {
+        let (mut app, spot) = help_with_link(opens);
+        // On the border next to the version, inside the box, outside it.
+        for (x, y) in [
+            (spot.x - 1, spot.y),
+            (spot.right(), spot.y),
+            (50, 20),
+            (0, 0),
+        ] {
+            app.help = true;
+            screen_text(&mut app, 100, 42);
+            click(&mut app, x, y);
+            assert!(!app.help, "{x},{y}");
+        }
+        // A right click on the version only closes it too.
+        app.help = true;
+        screen_text(&mut app, 100, 42);
+        app.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: spot.x,
+            row: spot.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(!app.help);
+        for key in [KeyCode::Enter, KeyCode::Char('o'), KeyCode::Esc] {
+            app.help = true;
+            screen_text(&mut app, 100, 42);
+            press(&mut app, key);
+            assert!(!app.help, "{key:?}");
+        }
+        assert!(opened().is_empty(), "nothing opened: {:?}", opened());
+        assert_eq!(flash(&app), None);
+    }
+
     #[test]
     fn help_fits_a_middle_sized_pane() {
         let mut app = app();
@@ -3737,6 +3902,183 @@ mod tests {
         assert_eq!(app.mine_state.selected(), Some(2));
         press(&mut app, KeyCode::Char('2'));
         assert_eq!(app.review_state.selected(), Some(1));
+    }
+
+    fn ctrl_r(app: &mut App) {
+        app.key(KeyCode::Char('r'), KeyModifiers::CONTROL);
+    }
+
+    /// `app()` with a failed pipeline on every row.
+    fn failed_app() -> App {
+        let mut app = app();
+        let data = app.data.as_mut().unwrap();
+        let all = data.all.as_mut().unwrap();
+        for mr in data
+            .review
+            .iter_mut()
+            .chain(&mut data.mine)
+            .chain(&mut all.items)
+        {
+            mr.pipeline = Pipeline::Failed;
+        }
+        app
+    }
+
+    #[test]
+    fn ctrl_r_asks_before_starting_a_failed_pipeline_again() {
+        let mut app = failed_app();
+        ctrl_r(&mut app);
+        let c = app.confirm.clone().unwrap();
+        assert_eq!(c.action, Action::Retry);
+        assert_eq!(c.mr.iid, 6, "the selected one");
+        assert!(!app.loading, "nothing refreshes");
+        // n and Esc start nothing.
+        press(&mut app, KeyCode::Char('n'));
+        assert!(app.confirm.is_none());
+        assert_eq!(flash(&app), Some("Cancelled"));
+        ctrl_r(&mut app);
+        press(&mut app, KeyCode::Esc);
+        assert!(app.confirm.is_none());
+        // Plain r still refreshes, and asks nothing.
+        app.loading = true;
+        press(&mut app, KeyCode::Char('r'));
+        assert!(app.confirm.is_none());
+        assert_eq!(flash(&app), Some("Already refreshing"));
+    }
+
+    #[test]
+    fn ctrl_r_works_in_every_section_on_mine_and_others() {
+        let mut app = failed_app();
+        for section in ['1', '2', '3'] {
+            press(&mut app, KeyCode::Char(section));
+            for _ in 0..2 {
+                ctrl_r(&mut app);
+                let c = app.confirm.take();
+                assert_eq!(c.map(|c| c.action), Some(Action::Retry), "{section}");
+                press(&mut app, KeyCode::Down);
+            }
+        }
+        // "All" has my own (7) and someone else's (8).
+        press(&mut app, KeyCode::Char('3'));
+        press(&mut app, KeyCode::Char('g'));
+        for author in ["sam", "me"] {
+            assert_eq!(app.selected().unwrap().author, author);
+            ctrl_r(&mut app);
+            assert!(app.confirm.take().is_some(), "{author}");
+            press(&mut app, KeyCode::Down);
+        }
+    }
+
+    #[test]
+    fn nothing_to_start_again_says_why() {
+        let mut mr = sample_mr(90);
+        for (pipeline, why) in [
+            (
+                Pipeline::Success,
+                "Nothing to start again: the pipeline of !90 passed",
+            ),
+            (
+                Pipeline::Running,
+                "Nothing to start again: the pipeline of !90 is running",
+            ),
+            (
+                Pipeline::Canceled,
+                "Nothing to start again: the pipeline of !90 was cancelled or skipped",
+            ),
+            (
+                Pipeline::Manual,
+                "Nothing to start again: the pipeline of !90 is waiting for a manual job",
+            ),
+            (
+                Pipeline::None,
+                "Nothing to start again: !90 has no pipeline",
+            ),
+        ] {
+            mr.pipeline = pipeline;
+            assert_eq!(nothing_to_retry(&mr).as_deref(), Some(why));
+        }
+        mr.pipeline = Pipeline::Failed;
+        assert_eq!(nothing_to_retry(&mr), None);
+        // The key asks nothing on them.
+        let mut app = app();
+        ctrl_r(&mut app);
+        assert!(app.confirm.is_none());
+        assert_eq!(
+            flash(&app),
+            Some("Nothing to start again: !6 has no pipeline")
+        );
+    }
+
+    #[test]
+    fn ctrl_r_is_refused_on_merged_and_closed_ones() {
+        let mut app = app();
+        let mut data = merged_data(None);
+        data.mine[0].pipeline = Pipeline::Failed;
+        app.status = Status::Merged;
+        app.data = Some(data);
+        app.clamp_selection();
+        ctrl_r(&mut app);
+        assert!(app.confirm.is_none());
+        assert_eq!(flash(&app), Some("!13 is merged"));
+    }
+
+    #[test]
+    fn a_refused_retry_says_why_and_refreshes_nothing() {
+        let mut app = failed_app();
+        app.act_tx
+            .send(Err("GitLab: Insufficient permissions".into()))
+            .unwrap();
+        app.receive_actions();
+        assert_eq!(flash(&app), Some("GitLab: Insufficient permissions"));
+        assert!(!app.loading, "the CI dot stays as it was");
+    }
+
+    #[test]
+    fn left_out_footer_hints_keep_their_keys() {
+        let mut app = app();
+        app.updated_at = Some(Instant::now());
+        let screen = screen_text(&mut app, 60, 20);
+        let footer = screen.lines().last().unwrap();
+        assert!(!footer.contains("q close"), "{footer}");
+        assert!(!footer.contains("all keys"), "{footer}");
+        press(&mut app, KeyCode::Char('q'));
+        assert!(app.ask_quit, "q still asks to close");
+        let screen = screen_text(&mut app, 60, 20);
+        assert!(screen.contains("Close the git panel?"), "{screen}");
+        press(&mut app, KeyCode::Char('n'));
+        assert!(!app.ask_quit);
+        press(&mut app, KeyCode::Char('?'));
+        assert!(app.help, "? still opens all keys");
+    }
+
+    #[test]
+    fn a_shown_footer_hint_still_clicks_on_a_narrow_pane() {
+        let mut app = app();
+        app.updated_at = Some(Instant::now());
+        let screen = screen_text(&mut app, 70, 20);
+        let footer = screen.lines().last().unwrap();
+        let x = footer[..footer.find("? all").unwrap()].chars().count() as u16;
+        assert!(!footer.contains("q close"), "{footer}");
+        click(&mut app, x, 19);
+        assert!(app.help, "{footer}");
+    }
+
+    #[test]
+    fn confirm_bar_is_unchanged_on_a_narrow_pane() {
+        let mut app = app();
+        app.updated_at = Some(Instant::now());
+        let mr = sample_mr(1);
+        app.confirm = Some(Confirm {
+            action: Action::Approve,
+            mr,
+        });
+        let screen = screen_text(&mut app, 60, 20);
+        let footer = screen.lines().last().unwrap();
+        assert!(
+            footer.contains("y yes") && footer.contains("n no"),
+            "{footer}"
+        );
+        assert!(!footer.contains("open"), "{footer}");
     }
 
     /// A login stamp; another number is another login.

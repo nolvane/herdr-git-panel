@@ -460,6 +460,7 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
                 ("v", "approve / take approval back"),
                 ("!", "request changes, with a reason (then y)"),
                 ("m", "merge (when GitLab or GitHub allows it)"),
+                ("Ctrl+r", "open ones: start failed jobs again (then y)"),
                 ("w", "your own: draft / ready for review"),
                 ("", "b v ! m w: open ones only"),
                 ("y", "copy the link"),
@@ -583,6 +584,41 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
         frame.render_widget(Paragraph::new(lines), *part);
     }
     app.hits.push((full, Hit::Help));
+    // The version in the bottom border, linked to the repository. It takes
+    // no row, so it stays when the box is cut to a short pane; a narrow box
+    // drops the address, then the name, and one too narrow for the version
+    // itself shows nothing. Pushed after `Hit::Help`, so a
+    // click on it finds the link first.
+    if area.height >= 3 {
+        let version = env!("CARGO_PKG_VERSION");
+        let url = env!("CARGO_PKG_REPOSITORY");
+        let address = url.trim_start_matches("https://");
+        // Both corners, a dash on each side and the spaces around it.
+        let room = area.width.saturating_sub(4) as usize;
+        let shown = [
+            format!("Herdr Git Panel {version} · {address}"),
+            format!("Herdr Git Panel {version}"),
+            version.to_string(),
+        ]
+        .into_iter()
+        .map(|t| {
+            Line::from(vec![
+                Span::raw(" "),
+                Span::styled(t, Style::new().fg(BLUE).add_modifier(Modifier::UNDERLINED)),
+                Span::raw(" "),
+            ])
+        })
+        .find(|l| l.width() <= room);
+        if let Some(shown) = shown {
+            let width = shown.width() as u16;
+            let y = area.bottom() - 1;
+            frame.render_widget(shown, Rect::new(area.x + 2, y, width, 1));
+            // Only the words, not the spaces around them.
+            let spot = Rect::new(area.x + 3, y, width - 2, 1);
+            app.hits.push((spot, Hit::Link(app.links.len())));
+            app.links.push(url.to_string());
+        }
+    }
 }
 
 /// The list's title: "Merge requests" (or "Pull requests") for open ones,
@@ -1327,7 +1363,7 @@ fn draw_details(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
             Span::styled(format!("{} ", mr.author), Style::new().fg(TEXT)),
             Span::styled(
                 mr.created
-                    .map(|t| format!(" opened {} ago", time::age(time::now() - t)))
+                    .map(|t| format!(" opened {}", time::ago(time::now() - t)))
                     .unwrap_or_default(),
                 Style::new().fg(FAINT),
             ),
@@ -1384,13 +1420,20 @@ fn draw_details(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
     };
     lines.extend(field("Threads", vec![threads]));
     let (picon, pcolor) = icons.pipeline(mr.pipeline);
-    lines.extend(field(
-        "Pipeline",
-        vec![Span::styled(
-            format!("{picon} {}", pipeline_word(mr.pipeline)),
-            Style::new().fg(pcolor),
-        )],
-    ));
+    let mut pipeline = vec![Span::styled(
+        format!("{picon} {}", pipeline_word(mr.pipeline)),
+        Style::new().fg(pcolor),
+    )];
+    // Only a failed one of the open ones can be started again (Ctrl+r).
+    if mr.pipeline == Pipeline::Failed && mr.status == Status::Open {
+        pipeline.push(Span::raw("   "));
+        pipeline.push(Span::styled(
+            "Ctrl+r",
+            Style::new().fg(MUTED).add_modifier(Modifier::BOLD),
+        ));
+        pipeline.push(Span::styled(" start again", Style::new().fg(FAINT)));
+    }
+    lines.extend(field("Pipeline", pipeline));
     if let (Some(a), Some(d)) = (mr.additions, mr.deletions) {
         lines.extend(field(
             "Changes",
@@ -1675,10 +1718,7 @@ fn activity_lines(
         return (lines, hits, None, urls);
     }
 
-    let age = |t: Option<i64>| {
-        t.map(|t| format!("{} ago", time::age(time::now() - t)))
-            .unwrap_or_default()
-    };
+    let age = |t: Option<i64>| t.map(|t| time::ago(time::now() - t)).unwrap_or_default();
     let mut last_was_system = false;
     for (index, d) in shown {
         // GitLab's own notes: one dim line each, grouped.
@@ -1798,6 +1838,28 @@ fn activity_lines(
                 spans.extend(l.spans);
                 lines.push(Line::from(spans));
             }
+            // Replies between the first note and the newest ones that were
+            // not loaded.
+            if i == 0 && d.hidden > 0 {
+                let what = if d.hidden == 1 { "reply" } else { "replies" };
+                let gap = text::wrap(
+                    vec![Span::styled(
+                        format!("… {} earlier {what} not shown", d.hidden),
+                        Style::new().fg(FAINT),
+                    )],
+                    width.saturating_sub(2),
+                    Span::raw(""),
+                    Span::raw("  "),
+                );
+                for l in gap {
+                    if d.resolvable {
+                        hits.push((lines.len(), 0, width, Hit::Thread(index)));
+                    }
+                    let mut spans = vec![bar.clone(), Span::raw(" ")];
+                    spans.extend(l.spans);
+                    lines.push(Line::from(spans));
+                }
+            }
         }
     }
     (lines, hits, selected_line, urls)
@@ -1842,6 +1904,10 @@ fn draw_footer(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
             Action::Approve => "Approve",
             Action::Revoke => "Revoke your approval of",
             Action::Merge => "Merge",
+            Action::Retry if c.mr.forge == crate::model::Forge::GitLab => {
+                "Start the failed jobs of"
+            }
+            Action::Retry => "Start the failed checks of",
         };
         let question = format!(
             " {verb} {} {}? ",
@@ -1949,12 +2015,15 @@ fn draw_footer(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
     let mut x = left_area.x + 1;
     for (key, what, click) in keys {
         let text = format!(" {what}  ");
-        let width = (key.chars().count() + text.chars().count()) as u16;
+        let width = (Span::raw(key).width() + Span::raw(text.as_str()).width()) as u16;
+        // A hint that does not fit is left out whole, and so is every one
+        // after it; its two trailing blanks keep it off "r refresh".
+        if x + width > left_area.x + left_area.width {
+            break;
+        }
         if let Some(c) = click {
-            if x + width <= left_area.x + left_area.width {
-                app.hits
-                    .push((Rect::new(x, area.y, width - 2, 1), Hit::Key(c)));
-            }
+            app.hits
+                .push((Rect::new(x, area.y, width - 2, 1), Hit::Key(c)));
         }
         x += width;
         spans.push(Span::styled(
@@ -2639,6 +2708,36 @@ mod tests {
     }
 
     #[test]
+    fn approvals_without_approval_rules_show_who_approved() {
+        // GitLab Community Edition: no approval rules, so nothing "of needed".
+        let mut approved = sample_mr(2, ReviewState::Unreviewed, Pipeline::Success);
+        approved.approvals_given = 1;
+        approved.approved_by = vec!["alex".into()];
+        approved.approved = true;
+        let open = sample_mr(1, ReviewState::Unreviewed, Pipeline::Success);
+        let mut app = app_with(vec![], vec![approved.clone(), open.clone()], false);
+        let icons = Icons { nerd: false };
+        let cell = |mr: &MergeRequest, app: &App| {
+            let line = cell_line(Col::Approvals, mr, app, &icons);
+            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            (text, line.spans[0].style.fg)
+        };
+        assert_eq!(cell(&approved, &app), ("✓ 1".to_string(), Some(GREEN)));
+        assert_eq!(cell(&open, &app), ("0".to_string(), Some(FAINT)));
+        app.details = true;
+        for (row, says) in [(0, "approved by alex"), (1, "not approved yet")] {
+            app.mine_state.select(Some(row));
+            let rows = screen(&mut app, 160, 40);
+            let line = rows
+                .iter()
+                .find(|r| r.contains("Approvals") && !r.contains("Updated"))
+                .unwrap_or_else(|| panic!("{rows:#?}"));
+            assert!(line.contains(says), "{line}");
+            assert!(!rows.iter().any(|r| r.contains("waiting for")), "{rows:#?}");
+        }
+    }
+
+    #[test]
     fn details_of_a_merged_one_offer_no_writes() {
         let with_clone = |app: &mut App| {
             app.details = true;
@@ -2760,6 +2859,108 @@ mod tests {
         }
     }
 
+    /// The help drawn on a pane of this size: every row as text, and where
+    /// the link to the repository is (its area and its target).
+    fn help_link(app: &mut App, width: u16, height: u16) -> (Vec<String>, Option<(Rect, String)>) {
+        app.help = true;
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let rows = (0..height).map(|y| row_text(&buf, y)).collect();
+        let link = app.hits.iter().rev().find_map(|(r, h)| match h {
+            Hit::Link(i) => Some((*r, app.links[*i].clone())),
+            _ => None,
+        });
+        (rows, link)
+    }
+
+    const REPOSITORY: &str = "https://github.com/nolvane/herdr-git-panel";
+
+    #[test]
+    fn help_shows_the_version_linked_in_its_bottom_border() {
+        let version = env!("CARGO_PKG_VERSION");
+        for (w, h) in [(120, 50), (100, 42), (70, 60)] {
+            let mut app = app_with(vec![], vec![], false);
+            let (rows, link) = help_link(&mut app, w, h);
+            let (spot, url) = link.unwrap_or_else(|| panic!("{w}x{h}: no link\n{rows:#?}"));
+            assert_eq!(url, REPOSITORY, "{w}x{h}");
+            let row = &rows[spot.y as usize];
+            assert!(
+                row.contains('╰') && row.contains('╯'),
+                "{w}x{h}: on the bottom border: {row}"
+            );
+            let shown: String = row
+                .chars()
+                .skip(spot.x as usize)
+                .take(spot.width as usize)
+                .collect();
+            assert_eq!(
+                shown,
+                format!("Herdr Git Panel {version} · github.com/nolvane/herdr-git-panel"),
+                "{w}x{h}"
+            );
+        }
+    }
+
+    #[test]
+    fn help_keeps_the_version_on_short_and_narrow_panes() {
+        let version = env!("CARGO_PKG_VERSION");
+        // Shorter than the help: the box is cut, its border stays.
+        let mut app = app_with(vec![], vec![], false);
+        let (rows, link) = help_link(&mut app, 70, 20);
+        let (spot, url) = link.expect("link on a short pane");
+        assert_eq!(url, REPOSITORY);
+        assert_eq!(spot.y, 19, "the last row is the border");
+        assert!(
+            rows[19].contains(&format!("Herdr Git Panel {version}")),
+            "{}",
+            rows[19]
+        );
+        // Narrower than the whole line: the version stays, inside the box.
+        for w in [40, 20, 12] {
+            let mut app = app_with(vec![], vec![], false);
+            let (rows, link) = help_link(&mut app, w, 30);
+            let (spot, url) = link.unwrap_or_else(|| panic!("{w}: no link\n{rows:#?}"));
+            assert_eq!(url, REPOSITORY);
+            let row = &rows[spot.y as usize];
+            let shown: String = row
+                .chars()
+                .skip(spot.x as usize)
+                .take(spot.width as usize)
+                .collect();
+            assert!(shown.contains(version), "{w}: {row}");
+            assert!(
+                spot.x > 0 && spot.right() < w,
+                "{w}: inside the corners: {spot:?}"
+            );
+            assert!(row.ends_with('╯'), "{w}: border whole: {row}");
+        }
+        // Too small for a border of its own: no line, no link.
+        let mut app = app_with(vec![], vec![], false);
+        assert!(help_link(&mut app, 70, 2).1.is_none());
+    }
+
+    #[test]
+    fn help_version_line_is_the_same_with_plain_icons() {
+        let mut nerd = app_with(vec![], vec![], false);
+        let mut plain = app_with(vec![], vec![], false);
+        plain.config.nerd_font = false;
+        let (a, la) = help_link(&mut nerd, 120, 50);
+        let (b, lb) = help_link(&mut plain, 120, 50);
+        let (spot, _) = la.clone().unwrap();
+        assert_eq!(la, lb);
+        assert_eq!(a[spot.y as usize], b[spot.y as usize]);
+    }
+
+    #[test]
+    fn closed_help_shows_no_version() {
+        let mut app = app_with(sample_rows(), sample_rows(), false);
+        let rows = screen(&mut app, 120, 20);
+        let version = format!("Herdr Git Panel {}", env!("CARGO_PKG_VERSION"));
+        assert!(rows.iter().all(|r| !r.contains(&version)), "{rows:#?}");
+        assert!(app.links.iter().all(|l| l != REPOSITORY));
+    }
+
     #[test]
     fn help_names_the_state_key() {
         let mut app = app_with(vec![], vec![], false);
@@ -2805,5 +3006,374 @@ mod tests {
         assert!(!offered(&mut app), "not inside Herdr");
         app.herdr = true;
         assert!(offered(&mut app));
+    }
+
+    #[test]
+    fn details_offer_ctrl_r_only_next_to_a_failed_pipeline() {
+        let rows = [
+            Pipeline::Failed,
+            Pipeline::Success,
+            Pipeline::Running,
+            Pipeline::Canceled,
+            Pipeline::Manual,
+            Pipeline::None,
+        ];
+        for pipeline in rows {
+            let mut app = app_with(
+                vec![],
+                vec![sample_mr(1, ReviewState::Unreviewed, pipeline)],
+                false,
+            );
+            app.details = true;
+            app.mine_state.select(Some(0));
+            let shown = screen(&mut app, 160, 40);
+            let line = shown.iter().find(|r| r.contains("Ctrl+r start again"));
+            assert_eq!(
+                line.is_some(),
+                pipeline == Pipeline::Failed,
+                "{pipeline:?}: {shown:#?}"
+            );
+            // On the panel's Pipeline line, behind the state.
+            if let Some(line) = line {
+                assert!(
+                    line.contains("Pipeline") && line.contains("failed   Ctrl+r"),
+                    "{line}"
+                );
+            }
+        }
+        // Merged and closed ones can only be looked at.
+        let mut merged = sample_mr(1, ReviewState::Unreviewed, Pipeline::Failed);
+        merged.status = Status::Merged;
+        let mut app = app_with(vec![], vec![merged], false);
+        app.details = true;
+        app.mine_state.select(Some(0));
+        let shown = screen(&mut app, 160, 40);
+        assert!(!shown.iter().any(|r| r.contains("Ctrl+r")), "{shown:#?}");
+    }
+
+    #[test]
+    fn the_confirm_bar_names_jobs_on_gitlab_and_checks_on_github() {
+        for (forge, question) in [
+            (Forge::GitLab, "Start the failed jobs of !1 Add export?"),
+            (Forge::GitHub, "Start the failed checks of #1 Add export?"),
+        ] {
+            let mut mr = sample_mr(1, ReviewState::Unreviewed, Pipeline::Failed);
+            mr.forge = forge;
+            let mut app = app_with(vec![], vec![mr.clone()], false);
+            app.confirm = Some(crate::app::Confirm {
+                action: Action::Retry,
+                mr,
+            });
+            let shown = screen(&mut app, 120, 20);
+            let footer = shown.last().unwrap();
+            assert!(footer.contains(question), "{footer}");
+            assert!(footer.contains("y yes"), "{footer}");
+        }
+    }
+
+    /// The footer's key hints in today's order, as drawn when they all fit.
+    const HINTS: [&str; 5] = ["⏎ open", "p details", "/ search", "? all keys", "q close"];
+
+    /// The list after a refresh, so the footer shows "updated … ago".
+    fn app_updated() -> App {
+        let mut app = app_with(vec![], sample_rows(), false);
+        app.updated_at = Some(std::time::Instant::now());
+        app
+    }
+
+    /// The footer's hints part: the text in front of "r refresh" (or the
+    /// status), without the leading blank.
+    fn hints_part(footer: &str, status: &str) -> String {
+        let end = footer
+            .find("r refresh")
+            .or_else(|| footer.find(status))
+            .unwrap_or_else(|| panic!("no status in {footer:?}"));
+        footer[..end].to_string()
+    }
+
+    /// Asserts the hints part holds whole hints from the left in today's
+    /// order, with no gap, and returns how many were shown.
+    fn assert_whole_hints(part: &str, footer: &str) -> usize {
+        let mut rest = part.strip_prefix(' ').unwrap_or(part);
+        let mut shown = 0;
+        for hint in HINTS {
+            match rest.strip_prefix(hint) {
+                Some(after) => {
+                    rest = after
+                        .strip_prefix("  ")
+                        .unwrap_or_else(|| panic!("two blanks after {hint:?}: {footer:?}"));
+                    shown += 1;
+                }
+                None => break,
+            }
+        }
+        assert!(rest.trim().is_empty(), "a cut or skipped hint: {footer:?}");
+        shown
+    }
+
+    #[test]
+    fn footer_shows_every_hint_when_wide() {
+        let mut app = app_updated();
+        let footer = screen(&mut app, 120, 20)[19].clone();
+        for hint in HINTS {
+            assert!(footer.contains(hint), "{hint:?} in {footer:?}");
+        }
+        assert!(footer.contains("r refresh"), "{footer}");
+        assert!(footer.contains(" updated "), "{footer}");
+    }
+
+    #[test]
+    fn footer_drops_whole_hints_from_the_right() {
+        let mut last = HINTS.len();
+        for width in (40..=120).rev() {
+            let mut app = app_updated();
+            let footer = screen(&mut app, width, 20)[19].clone();
+            assert!(footer.contains(" updated "), "{width}: {footer}");
+            // "close" shows whole with its blanks, or not at all.
+            assert!(
+                !footer.contains("clos") || footer.contains("q close  "),
+                "{width}: {footer}"
+            );
+            let part = hints_part(&footer, "updated");
+            let shown = assert_whole_hints(&part, &footer);
+            // Two blank cells (at least) before "r refresh".
+            assert!(part.ends_with("  "), "{width}: {footer:?}");
+            assert!(shown <= last, "{width}: narrower shows no more hints");
+            last = shown;
+        }
+        assert!(last < HINTS.len(), "40 cells leaves some out");
+    }
+
+    #[test]
+    fn footer_at_the_reported_width_drops_close_whole() {
+        for width in 76..=78 {
+            let mut app = app_updated();
+            let footer = screen(&mut app, width, 20)[19].clone();
+            assert!(!footer.contains("clos"), "{width}: {footer}");
+            assert!(footer.contains("? all keys"), "{width}: {footer}");
+        }
+    }
+
+    #[test]
+    fn help_names_ctrl_r() {
+        let mut app = app_with(vec![], vec![], false);
+        app.help = true;
+        let rows = screen(&mut app, 120, 50);
+        assert!(
+            rows.iter().any(|r| r.contains("Ctrl+r")
+                && r.contains("open ones: start failed jobs again (then y)")),
+            "{rows:#?}"
+        );
+    }
+
+    #[test]
+    fn footer_hints_make_room_for_a_long_status_and_come_back() {
+        let mut app = app_updated();
+        app.error = Some("GitLab: the merge request list could not be loaded".into());
+        let footer = screen(&mut app, 90, 20)[19].clone();
+        assert!(footer.contains("could not be loaded"), "{footer}");
+        let shown = assert_whole_hints(&hints_part(&footer, "GitLab:"), &footer);
+        assert!(shown < HINTS.len(), "{footer}");
+        for (status, flash) in [
+            ("\u{f46a} refreshing", false),
+            ("Opened in the browser", true),
+        ] {
+            let mut app = app_updated();
+            if flash {
+                app.flash = Some((status.into(), std::time::Instant::now()));
+            } else {
+                app.loading = true;
+            }
+            let footer = screen(&mut app, 60, 20)[19].clone();
+            assert!(footer.contains(status), "{footer}");
+            assert_whole_hints(&hints_part(&footer, status), &footer);
+        }
+        app.error = None;
+        let footer = screen(&mut app, 90, 20)[19].clone();
+        let back = assert_whole_hints(&hints_part(&footer, "updated"), &footer);
+        assert_eq!(back, HINTS.len(), "{footer}");
+    }
+
+    #[test]
+    fn left_out_hints_cannot_be_clicked() {
+        let mut app = app_updated();
+        let footer = screen(&mut app, 60, 20)[19].clone();
+        assert!(!footer.contains("q close"), "{footer}");
+        let keys: Vec<char> = app
+            .hits
+            .iter()
+            .filter(|(r, _)| r.y == 19)
+            .filter_map(|(_, h)| match h {
+                Hit::Key(c) => Some(*c),
+                _ => None,
+            })
+            .collect();
+        assert!(!keys.contains(&'q'), "{keys:?}");
+        assert!(keys.contains(&'o') && keys.contains(&'r'), "{keys:?}");
+        // From the end of the last shown hint up to "r refresh", where the
+        // left-out hints would be: no click area on any cell.
+        let cell = |text: &str| footer[..footer.find(text).unwrap()].chars().count() as u16;
+        for x in cell("/ search") + 8..cell("r refresh") {
+            assert!(
+                !app.hits
+                    .iter()
+                    .any(|(r, _)| r.y == 19 && r.x <= x && x < r.x + r.width),
+                "{x}: {:?}",
+                app.hits
+            );
+        }
+        // A shown hint still opens: "/" starts a search.
+        let slash = cell("/ search");
+        let (rect, hit) = *app
+            .hits
+            .iter()
+            .find(|(r, _)| r.y == 19 && r.x == slash)
+            .expect("click area of / search");
+        assert_eq!(hit, Hit::Key('/'));
+        assert!(rect.width >= 1);
+    }
+
+    /// The text of each line `activity_lines` gives for `list`.
+    fn activity_text(list: Vec<crate::model::Discussion>) -> Vec<String> {
+        let activity = Activity::Loaded(list);
+        let (lines, _, _, _) =
+            activity_lines(Some(&activity), "me", 80, ThreadFilter::All, None, true);
+        lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect()
+    }
+
+    fn note_at(author: &str, body: &str, created: i64) -> crate::model::Note {
+        crate::model::Note {
+            author: author.into(),
+            body: body.into(),
+            created: Some(created),
+            system: false,
+        }
+    }
+
+    #[test]
+    fn fresh_notes_say_now_without_ago() {
+        let now = time::now();
+        let rows = activity_text(vec![
+            crate::model::Discussion {
+                id: String::new(),
+                resolvable: false,
+                resolved: false,
+                place: None,
+                notes: vec![note_at("sam", "Just now.", now - 5)],
+                hidden: 0,
+            },
+            crate::model::Discussion {
+                id: String::new(),
+                resolvable: false,
+                resolved: false,
+                place: None,
+                notes: vec![note_at("kim", "A bit ago.", now - 300)],
+                hidden: 0,
+            },
+            crate::model::Discussion {
+                id: String::new(),
+                resolvable: false,
+                resolved: false,
+                place: None,
+                notes: vec![crate::model::Note {
+                    system: true,
+                    ..note_at("alex", "added 2 commits", now + 20)
+                }],
+                hidden: 0,
+            },
+        ]);
+        assert!(!rows.iter().any(|r| r.contains("now ago")), "{rows:#?}");
+        assert!(
+            rows.iter().any(|r| r.contains("sam") && r.ends_with("now")),
+            "{rows:#?}"
+        );
+        assert!(rows.iter().any(|r| r.contains("kim  5m ago")), "{rows:#?}");
+        assert!(
+            rows.iter()
+                .any(|r| r.contains("added 2 commits") && r.ends_with("now")),
+            "clock skew: {rows:#?}"
+        );
+    }
+
+    #[test]
+    fn a_cut_thread_says_how_many_replies_are_not_shown() {
+        let now = time::now();
+        let thread = |hidden| crate::model::Discussion {
+            id: "gid://gitlab/Discussion/abc".into(),
+            resolvable: true,
+            resolved: false,
+            place: Some("src/a.rs:12".into()),
+            notes: vec![
+                note_at("alex", "First.", now - 7200),
+                note_at("sam", "Newest.", now - 60),
+            ],
+            hidden,
+        };
+        let rows = activity_text(vec![thread(12)]);
+        let first = rows.iter().position(|r| r.contains("First.")).unwrap();
+        let gap = rows
+            .iter()
+            .position(|r| r.contains("… 12 earlier replies not shown"))
+            .expect("the gap line");
+        let newest = rows.iter().position(|r| r.contains("↳ sam")).unwrap();
+        assert!(first < gap && gap < newest, "{rows:#?}");
+        // The header keeps its place and its button.
+        assert!(
+            rows.iter()
+                .any(|r| r.contains("src/a.rs:12") && r.contains(" Resolve ")),
+            "{rows:#?}"
+        );
+        let rows = activity_text(vec![thread(1)]);
+        assert!(
+            rows.iter()
+                .any(|r| r.contains("… 1 earlier reply not shown")),
+            "{rows:#?}"
+        );
+        let rows = activity_text(vec![thread(0)]);
+        assert!(!rows.iter().any(|r| r.contains("not shown")), "{rows:#?}");
+        // A narrow pane wraps the line instead of cutting it.
+        let activity = Activity::Loaded(vec![thread(12)]);
+        let (lines, _, _, _) =
+            activity_lines(Some(&activity), "me", 20, ThreadFilter::All, None, true);
+        let rows: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        let gap = rows.iter().position(|r| r.contains("… 12")).unwrap();
+        assert!(
+            rows[gap..gap + 3].iter().all(|r| r.chars().count() <= 20),
+            "{rows:#?}"
+        );
+        let words: Vec<&str> = rows.iter().flat_map(|r| r.split_whitespace()).collect();
+        assert!(
+            words.join(" ").contains("… 12 earlier replies not shown"),
+            "{rows:#?}"
+        );
+    }
+
+    #[test]
+    fn a_fresh_merge_request_was_opened_now() {
+        let overview = |created| {
+            let mut mr = sample_mr(1, ReviewState::Unreviewed, Pipeline::None);
+            mr.created = Some(created);
+            let mut app = app_with(vec![], vec![mr], false);
+            app.details = true;
+            app.mine_state.select(Some(0));
+            screen(&mut app, 160, 40)
+        };
+        let rows = overview(time::now() - 5);
+        assert!(
+            rows.iter().any(|r| r.contains("alex  opened now")),
+            "{rows:#?}"
+        );
+        assert!(!rows.iter().any(|r| r.contains("now ago")), "{rows:#?}");
+        let rows = overview(time::now() - 300);
+        assert!(
+            rows.iter().any(|r| r.contains("opened 5m ago")),
+            "{rows:#?}"
+        );
     }
 }

@@ -5,23 +5,37 @@ use crate::cli;
 use crate::model::*;
 use crate::time;
 use serde_json::Value;
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::path::PathBuf;
+use std::sync::{LazyLock, Mutex};
 use std::time::SystemTime;
+
+/// The fields of a merge request that only GitLab's Enterprise Edition has
+/// (also gitlab.com and an unlicensed self-managed one): approval rules.
+/// Community Edition rejects a query that asks for them, so they are one
+/// exact piece of [`mr_fragment`] that [`without_approval_rules`] takes out.
+macro_rules! approval_rule_fields {
+    () => {
+        "\n  approvalsRequired approvalState { rules { name type approved approvalsRequired } }"
+    };
+}
 
 /// The fields the list shows of a merge request, for every query that loads
 /// merge requests.
 macro_rules! mr_fragment {
     () => {
-        r#"
+        concat!(
+            r#"
 fragment mr on MergeRequest {
   iid title description webUrl draft state createdAt updatedAt sourceBranch targetBranch diffHeadSha
   sourceProjectId targetProjectId
   project { fullPath }
   author { username }
-  approved approvalsRequired approvalsLeft
-  approvedBy { nodes { username } }
-  approvalState { rules { name type approved approvalsRequired } }
+  approved
+  approvedBy { nodes { username } }"#,
+            approval_rule_fields!(),
+            r#"
   reviewers { nodes { username mergeRequestInteraction { reviewState } } }
   detailedMergeStatus
   resolvableDiscussionsCount resolvedDiscussionsCount
@@ -30,6 +44,7 @@ fragment mr on MergeRequest {
   diffStatsSummary { additions deletions }
 }
 "#
+        )
     };
 }
 
@@ -197,7 +212,7 @@ pub fn fetch_all_of(
 ) -> Result<Option<AllPart>, String> {
     if let Some(path) = project {
         let query = PROJECT_ALL.replace("STATE", state_word(status));
-        let Some(value) = user_graphql(host, &query, &[("project", path)])? else {
+        let Some(value) = mr_graphql(host, &query, &[("project", path)])? else {
             return Ok(None);
         };
         return parse_project_all(&value, host).map(Some);
@@ -213,7 +228,7 @@ pub fn fetch_all_of(
             .chunks(PROJECTS_PER_REQUEST)
             .map(|chunk| {
                 let query = member_query(chunk, pick.after.as_deref(), status);
-                scope.spawn(move || user_graphql(host, &query, &[]))
+                scope.spawn(move || mr_graphql(host, &query, &[]))
             })
             .collect();
         runs.into_iter()
@@ -355,7 +370,7 @@ fn query(
     // Only a query that declares `$project` may get it.
     let project = project.filter(|_| status != Status::Open);
     let vars: Vec<(&str, &str)> = project.map(|p| ("project", p)).into_iter().collect();
-    user_graphql(host, &list_query(list, status, project.is_some()), &vars)
+    mr_graphql(host, &list_query(list, status, project.is_some()), &vars)
 }
 
 /// Why a GitLab request failed.
@@ -365,9 +380,29 @@ enum Failure {
     Other(String),
 }
 
+/// Why `host` cannot go to glab: it ends in a port, which glab refuses in
+/// `--hostname` and keeps in its own login as the API host instead.
+fn port_error(host: &str) -> Option<String> {
+    let (name, port) = host.rsplit_once(':')?;
+    // A name before the port, itself without one (not an IPv6 address).
+    if name.is_empty() || name.contains(':') || port.is_empty() {
+        return None;
+    }
+    if !port.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(format!(
+        "gitlab_host takes the host name without the port: set gitlab_host = \"{name}\" \
+         and log glab in with glab auth login --hostname {name} --api-host {host}"
+    ))
+}
+
 /// Runs a GraphQL query through glab, with variables, and returns GitLab's
 /// JSON answer.
 fn request(host: &str, query: &str, vars: &[(&str, &str)]) -> Result<Value, Failure> {
+    if let Some(e) = port_error(host) {
+        return Err(Failure::Other(e));
+    }
     let mut cmd = cli::command("glab");
     cmd.args(["api", "graphql", "--hostname", host, "-f"])
         .arg(format!("query={query}"));
@@ -384,12 +419,12 @@ fn answer(out: &cli::Output, host: &str) -> Result<Value, Failure> {
     if let Ok(value) = serde_json::from_slice::<Value>(&out.stdout) {
         // A refusal comes without data; one error next to data is not one.
         let no_data = value.get("data").is_none_or(Value::is_null);
-        if refused(&value) && (!out.success || no_data) {
+        if cli::refused(&value) && (!out.success || no_data) {
             return Err(Failure::NotLoggedIn);
         }
         return Ok(value);
     }
-    if !out.success && refused_stderr(&out.stderr) {
+    if !out.success && cli::not_logged_in(&out.stderr) {
         return Err(Failure::NotLoggedIn);
     }
     if !out.success {
@@ -400,44 +435,6 @@ fn answer(out: &cli::Output, host: &str) -> Result<Value, Failure> {
         )));
     }
     Err(Failure::Other("unreadable answer from GitLab".into()))
-}
-
-/// Whether GitLab's JSON answer refuses the token: without one, or with
-/// one it no longer takes, it answers 401 with exactly "Invalid token"
-/// (GraphQL), `invalid_token` (an expired OAuth token) or "401
-/// Unauthorized" (REST). Whole messages only, so an error that merely
-/// mentions 401 or a token (a query's complexity, an integration) stays an
-/// error.
-fn refused(value: &Value) -> bool {
-    let is = |v: Option<&Value>, word: &str| {
-        v.and_then(Value::as_str)
-            .is_some_and(|m| m.trim().eq_ignore_ascii_case(word))
-    };
-    let errors = value.get("errors").and_then(Value::as_array);
-    errors
-        .into_iter()
-        .flatten()
-        .any(|e| is(e.get("message"), "Invalid token"))
-        || is(value.get("error"), "invalid_token")
-        || is(value.get("message"), "401 Unauthorized")
-}
-
-/// Whether glab's error output, without a JSON answer, says it is not
-/// logged in. Stricter than [`cli::not_logged_in`]: a bare "401" may be
-/// part of a host name, and here it would hide GitLab without a word.
-fn refused_stderr(stderr: &str) -> bool {
-    let lower = stderr.to_lowercase();
-    [
-        "(http 401)",
-        "401 unauthorized",
-        "invalid token",
-        "invalid_token",
-        "not logged in",
-        "not authenticated",
-        "auth login",
-    ]
-    .iter()
-    .any(|w| lower.contains(w))
 }
 
 /// [`request`] for one merge request the user acts on: not being logged in
@@ -458,6 +455,75 @@ fn user_graphql(host: &str, query: &str, vars: &[(&str, &str)]) -> Result<Option
         Err(Failure::NotLoggedIn) => Ok(None),
         Err(Failure::Other(e)) => Err(e),
     }
+}
+
+/// Hosts whose GitLab has no approval rules (Community Edition), learned
+/// from their answer while the list runs, so later refreshes ask them
+/// without those fields straight away.
+static WITHOUT_RULES: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Mutex::default);
+
+/// [`user_graphql`] for a query that loads merge requests: without the
+/// approval rule fields on a host that has none.
+fn mr_graphql(host: &str, query: &str, vars: &[(&str, &str)]) -> Result<Option<Value>, String> {
+    with_rules_fallback(host, query, &WITHOUT_RULES, |q| user_graphql(host, q, vars))
+}
+
+/// Sends `query` with `send`, and once more without the approval rule
+/// fields when GitLab says it has none; `known` remembers such hosts.
+fn with_rules_fallback(
+    host: &str,
+    query: &str,
+    known: &Mutex<HashSet<String>>,
+    send: impl Fn(&str) -> Result<Option<Value>, String>,
+) -> Result<Option<Value>, String> {
+    if known.lock().is_ok_and(|hosts| hosts.contains(host)) {
+        return send(&without_approval_rules(query));
+    }
+    let value = send(query)?;
+    if !value.as_ref().is_some_and(lacks_approval_rules) {
+        return Ok(value);
+    }
+    let short = without_approval_rules(query);
+    // Nothing to leave out: the same request would fail the same way.
+    if short == query {
+        return Ok(value);
+    }
+    if let Ok(mut hosts) = known.lock() {
+        hosts.insert(host.to_string());
+    }
+    send(&short)
+}
+
+/// The query without the fields only Enterprise Edition has.
+fn without_approval_rules(query: &str) -> String {
+    query.replace(approval_rule_fields!(), "")
+}
+
+/// Whether GitLab refused the query because it lacks the approval rule
+/// fields, in graphql-ruby's words: "Field 'approvalState' doesn't exist on
+/// type 'MergeRequest'". Any other error stays an error.
+fn lacks_approval_rules(value: &Value) -> bool {
+    value
+        .get("errors")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.get("message").and_then(Value::as_str))
+        .any(|m| {
+            // The field named before "doesn't exist", in any quotes, so a
+            // field GitLab merely suggests ("Did you mean …") does not count.
+            let Some((field, kind)) = m.split_once("doesn't exist on type") else {
+                return false;
+            };
+            kind.contains("MergeRequest")
+                && ["approvalsRequired", "approvalState", "approvalsLeft"]
+                    .iter()
+                    .any(|f| {
+                        ['\'', '"', '`']
+                            .iter()
+                            .any(|q| field.contains(&format!("{q}{f}{q}")))
+                    })
+        })
 }
 
 /// Whether GitLab answered without a user and without an error: glab sent
@@ -544,11 +610,15 @@ const ACTIVITY: &str = r#"
 query($project: ID!, $iid: String!) {
   project(fullPath: $project) {
     mergeRequest(iid: $iid) {
-      discussions(first: 100) {
+      discussions(last: 100) {
         nodes {
           id resolvable resolved
-          notes(first: 50) {
-            nodes { body system createdAt author { username } position { filePath newLine oldLine } }
+          head: notes(first: 1) {
+            nodes { id body system createdAt author { username } position { filePath newLine oldLine } }
+          }
+          tail: notes(last: 49) {
+            count
+            nodes { id body system createdAt author { username } position { filePath newLine oldLine } }
           }
         }
       }
@@ -579,20 +649,28 @@ pub fn parse_activity(value: &Value) -> Result<Vec<Discussion>, String> {
     let mut list: Vec<Discussion> = nodes
         .iter()
         .map(|d| {
-            let notes: Vec<Note> = d["notes"]["nodes"]
-                .as_array()
-                .map(|a| {
-                    a.iter()
-                        .map(|n| Note {
-                            author: str_of(&n["author"]["username"]),
-                            body: str_of(&n["body"]),
-                            created: n["createdAt"].as_str().and_then(time::parse_iso),
-                            system: n["system"].as_bool().unwrap_or(false),
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            let first = &d["notes"]["nodes"][0]["position"];
+            let end = |part: &str| -> Vec<(String, Note)> {
+                d[part]["nodes"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .map(|n| {
+                                let note = Note {
+                                    author: str_of(&n["author"]["username"]),
+                                    body: str_of(&n["body"]),
+                                    created: n["createdAt"].as_str().and_then(time::parse_iso),
+                                    system: n["system"].as_bool().unwrap_or(false),
+                                };
+                                (str_of(&n["id"]), note)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            let total = d["tail"]["count"].as_u64().unwrap_or(0) as usize;
+            let (notes, hidden) = thread_notes(end("head"), end("tail"), total);
+            // The thread's place is where its first note is.
+            let first = &d["head"]["nodes"][0]["position"];
             let place = first["filePath"].as_str().map(|path| {
                 match first["newLine"]
                     .as_u64()
@@ -608,6 +686,7 @@ pub fn parse_activity(value: &Value) -> Result<Vec<Discussion>, String> {
                 resolved: d["resolved"].as_bool().unwrap_or(false),
                 place,
                 notes,
+                hidden,
             }
         })
         .filter(|d| !d.notes.is_empty())
@@ -694,12 +773,36 @@ fn note_body(body: &str) -> Vec<u8> {
     serde_json::json!({ "body": body }).to_string().into_bytes()
 }
 
+/// `text` with a backslash in front of every line that starts with `/`
+/// (`\/merge later`). GitLab runs such lines of a note as quick actions;
+/// escaped, it leaves them as text and Markdown shows `/merge later`.
+fn escape_quick_actions(text: &str) -> String {
+    let escaped: Vec<String> = text
+        .split('\n')
+        .map(|line| {
+            if line.starts_with('/') {
+                format!("\\{line}")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect();
+    escaped.join("\n")
+}
+
+/// The request body of a reply or comment: the text as typed, as JSON,
+/// with lines starting with `/` escaped so GitLab runs no command from
+/// them.
+fn text_note_body(body: &str) -> Vec<u8> {
+    note_body(&escape_quick_actions(body))
+}
+
 /// Posts `body` as a reply to a thread (`Some`) or as a comment on the
 /// merge request.
 pub fn post_note(mr: &MergeRequest, thread: Option<&str>, body: &str) -> Result<(), String> {
     let mut cmd = cli::command("glab");
     cmd.args(note_args(&mr.host, &mr.project, mr.iid, thread)?);
-    let out = cli::run_input("glab", cmd, &mr.host, note_body(body))?;
+    let out = cli::run_input("glab", cmd, &mr.host, text_note_body(body))?;
     if out.success {
         Ok(())
     } else {
@@ -718,17 +821,7 @@ const REQUEST_CHANGES: &str = "/submit_review requested_changes";
 /// (an open code block, an HTML block) can hide it; GitLab takes it out
 /// of the posted note.
 fn request_changes_note(reason: &str) -> String {
-    let escaped: Vec<String> = reason
-        .split('\n')
-        .map(|line| {
-            if line.starts_with('/') {
-                format!("\\{line}")
-            } else {
-                line.to_string()
-            }
-        })
-        .collect();
-    format!("{REQUEST_CHANGES}\n\n{}", escaped.join("\n"))
+    format!("{REQUEST_CHANGES}\n\n{}", escape_quick_actions(reason))
 }
 
 /// Whether GitLab ran the quick action of a change request: it takes the
@@ -770,6 +863,74 @@ pub fn merge(mr: &MergeRequest) -> Result<(), String> {
         args.extend(["--sha", mr.head_sha.as_str()]);
     }
     mr_command(mr, &args).map(|_| ())
+}
+
+/// The merge request's head commit and head pipeline now, loaded when a
+/// retry is confirmed (the list loads no pipeline id).
+const RETRY_HEAD: &str = r#"
+query($project: ID!, $iid: String!) {
+  project(fullPath: $project) {
+    mergeRequest(iid: $iid) { diffHeadSha headPipeline { id status } }
+  }
+}
+"#;
+
+/// The id of the head pipeline to start again, from [`RETRY_HEAD`]'s
+/// answer: only while the head is still `shown_head` (the commit the list
+/// showed) and its pipeline still failed. `r` is the reference (`!90`).
+fn retry_target(value: &Value, shown_head: &str, r: &str) -> Result<String, String> {
+    if let Some(msg) = cli::graphql_errors(value) {
+        return Err(format!("GitLab: {msg}"));
+    }
+    let mr = &value["data"]["project"]["mergeRequest"];
+    if mr.is_null() {
+        return Err(format!("GitLab did not return {r}: refresh first (r)"));
+    }
+    if !shown_head.is_empty() && mr["diffHeadSha"].as_str() != Some(shown_head) {
+        return Err(format!(
+            "{r} changed since the list loaded: refresh first (r)"
+        ));
+    }
+    let pipeline = &mr["headPipeline"];
+    let id = str_of(&pipeline["id"]);
+    if pipeline["status"].as_str() != Some("FAILED") || id.is_empty() {
+        return Err(format!(
+            "The pipeline of {r} is no longer failed: refresh first (r)"
+        ));
+    }
+    Ok(id)
+}
+
+/// What GitLab said against `pipelineRetry`, empty when it started.
+fn retry_errors(value: &Value) -> Option<String> {
+    if let Some(msg) = cli::graphql_errors(value) {
+        return Some(format!("GitLab: {msg}"));
+    }
+    let errors: Vec<&str> = value
+        .pointer("/data/pipelineRetry/errors")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    (!errors.is_empty()).then(|| format!("GitLab: {}", errors.join("; ")))
+}
+
+/// Starts the failed (and cancelled) jobs of the merge request's head
+/// pipeline again, only if its head is still the one the list showed.
+pub fn retry_pipeline(mr: &MergeRequest) -> Result<String, String> {
+    let r = mr.reference();
+    let iid = mr.iid.to_string();
+    let head = graphql(
+        &mr.host,
+        RETRY_HEAD,
+        &[("project", &mr.project), ("iid", &iid)],
+    )?;
+    let id = retry_target(&head, &mr.head_sha, &r)?;
+    let mutation = "mutation($id: CiPipelineID!) { pipelineRetry(input: {id: $id}) { errors } }";
+    let value = graphql(&mr.host, mutation, &[("id", &id)])?;
+    match retry_errors(&value) {
+        Some(e) => Err(e),
+        None => Ok(format!("Pipeline of {r} started again")),
+    }
 }
 
 /// Marks the merge request as draft, or as ready.
@@ -953,11 +1114,12 @@ fn parse_mr(n: &Value, host: &str, viewer: &str) -> Option<MergeRequest> {
             _ => Status::Open,
         },
         approvals_given: approved_by,
-        approvals_required: Some(if rules_required > 0 {
-            rules_required
+        // Community Edition has no approval rules and says nothing.
+        approvals_required: if rules_required > 0 {
+            Some(rules_required)
         } else {
-            required
-        }),
+            n.get("approvalsRequired").map(|_| required)
+        },
         approved_by: approver_names,
         approved: n["approved"].as_bool().unwrap_or(false) && (required > 0 || approved_by > 0),
         pending_rules,
@@ -1012,7 +1174,8 @@ mod tests {
     }
 
     #[test]
-    fn note_text_is_sent_as_typed() {
+    fn note_body_wraps_the_text_as_json() {
+        // The plain JSON wrapper; replies and comments also escape `/` lines.
         for body in [
             "@alex please check",
             "@/etc/passwd",
@@ -1022,6 +1185,35 @@ mod tests {
             "\"quotes\" and \\ backslashes",
         ] {
             let sent: Value = serde_json::from_slice(&note_body(body)).unwrap();
+            assert_eq!(sent, json!({ "body": body }));
+        }
+    }
+
+    #[test]
+    fn a_reply_or_comment_runs_no_quick_action() {
+        let sent: Value = serde_json::from_slice(&text_note_body(
+            "/merge later\nok /approve here\n/approve\n /close",
+        ))
+        .unwrap();
+        assert_eq!(
+            sent["body"],
+            "\\/merge later\nok /approve here\n\\/approve\n /close"
+        );
+        let body = sent["body"].as_str().unwrap();
+        assert!(!body.lines().any(|l| l.starts_with('/')));
+    }
+
+    #[test]
+    fn a_reply_or_comment_is_sent_as_typed_otherwise() {
+        for body in [
+            "@alex please check",
+            "@/etc/passwd and a/b",
+            "line one\nline two",
+            "see :branch and :id",
+            "\"quotes\" and \\ backslashes",
+            "Bitte ändern: Grösse, Übersicht 👍",
+        ] {
+            let sent: Value = serde_json::from_slice(&text_note_body(body)).unwrap();
             assert_eq!(sent, json!({ "body": body }));
         }
     }
@@ -1116,7 +1308,7 @@ mod tests {
                 "sourceBranch": "abc-1-export", "targetBranch": "main",
                 "sourceProjectId": 11, "targetProjectId": 11,
                 "project": {"fullPath": "acme/app"}, "author": {"username": "alex"},
-                "approved": false, "approvalsRequired": 1, "approvalsLeft": 1,
+                "approved": false, "approvalsRequired": 1,
                 "approvedBy": {"nodes": []},
                 "approvalState": {"rules": [
                     {"name": "*, /docs/", "type": "CODE_OWNER", "approved": false, "approvalsRequired": 1},
@@ -1133,14 +1325,14 @@ mod tests {
             "authoredMergeRequests": {"nodes": [
                 {"iid": "7", "title": "Old", "webUrl": "u7", "draft": true, "updatedAt": "2026-11-01T08:00:00Z",
                  "project": {"fullPath": "acme/app"}, "author": {"username": "me"},
-                 "approved": true, "approvalsRequired": 0, "approvalsLeft": 0, "approvedBy": {"nodes": []},
+                 "approved": true, "approvalsRequired": 0, "approvedBy": {"nodes": []},
                  "reviewers": {"nodes": []}, "detailedMergeStatus": "DRAFT_STATUS",
                  "resolvableDiscussionsCount": 0, "resolvedDiscussionsCount": 0,
                  "labels": {"nodes": []}, "headPipeline": null, "diffStatsSummary": null},
                 {"iid": "9", "title": "New", "webUrl": "u9", "draft": false, "updatedAt": "2026-11-07T08:00:00Z",
                  "sourceProjectId": 12, "targetProjectId": 11,
                  "project": {"fullPath": "acme/lib"}, "author": {"username": "me"},
-                 "approved": true, "approvalsRequired": 2, "approvalsLeft": 0, "approvedBy": {"nodes": [{"username": "alex"}]},
+                 "approved": true, "approvalsRequired": 2, "approvedBy": {"nodes": [{"username": "alex"}]},
                  "reviewers": {"nodes": [{"username": "alex", "mergeRequestInteraction": {"reviewState": "APPROVED"}}]},
                  "detailedMergeStatus": "MERGEABLE",
                  "resolvableDiscussionsCount": 2, "resolvedDiscussionsCount": 2,
@@ -1182,15 +1374,20 @@ mod tests {
     #[test]
     fn activity_newest_first_with_place() {
         let v = json!({"data": {"project": {"mergeRequest": {"discussions": {"nodes": [
-            {"resolvable": false, "resolved": false, "notes": {"nodes": [
-                {"body": "approved this merge request", "system": true, "createdAt": "2026-11-01T08:00:00Z",
-                 "author": {"username": "alex"}, "position": null}]}},
-            {"id": "gid://gitlab/Discussion/abc", "resolvable": true, "resolved": false, "notes": {"nodes": [
-                {"body": "Why?", "system": false, "createdAt": "2026-11-02T08:00:00Z",
+            {"resolvable": false, "resolved": false,
+             "head": {"nodes": [{"id": "gid://gitlab/Note/1", "body": "approved this merge request", "system": true,
+                 "createdAt": "2026-11-01T08:00:00Z", "author": {"username": "alex"}, "position": null}]},
+             "tail": {"count": 1, "nodes": [{"id": "gid://gitlab/Note/1", "body": "approved this merge request", "system": true,
+                 "createdAt": "2026-11-01T08:00:00Z", "author": {"username": "alex"}, "position": null}]}},
+            {"id": "gid://gitlab/Discussion/abc", "resolvable": true, "resolved": false,
+             "head": {"nodes": [{"id": "gid://gitlab/DiscussionNote/2", "body": "Why?", "system": false, "createdAt": "2026-11-02T08:00:00Z",
+                 "author": {"username": "sam"}, "position": {"filePath": "src/a.rs", "newLine": 12, "oldLine": null}}]},
+             "tail": {"count": 2, "nodes": [
+                {"id": "gid://gitlab/DiscussionNote/2", "body": "Why?", "system": false, "createdAt": "2026-11-02T08:00:00Z",
                  "author": {"username": "sam"}, "position": {"filePath": "src/a.rs", "newLine": 12, "oldLine": null}},
-                {"body": "Because.", "system": false, "createdAt": "2026-11-03T08:00:00Z",
+                {"id": "gid://gitlab/DiscussionNote/3", "body": "Because.", "system": false, "createdAt": "2026-11-03T08:00:00Z",
                  "author": {"username": "me"}, "position": null}]}},
-            {"resolvable": false, "resolved": false, "notes": {"nodes": []}}
+            {"resolvable": false, "resolved": false, "head": {"nodes": []}, "tail": {"count": 0, "nodes": []}}
         ]}}}}});
         let a = parse_activity(&v).unwrap();
         assert_eq!(a.len(), 2);
@@ -1198,6 +1395,71 @@ mod tests {
         assert_eq!(a[0].id, "gid://gitlab/Discussion/abc");
         assert_eq!(a[0].notes.len(), 2);
         assert!(a[1].notes[0].system);
+    }
+
+    /// A note of a discussion as `ACTIVITY` loads it.
+    fn activity_note(id: u32, author: &str, at: &str, position: Value) -> Value {
+        json!({"id": format!("gid://gitlab/DiscussionNote/{id}"), "body": format!("Note {id}"), "system": false,
+               "createdAt": at, "author": {"username": author}, "position": position})
+    }
+
+    #[test]
+    fn activity_loads_the_newest_hundred_threads_with_both_ends() {
+        assert!(ACTIVITY.contains("discussions(last: 100)"), "{ACTIVITY}");
+        assert!(ACTIVITY.contains("head: notes(first: 1)"), "{ACTIVITY}");
+        assert!(
+            ACTIVITY.contains("tail: notes(last: 49) {\n            count\n"),
+            "{ACTIVITY}"
+        );
+    }
+
+    #[test]
+    fn a_short_thread_shows_every_note_once_oldest_first() {
+        let at = |m| format!("2026-11-02T08:{m:02}:00Z");
+        let place = json!({"filePath": "src/a.rs", "newLine": 12, "oldLine": null});
+        let first = activity_note(1, "sam", &at(0), place);
+        let v = json!({"data": {"project": {"mergeRequest": {"discussions": {"nodes": [
+            {"id": "gid://gitlab/Discussion/abc", "resolvable": true, "resolved": false,
+             "head": {"nodes": [first.clone()]},
+             "tail": {"count": 3, "nodes": [first, activity_note(2, "me", &at(1), Value::Null),
+                                            activity_note(3, "sam", &at(2), Value::Null)]}}
+        ]}}}}});
+        let a = parse_activity(&v).unwrap();
+        let bodies: Vec<&str> = a[0].notes.iter().map(|n| n.body.as_str()).collect();
+        assert_eq!(bodies, ["Note 1", "Note 2", "Note 3"]);
+        assert_eq!(a[0].hidden, 0);
+        assert_eq!(a[0].place.as_deref(), Some("src/a.rs:12"));
+    }
+
+    #[test]
+    fn a_long_thread_shows_its_first_note_and_the_newest_replies() {
+        let at = |h: u32, m: u32| format!("2026-11-02T{h:02}:{m:02}:00Z");
+        let place = json!({"filePath": "src/a.rs", "newLine": 12, "oldLine": null});
+        // 60 notes, one a minute: the tail has notes 12 to 60.
+        let tail: Vec<Value> = (12..=60)
+            .map(|i| activity_note(i, "sam", &at(8 + (i - 1) / 60, (i - 1) % 60), Value::Null))
+            .collect();
+        let v = json!({"data": {"project": {"mergeRequest": {"discussions": {"nodes": [
+            // A short thread whose only note is newer than the long thread's first ones.
+            {"id": "gid://gitlab/Discussion/short", "resolvable": true, "resolved": false,
+             "head": {"nodes": [activity_note(100, "kim", &at(8, 30), Value::Null)]},
+             "tail": {"count": 1, "nodes": [activity_note(100, "kim", &at(8, 30), Value::Null)]}},
+            {"id": "gid://gitlab/Discussion/long", "resolvable": true, "resolved": false,
+             "head": {"nodes": [activity_note(1, "alex", &at(8, 0), place)]},
+             "tail": {"count": 60, "nodes": tail}}
+        ]}}}}});
+        let a = parse_activity(&v).unwrap();
+        // Sorted by its real newest reply (08:59), above the short one (08:30).
+        assert_eq!(a[0].id, "gid://gitlab/Discussion/long");
+        let long = &a[0];
+        assert_eq!(long.notes.len(), 50);
+        assert_eq!(long.notes[0].body, "Note 1");
+        assert_eq!(long.notes[0].author, "alex");
+        assert_eq!(long.notes[1].body, "Note 12");
+        assert_eq!(long.notes[49].body, "Note 60");
+        assert_eq!(long.hidden, 10, "notes 2 to 11");
+        assert_eq!(long.place.as_deref(), Some("src/a.rs:12"));
+        assert!(long.resolvable);
     }
 
     /// A merge request node of `project` by `author`, updated at `at`.
@@ -1319,6 +1581,22 @@ mod tests {
             answer(&offline, "git.acme.test"),
             Err(Failure::Other(e)) if e == "Cannot reach git.acme.test: check the connection"
         ));
+    }
+
+    #[test]
+    fn glab_errors_that_mention_401_stay_errors() {
+        let jira = output(false, "", "glab: Jira integration: 401 Unauthorized");
+        assert!(matches!(
+            answer(&jira, "gitlab.com"),
+            Err(Failure::Other(e)) if e == "glab failed: glab: Jira integration: 401 Unauthorized"
+        ));
+        // A GraphQL error that mentions 401 is GitLab's answer, read as such.
+        let complex = output(
+            false,
+            r#"{"errors":[{"message":"Query has complexity of 401, which exceeds max complexity of 250"}]}"#,
+            "glab: Query has complexity of 401, which exceeds max complexity of 250",
+        );
+        assert!(answer(&complex, "gitlab.com").is_ok());
     }
 
     #[test]
@@ -1552,10 +1830,293 @@ mod tests {
         assert_eq!(part.total, 5);
     }
 
+    /// GitLab Community Edition's answer to a query with the approval rule
+    /// fields, as a public server gave it.
+    fn without_rules_error() -> Value {
+        json!({"errors": [
+            {"message": "Field 'approvalsLeft' doesn't exist on type 'MergeRequest' (Did you mean `approved`?)"},
+            {"message": "Field 'approvalState' doesn't exist on type 'MergeRequest' (Did you mean `approved`?)"}
+        ]})
+    }
+
+    /// A Community Edition answer without the approval rule fields: alex
+    /// approved !2, nobody !1.
+    fn community_answer() -> Value {
+        let mut approved = node(2, "acme/app", "me", None, "2026-11-08T09:00:00Z");
+        let mut open = node(1, "acme/app", "sam", Some("me"), "2026-11-08T08:00:00Z");
+        for n in [&mut approved, &mut open] {
+            let o = n.as_object_mut().unwrap();
+            o.remove("approvalsRequired");
+            o.remove("approvalState");
+        }
+        approved["approved"] = json!(true);
+        approved["approvedBy"] = json!({"nodes": [{"username": "alex"}]});
+        json!({"data": {"currentUser": {"username": "me",
+            "authoredMergeRequests": {"nodes": [approved]},
+            "reviewRequestedMergeRequests": {"nodes": [open]}}}})
+    }
+
+    /// Every query that loads merge requests, in every state.
+    fn mr_queries() -> Vec<String> {
+        let mut queries = Vec::new();
+        for status in [Status::Open, Status::Merged, Status::Closed] {
+            for list in ["authoredMergeRequests", "reviewRequestedMergeRequests"] {
+                for scoped in [false, true] {
+                    queries.push(list_query(list, status, scoped));
+                }
+            }
+            queries.push(PROJECT_ALL.replace("STATE", state_word(status)));
+            queries.push(member_query(&["acme/app".into()], None, status));
+        }
+        queries
+    }
+
+    #[test]
+    fn every_merge_request_query_can_leave_out_the_approval_rules() {
+        for q in mr_queries() {
+            assert!(q.contains("approvalsRequired approvalState"), "{q}");
+            let short = without_approval_rules(&q);
+            for field in ["approvalsRequired", "approvalState", "approvalsLeft"] {
+                assert!(!short.contains(field), "{short}");
+            }
+            // What every GitLab edition has stays.
+            assert!(short.contains("approved\n  approvedBy { nodes { username } }"));
+            assert!(short.contains("...mr") && short.contains("fragment mr on MergeRequest"));
+        }
+        assert!(!mr_fragment!().contains("approvalsLeft"), "never read");
+    }
+
+    #[test]
+    fn only_the_missing_approval_fields_count_as_no_rules() {
+        assert!(lacks_approval_rules(&without_rules_error()));
+        assert!(lacks_approval_rules(&json!({"errors": [
+            {"message": "Field 'approvalsRequired' doesn't exist on type 'MergeRequest'"}
+        ]})));
+        assert!(
+            lacks_approval_rules(&json!({"errors": [
+                {"message": "Field \"approvalState\" doesn't exist on type \"MergeRequest\""}
+            ]})),
+            "other quotes"
+        );
+        for message in [
+            "Field 'nope' doesn't exist on type 'MergeRequest'",
+            "Field 'nope' doesn't exist on type 'MergeRequest' (Did you mean `approvalState`?)",
+            "Field 'approvalState' doesn't exist on type 'Project'",
+            "Invalid token",
+            "Internal server error",
+        ] {
+            assert!(
+                !lacks_approval_rules(&json!({"errors": [{"message": message}]})),
+                "{message}"
+            );
+        }
+        assert!(!lacks_approval_rules(&community_answer()));
+    }
+
+    /// Sends through [`with_rules_fallback`] and records each query sent,
+    /// answering `answer(query)`.
+    fn send_all(
+        host: &str,
+        known: &Mutex<HashSet<String>>,
+        answer: impl Fn(&str) -> Result<Option<Value>, String>,
+    ) -> (Result<Option<Value>, String>, Vec<String>) {
+        let sent = std::cell::RefCell::new(Vec::new());
+        let query = list_query("authoredMergeRequests", Status::Open, false);
+        let result = with_rules_fallback(host, &query, known, |q| {
+            sent.borrow_mut().push(q.to_string());
+            answer(q)
+        });
+        (result, sent.into_inner())
+    }
+
+    /// A Community Edition server: refuses the approval rule fields.
+    fn community(q: &str) -> Result<Option<Value>, String> {
+        Ok(Some(if q.contains("approvalState") {
+            without_rules_error()
+        } else {
+            community_answer()
+        }))
+    }
+
+    #[test]
+    fn a_server_without_approval_rules_is_asked_again_without_them() {
+        let known = Mutex::new(HashSet::new());
+        let (result, sent) = send_all("git.acme.test", &known, community);
+        assert_eq!(sent.len(), 2, "once more, without the fields");
+        assert!(sent[0].contains("approvalState") && !sent[1].contains("approvalState"));
+        let data = parse(&result.unwrap().unwrap(), "git.acme.test").unwrap();
+        assert_eq!(data.mine.len(), 1);
+        assert_eq!(data.review.len(), 1);
+        assert!(known.lock().unwrap().contains("git.acme.test"));
+        // Later refreshes ask that host without them straight away.
+        let (result, sent) = send_all("git.acme.test", &known, community);
+        assert_eq!(sent.len(), 1, "{sent:#?}");
+        assert!(!sent[0].contains("approvalState"));
+        assert!(parse(&result.unwrap().unwrap(), "git.acme.test").is_ok());
+        // Another host is asked in full.
+        let (_, sent) = send_all("gitlab.com", &known, |_| Ok(Some(sample())));
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].contains("approvalState"));
+    }
+
+    #[test]
+    fn a_server_with_approval_rules_takes_one_full_request() {
+        let known = Mutex::new(HashSet::new());
+        for _ in 0..2 {
+            let (result, sent) = send_all("gitlab.com", &known, |_| Ok(Some(sample())));
+            assert_eq!(sent.len(), 1);
+            assert!(sent[0].contains(approval_rule_fields!()));
+            let d = parse(&result.unwrap().unwrap(), "gitlab.com").unwrap();
+            assert_eq!(d.review[0].approvals_required, Some(2), "given of needed");
+            assert_eq!(d.review[0].pending_rules, vec!["code owners", "Builders"]);
+        }
+        assert!(known.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn other_errors_are_not_asked_again() {
+        let known = Mutex::new(HashSet::new());
+        let unknown =
+            json!({"errors": [{"message": "Field 'nope' doesn't exist on type 'MergeRequest'"}]});
+        let (result, sent) = send_all("git.acme.test", &known, |_| Ok(Some(unknown.clone())));
+        assert_eq!(sent.len(), 1);
+        let e = parse(&result.unwrap().unwrap(), "git.acme.test").unwrap_err();
+        assert_eq!(
+            e,
+            "GitLab: Field 'nope' doesn't exist on type 'MergeRequest'"
+        );
+        let (result, sent) = send_all("git.acme.test", &known, |_| {
+            Err("git.acme.test did not answer within 30 s".into())
+        });
+        assert_eq!(sent.len(), 1);
+        assert!(result.is_err());
+        let (result, sent) = send_all("git.acme.test", &known, |_| Ok(None));
+        assert_eq!(sent.len(), 1, "not logged in");
+        assert!(result.unwrap().is_none());
+        assert!(known.lock().unwrap().is_empty());
+        // A query without the fields is never sent twice.
+        let short =
+            without_approval_rules(&list_query("authoredMergeRequests", Status::Open, false));
+        let count = std::cell::Cell::new(0);
+        let result = with_rules_fallback("git.acme.test", &short, &known, |_| {
+            count.set(count.get() + 1);
+            Ok(Some(without_rules_error()))
+        });
+        assert_eq!(count.get(), 1);
+        assert!(result.unwrap().is_some());
+    }
+
+    #[test]
+    fn approvals_without_rules_count_who_approved() {
+        let d = parse(&community_answer(), "git.acme.test").unwrap();
+        let (approved, open) = (&d.mine[0], &d.review[0]);
+        assert_eq!(approved.approvals_given, 1);
+        assert_eq!(approved.approvals_required, None, "no 'of needed'");
+        assert!(approved.approved);
+        assert_eq!(approved.approved_by, ["alex"]);
+        assert!(approved.pending_rules.is_empty());
+        assert_eq!(open.approvals_given, 0);
+        assert_eq!(open.approvals_required, None);
+        assert!(!open.approved, "nobody approved");
+        assert!(open.pending_rules.is_empty());
+        // "All" reads the same nodes.
+        let nodes =
+            community_answer()["data"]["currentUser"]["authoredMergeRequests"]["nodes"].clone();
+        let v = json!({"data": {"currentUser": {"username": "me"}, "project": {"fullPath": "acme/app", "mergeRequests": {"count": 1, "nodes": nodes.clone()}}}});
+        let part = parse_project_all(&v, "git.acme.test").unwrap();
+        assert!(part.items[0].approved && part.items[0].approvals_required.is_none());
+        let v = json!({"data": {"currentUser": {"username": "me"}, "projects": {"nodes": [{"mergeRequests": {"nodes": nodes}}]}}});
+        let items = parse_members(&v, "git.acme.test").unwrap();
+        assert!(items[0].approved && items[0].pending_rules.is_empty());
+    }
+
+    #[test]
+    fn a_port_in_gitlab_host_says_how_to_fix_it() {
+        // glab takes no port in --hostname; the list says what to set
+        // instead, without starting glab (#25).
+        let Err(e) = fetch("git.acme.test:8443", Status::Open, None) else {
+            panic!("no error");
+        };
+        assert_eq!(
+            e,
+            "gitlab_host takes the host name without the port: set gitlab_host = \"git.acme.test\" \
+             and log glab in with glab auth login --hostname git.acme.test --api-host git.acme.test:8443"
+        );
+        assert!(!e.contains("invalid hostname"));
+        // Hosts without a port, and values that are no port, go to glab.
+        assert_eq!(port_error("gitlab.com"), None);
+        assert_eq!(port_error("git.acme.test"), None);
+        assert_eq!(port_error("https://git.acme.test"), None);
+        assert_eq!(port_error("git.acme.test:"), None);
+        assert_eq!(port_error(":8443"), None);
+        assert_eq!(port_error("::1"), None);
+    }
+
     #[test]
     fn graphql_errors_are_reported() {
         let e = parse(&json!({"errors": [{"message": "boom"}]}), "gitlab.com").unwrap_err();
         assert!(e.contains("boom"));
+    }
+
+    fn retry_head(sha: &str, status: Option<&str>) -> Value {
+        let pipeline = match status {
+            Some(s) => json!({"id": "gid://gitlab/Ci::Pipeline/4711", "status": s}),
+            None => Value::Null,
+        };
+        json!({"data": {"project": {"mergeRequest": {"diffHeadSha": sha, "headPipeline": pipeline}}}})
+    }
+
+    #[test]
+    fn a_retry_starts_the_failed_head_pipeline_of_the_shown_head() {
+        assert_eq!(
+            retry_target(&retry_head("abc123", Some("FAILED")), "abc123", "!90").as_deref(),
+            Ok("gid://gitlab/Ci::Pipeline/4711")
+        );
+    }
+
+    #[test]
+    fn a_retry_after_a_push_starts_nothing() {
+        assert_eq!(
+            retry_target(&retry_head("def456", Some("FAILED")), "abc123", "!90"),
+            Err("!90 changed since the list loaded: refresh first (r)".into())
+        );
+    }
+
+    #[test]
+    fn a_retry_of_a_pipeline_that_no_longer_failed_starts_nothing() {
+        for status in [Some("RUNNING"), Some("SUCCESS"), Some("PENDING"), None] {
+            assert_eq!(
+                retry_target(&retry_head("abc123", status), "abc123", "!90"),
+                Err("The pipeline of !90 is no longer failed: refresh first (r)".into()),
+                "{status:?}"
+            );
+        }
+        let gone = json!({"data": {"project": {"mergeRequest": null}}});
+        assert!(retry_target(&gone, "abc123", "!90").is_err());
+        let refused = json!({"errors": [{"message": "The resource that you are attempting to access does not exist"}]});
+        assert!(retry_target(&refused, "abc123", "!90")
+            .unwrap_err()
+            .starts_with("GitLab: The resource"));
+    }
+
+    #[test]
+    fn a_refused_retry_says_why() {
+        assert_eq!(
+            retry_errors(&json!({"data": {"pipelineRetry": {"errors": []}}})),
+            None
+        );
+        assert_eq!(
+            retry_errors(
+                &json!({"data": {"pipelineRetry": {"errors": ["Insufficient permissions"]}}})
+            ),
+            Some("GitLab: Insufficient permissions".into())
+        );
+        assert_eq!(
+            retry_errors(
+                &json!({"data": {"pipelineRetry": null}, "errors": [{"message": "Pipeline cannot be retried"}]})
+            ),
+            Some("GitLab: Pipeline cannot be retried".into())
+        );
     }
 
     #[test]

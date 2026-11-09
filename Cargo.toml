@@ -4,6 +4,7 @@ version = "1.0.0"
 edition = "2021"
 description = "Herdr plugin that shows the merge requests you have to review and your own, with threads, approvals, pipeline and labels"
 license = "MIT"
+repository = "https://github.com/nolvane/herdr-git-panel"
 publish = false
 
 [dependencies]

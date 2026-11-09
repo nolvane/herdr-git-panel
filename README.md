@@ -55,9 +55,15 @@ box at the bottom of the panel takes the text, over several lines (`Enter`
 adds a line break, pasted text goes in whole). `Ctrl+s` shows what will be
 posted and where (`↑` `↓` scroll a long text), `y` posts it (`n` goes back to
 the text, `Esc` throws it away). The new reply or comment then shows in the tab; when posting fails,
-the box says why and keeps the text. Links in both tabs (the merge
+the box says why and keeps the text. On GitLab a line of a reply or
+comment that starts with `/` is posted as text, never run as a GitLab
+command (`\/` in front, as for change requests; inside a code block the
+backslash shows). Links in both tabs (the merge
 request's link, Markdown links and plain URLs in descriptions and comments)
 open in the browser with a click.
+The tab loads the 100 threads started last; a thread with more than
+50 notes shows its first note and its newest 49, with a dim line that says
+how many replies in between are not shown.
 
 `d` shows the changes inside the list: the changed files as a tree on the
 left (with lines added and removed; click one to jump to it, `f` hides the
@@ -158,6 +164,16 @@ Either way it only goes through if nobody pushed since the list loaded it.
 
 Both run through `glab` or `gh` and refresh the list.
 
+`Ctrl+r` starts a failed pipeline again after you confirm with `y`, on open
+ones with a red CI dot, your own and others'. On GitLab it retries the
+failed and cancelled jobs of the merge request's head pipeline; on GitHub
+the failed jobs of every failed GitHub Actions run of the newest commit.
+Other apps' checks and outside CI services' statuses can't be started from
+here, and the list says so. On any other pipeline it asks nothing and says
+why there is nothing to start. Like a merge, it only goes through if nobody
+pushed since the list loaded it. The CI dot shows it running at the latest
+at the next refresh.
+
 `w` marks your own merge request as a draft, or as ready for review again,
 without asking (the same key undoes it).
 
@@ -199,6 +215,9 @@ column heading (sort), a part of the second header line or a key hint in the
 footer. The wheel moves through the list, or scrolls the details panel when
 the pointer is over it.
 
+The help (`?`) shows the plugin's version in its bottom border; a click on
+it opens the plugin's repository on GitHub.
+
 ## Keys
 
 | Key | What it does |
@@ -218,6 +237,7 @@ the pointer is over it.
 | `v` | Open ones: approve (or take your approval back), after confirming |
 | `!` | Open ones of others: request changes with a reason (`Ctrl+s`, then `y` sends) |
 | `m` | Open ones: merge, after confirming, when GitLab or GitHub allows it |
+| `Ctrl+r` | Open ones with a failed pipeline: start the failed jobs again, after confirming |
 | `w` | Your own open ones: mark as draft, or as ready for review again |
 | `b` | Open ones: open the branch in a new Herdr workspace (a git worktree) |
 | `?` | All keys |
@@ -300,7 +320,21 @@ Changes apply the next time the list opens.
 | `split_direction` | `down` | Where a split goes: `down` (below) or `right` |
 | `icons` | `nerd` | `plain` for terminals without a Nerd Font (or press `i`) |
 | `compact` | `false` | `true`: one line per merge request instead of two, with the number in a column |
-| `gitlab_host` | `gitlab.com` | GitLab host `glab` is logged in to |
+| `gitlab_host` | `gitlab.com` | GitLab host `glab` is logged in to, without a port |
+
+For a GitLab whose web and API run on another port (such as
+`https://git.acme.test:8443`), set `gitlab_host = "git.acme.test"` and give
+`glab` the port as its API host:
+`glab auth login --hostname git.acme.test --api-host git.acme.test:8443`
+(add `--api-protocol http` for a GitLab without HTTPS; when `glab` is already
+logged in to the host, `glab config set api_host git.acme.test:8443 --host
+git.acme.test` is enough).
+`glab` takes no port in the host name, and a clone with a port in its remote
+is still recognised as its project.
+
+A GitLab Community Edition server works too. It has no approval rules, so
+the list shows how many people approved and who, but not how many are
+needed or which rule waits.
 
 ## How it works
 
@@ -327,11 +361,15 @@ When the list opens, it reads the git remote of its directory from
 Comments load when a merge request's activity tab is open. The list only
 writes what you asked for: an approval or taking one back, a merge, a reply
 to a thread, a comment or a change request (all after confirming), and
-resolving a thread or opening it again. Replies, comments and change
+resolving a thread or opening it again. Starting a failed pipeline again
+(after confirming) asks the forge for the current head first, then sends
+GitLab's GraphQL `pipelineRetry`, or GitHub's REST `rerun-failed-jobs` for
+each failed GitHub Actions run, through `gh api`. Replies, comments and change
 requests go through `glab api` (GitLab's REST API) and `gh api` (GitHub's
 GraphQL API for replies, REST for comments and reviews), with the text as
 typed, sent to them on standard input; on GitLab a change request adds the
-quick action line in front and a backslash before lines starting with `/`. `b` runs
+quick action line in front, and replies, comments and change requests
+get a backslash before lines starting with `/`. `b` runs
 `git fetch` against the clone's remote, creates or moves forward a local
 branch that is not checked out anywhere, sets its upstream when it has
 none, and asks Herdr to create the folder. Nothing else is stored and

@@ -521,8 +521,8 @@ Now both forges work the same way (#19).
   error shows instead of leaving GitLab out. `cli::explain_failure` now
   names a network error before it looks for login words, and
   `cli::not_logged_in`, which the messages of writes and of gh use, also
-  knows "invalid token". Its loose "401" and "unauthorized" stay for now
-  (#29).
+  knows "invalid token". Since #29 it is the one strict check for both
+  forges (see below).
 - When one request of a refresh fails without an answer (no network, the
   time limit) and another looks logged out, the error wins and shows. A
   GraphQL error next to a logged-out answer means the login changed during
@@ -635,3 +635,181 @@ glab is not logged in it does not keep asking gitlab.com.
   asks `/api/v4/user` every time, the refused-token case of #27, and it
   ties the list to glab's output. A timer that asks every 15 minutes
   (the triage's proposal) was replaced by the owner's decision.
+
+## 2026-11-09: GitLab without approval rules (Community Edition)
+
+GitLab Community Edition has no `approvalsRequired`, `approvalsLeft` or
+`approvalState` on a merge request (they are defined only in GitLab's `ee/`
+code), and GitLab checks a whole query before it runs it, so one of them
+rejected every list (#28). The list now sends the full query first; when
+GitLab answers that `approvalsRequired`, `approvalsLeft` or `approvalState`
+"doesn't exist on type 'MergeRequest'", it sends the same query once more
+without them and remembers the host while the list runs, so later refreshes
+take one request again. Without those fields the parsing counts who
+approved, waits for no rule and leaves the number needed unknown (`None`,
+as GitHub does when it doesn't say), so the column shows no "of needed".
+
+- Retry on that error rather than asking the server which edition it is: an
+  extra request on every open for everyone (gitlab.com included) costs more
+  than a second request on the first load of a Community Edition server.
+  The first load there takes two requests per list ("Mine" and "To review"
+  and the "All" requests run at the same time, each finds out on its own).
+- The Enterprise-only fields are one exact piece of the fragment
+  (`approval_rule_fields!`), taken out when the query is sent, so the query
+  builders stay as they are; a test checks every query in every state still
+  holds that piece and loses all three fields without it.
+- `approvalsLeft` was never read and is no longer asked for.
+- The error is recognised by the field named before "doesn't exist on type"
+  and the type `MergeRequest`, in any quotes, not by the whole sentence.
+- Checked on 2026-11-09 without a login against a public Community Edition
+  server: the query without those fields is accepted and returns
+  `approved` and `approvedBy`.
+
+## 2026-11-09: Only a refused login counts as not logged in
+
+`cli::not_logged_in` took any error output with "401" or "unauthorized" in
+it as a refused login, so an error about merge request !401, a query's
+"complexity of 401" or "Jira integration: 401 Unauthorized" left GitHub out
+without a word or showed "run … auth login" for a write (#29).
+
+- One strict check for both forges and every caller (GitHub's lists,
+  replies and resolving, the messages of all writes, GitLab's lists):
+  `cli::not_logged_in` for the tools' error output, `cli::refused` for the
+  forges' JSON answers, one word list (`cli::REFUSALS`) for both. GitLab's
+  own `refused` and `refused_stderr` from #19 went into them.
+- Error output counts as not logged in only for the HTTP status as the tools
+  write it ("(HTTP 401)", "HTTP 401:", glab's "<url>: 401 …" and "status
+  code: 401"),
+  the tools' own words ("not logged in", "not authenticated", "auth
+  login"), or "Bad credentials", "401 Unauthorized", "Invalid token" or
+  `invalid_token` as the whole message of a line, with or without a
+  `glab:`, `gh:` or `error:` in front; GitHub's "Requires authentication"
+  (its 401 answer to a request without a token) too. In a JSON answer any
+  of these words counts as the whole `message`, `error` or GraphQL error
+  message, whichever forge sent it.
+- The JSON answer decides when there is one, for GitHub's GraphQL requests
+  as for GitLab's and for REST writes (`cli::api_error`): a refusal as its
+  whole message gives the login hint, any other message shows as the
+  forge's own words, also when gh's error output says "HTTP 401". A failed
+  GitHub GraphQL request whose JSON is a REST error (no `data`, no
+  `errors`, such as a rate limit) is that error, not an empty answer.
+- Recorded on 2026-11-09 with an invalid `GH_TOKEN`: `gh api graphql`
+  prints `{"message":"Bad credentials",…,"status":"401"}` and `gh: Bad
+  credentials (HTTP 401)`; `gh pr view` prints `HTTP 401: Bad credentials
+  (https://api.github.com/graphql)` and `Try authenticating with:  gh auth
+  login -h github.com`.
+- GitHub got an `answer` helper like GitLab's, so the decision is tested
+  with recorded output. They stay two: GitLab also treats a refusal next to
+  data differently, and the word lists are what they share.
+
+## 2026-11-09: Starting a failed pipeline again with `Ctrl+r`
+
+`Ctrl+r` starts a failed pipeline again (the owner's decision on #12, with
+the keys of #9 to #11). Herdr's prefix is `Ctrl+b` by default and Herdr
+binds no `Ctrl+r` of its own, so it reaches the list like `Ctrl+d`,
+`Ctrl+u` and `Ctrl+s`. It is a confirmed write like approve and merge
+(`Action::Retry`): the footer asks, `y` starts it in the background, and
+the refresh after it shows the CI dot running (on GitHub at the latest at
+the next refresh, once GitHub updated its rollup). Refused on merged and
+closed ones, like every write since #7.
+
+- What a retry needs is loaded when it is confirmed, not with the list: one
+  small query for the current head (GitLab: `diffHeadSha` and
+  `headPipeline { id status }`; GitHub: `headRefOid` and the check suites of
+  the newest commit). The list queries stay as heavy as they were, and the
+  same query pins the retry to the head the list showed: after a push, or
+  when the pipeline no longer failed, nothing starts and the list says to
+  refresh.
+- GitLab: the GraphQL mutation `pipelineRetry` on the head pipeline, which
+  starts its failed and cancelled jobs again; its `errors` are shown.
+- GitHub: only GitHub Actions runs (check suites with a `workflowRun`) can
+  be started again with the user's `gh` login. Each failed one (conclusion
+  failure, timed out or cancelled; not "action required" or "startup
+  failure", which a re-run can't start) gets `POST
+  repos/{repo}/actions/runs/{id}/rerun-failed-jobs` in the repository of
+  its suite. When some start and others are refused, it counts as started
+  (the list refreshes) and says how many and why. When only other apps'
+  checks or commit statuses failed, nothing starts. The CI dot is GitHub's
+  rollup of all of them, so it can stay red after the Actions runs started
+  when another app's check failed too.
+
+## 2026-11-09: The version and the repository link sit in the help's border
+
+The help overlay (`?`) shows "Herdr Git Panel <version> ·
+github.com/nolvane/herdr-git-panel" in its bottom border (#14), so it takes
+no row from the list or the help text and stays visible when the box is cut
+to a short pane. A narrow box drops the address, then the name, and keeps
+the version as long as it fits between the corners. A click on it opens the repository through the same web-link
+check as links in the details panel and closes the help; every other click
+still only closes it. The version is `CARGO_PKG_VERSION`, the same value as
+`--version`, and the address is `repository` in `Cargo.toml`, so neither is
+written twice. `App::opener` starts the browser, so tests can put in one that
+starts nothing, like `App::poster` for posting.
+
+## 2026-11-09: Both ends of long threads, the newest 100 threads
+
+The activity request loads per thread its first note (`head: notes(first:
+1)`, on GitHub `comments`) and its newest 49 (`tail: notes(last: 49)`) with
+the thread's total (`count`, on GitHub `totalCount`), and the newest 100
+threads (`discussions(last: 100)`, `reviewThreads(last: 100)`). Both forges
+give notes oldest first, so `first: 50` dropped exactly the newest replies,
+and `first: 100` the newest threads.
+- `last: 100` counts threads by when they were started, not by their
+  latest reply: on a merge request with more than 100 threads (on GitLab
+  each system note is one), an old thread that just got a reply can still
+  be left out. Neither forge sorts threads by activity in this connection.
+- The first note stays because the thread's place (file and line) and the
+  reply marks hang on it. Head and tail overlap on a thread of up to 50
+  notes; `model::thread_notes` merges them by note id, so each note shows
+  once.
+- What lies between shows as one dim line "… N earlier replies not shown",
+  so a cut thread does not look complete. Paging through every note would
+  cost requests per thread, against "Comments loaded on demand".
+- GitLab complexity of the whole new request, measured on gitlab.com on
+  2026-11-09 with `queryComplexity`: 35 of the 250 allowed. GitHub accepts
+  the query; at most 100 × 50 comments stay far below its node limit.
+
+## 2026-11-09: A GitLab on another port: the port stays with glab
+
+`gitlab_host` is the host name glab is logged in to, without a port (#25).
+
+- glab (1.128) refuses a port in `--hostname` (`error parsing --hostname:
+  invalid hostname.`) before it sends anything. For a GitLab on another
+  port it logs in with the host name alone and keeps the port as the API
+  host (`glab auth login --hostname <host> --api-host <host>:<port>`, or
+  the per-host config key `api_host`), so the plugin passes the bare host
+  and glab adds the port.
+- A `gitlab_host` that ends in `:<digits>` fails every GitLab request
+  before glab starts, with a message that names the setting to use and the
+  `--api-host` login. Only digits count as a port, so another wrong value
+  (such as one with `https://`) still shows glab's own error rather than a
+  wrong suggestion.
+- The remote's port stays dropped in `repo::parse_remote`: an SSH remote's
+  port is the SSH server's (often 22 or 2222), not the web and API port, so
+  keeping it would break SSH clones of every self-hosted GitLab.
+- Rejected: taking `host:port` and handing the port to glab ourselves
+  (`GITLAB_API_HOST`), which would duplicate glab's own login setup.
+
+  Replies and comments escape such lines the same way since #31.
+
+## 2026-11-09: Replies and comments run no GitLab command
+
+A line of a GitLab reply or comment that starts with `/` is posted as text,
+not run as a quick action (the owner's decision on #31), although GitLab's
+own comment box would run it: a reply should post what it says, and a
+hidden `/merge` or `/approve` in it would be a surprise.
+
+- `post_note` sends the text through `escape_quick_actions`, the escape
+  that change requests use (#11): a backslash before every line that starts
+  with `/` in its first column, nothing else changed. The same limits hold:
+  inside a code block the backslash shows, which is more common in
+  replies than in change requests (a path or command at a line start), but
+  skipping code blocks would need to find them exactly as GitLab does, and
+  a mismatch would run a command. The preview shows the text as typed.
+- Every line starting with `/` is escaped, not only known command names:
+  the commands differ between GitLab versions and editions.
+- An exception to "Replies and comments from the activity tab", which sends
+  the text as typed otherwise. GitHub has no quick actions and is unchanged.
+- The list's own rendering of the posted note shows the backslash
+  (`\/merge later`), as it does for change requests; GitLab's web shows
+  `/merge later`.

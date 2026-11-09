@@ -381,6 +381,15 @@ pub fn merge(mr: &MergeRequest) -> Result<(), String> {
     }
 }
 
+/// Starts the failed jobs of the merge request's pipeline (GitLab) or of its
+/// failed GitHub Actions runs (GitHub) again; the answer says what started.
+pub fn retry_pipeline(mr: &MergeRequest) -> Result<String, String> {
+    match mr.forge {
+        Forge::GitLab => gitlab::retry_pipeline(mr),
+        Forge::GitHub => github::retry_checks(mr),
+    }
+}
+
 pub fn fetch_diff(mr: &MergeRequest) -> Result<String, String> {
     match mr.forge {
         Forge::GitLab => gitlab::fetch_diff(mr),
@@ -441,6 +450,56 @@ mod tests {
             not_available(&project("GitHub.com")),
             "gh is not installed or not logged in to github.com"
         );
+    }
+
+    #[test]
+    fn a_clone_of_a_gitlab_on_another_port_is_this_project() {
+        // `gitlab_host` without the port, as glab knows the host; the
+        // remote's port is dropped (#25).
+        for url in [
+            "https://git.acme.test:8443/acme/app.git",
+            "ssh://git@git.acme.test:2222/acme/app.git",
+            "git@git.acme.test:acme/app.git",
+        ] {
+            let p = crate::repo::parse_remote(url).unwrap();
+            assert!(known(&p, "git.acme.test"), "{url}");
+            assert_eq!(all_forges(Some(&p), "git.acme.test"), (true, false));
+        }
+    }
+
+    #[test]
+    fn a_port_in_gitlab_host_shows_in_the_footer_or_as_the_error() {
+        // GitLab's answer, which comes without starting glab.
+        let host = "git.acme.test:8443";
+        let fix = gitlab::fetch(host, Status::Open, None).err().unwrap();
+        let all = gitlab::fetch_all_of(host, Status::Open, None)
+            .err()
+            .unwrap();
+        assert!(fix.starts_with("gitlab_host takes the host name without the port"));
+        // GitHub answering: its lists, the message in the footer.
+        let fetched = combine(
+            host,
+            BOTH,
+            Status::Open,
+            None,
+            [Err(fix.clone()), Ok(Some(lists()))],
+            [Err(all.clone()), Ok(None)],
+        )
+        .unwrap();
+        assert_eq!(fetched.warning.as_deref(), Some(fix.as_str()));
+        assert_eq!(fetched.data.mine.len(), 1);
+        // Without GitHub: the list's error.
+        let e = combine(
+            host,
+            [true, false],
+            Status::Open,
+            None,
+            [Err(fix.clone()), Ok(None)],
+            [Err(all), Ok(None)],
+        )
+        .err()
+        .unwrap();
+        assert_eq!(e, fix);
     }
 
     fn mr(forge: Forge, iid: u64, updated: i64) -> MergeRequest {
@@ -649,6 +708,21 @@ mod tests {
 
     /// glab and gh both installed.
     const BOTH: [bool; 2] = [true, true];
+
+    #[test]
+    fn a_github_error_shows_instead_of_a_login_hint() {
+        // GitLab not logged in, GitHub failing for a reason of its own.
+        let e = "GitHub: Query has complexity of 401, which exceeds max complexity of 400";
+        let result = combine(
+            "gitlab.com",
+            BOTH,
+            Status::Open,
+            None,
+            [Ok(None), Err(e.into())],
+            [Ok(None), Err(e.into())],
+        );
+        assert_eq!(result.err().as_deref(), Some(e));
+    }
 
     #[test]
     fn gitlab_not_logged_in_is_left_out_quietly() {

@@ -379,12 +379,26 @@ fn graphql(query: &str, vars: &[(&str, &str)]) -> Result<Value, Failure> {
         };
     }
     let out = cli::run("gh", cmd, HOST).map_err(Failure::Other)?;
-    if !out.success && cli::not_logged_in(&out.stderr) {
-        return Err(Failure::NotLoggedIn);
-    }
+    answer(&out)
+}
+
+/// GitHub's answer in gh's output: its JSON decides when there is one, gh's
+/// error output only without it.
+fn answer(out: &cli::Output) -> Result<Value, Failure> {
     // GitHub's own errors come as JSON, also when gh exits with an error.
     if let Ok(value) = serde_json::from_slice::<Value>(&out.stdout) {
+        if !out.success && cli::refused(&value) {
+            return Err(Failure::NotLoggedIn);
+        }
+        // A REST error answer (`{"message": …}`, such as a rate limit) has
+        // neither GraphQL data nor errors: it is the error, in GitHub's words.
+        if !out.success && value.get("data").is_none() && value.get("errors").is_none() {
+            return Err(Failure::Other(cli::api_error("gh", HOST, "GitHub", out)));
+        }
         return Ok(value);
+    }
+    if !out.success && cli::not_logged_in(&out.stderr) {
+        return Err(Failure::NotLoggedIn);
     }
     if !out.success {
         return Err(Failure::Other(cli::explain_failure(
@@ -592,10 +606,11 @@ query($owner: String!, $name: String!, $number: Int!) {
     pullRequest(number: $number) {
       comments(last: 100) { nodes { body createdAt author { login } } }
       reviews(last: 50) { nodes { body state submittedAt author { login } } }
-      reviewThreads(first: 100) {
+      reviewThreads(last: 100) {
         nodes {
           id isResolved path line originalLine
-          comments(first: 50) { nodes { body createdAt author { login } } }
+          head: comments(first: 1) { nodes { id body createdAt author { login } } }
+          tail: comments(last: 49) { totalCount nodes { id body createdAt author { login } } }
         }
       }
     }
@@ -641,6 +656,7 @@ pub fn parse_activity(value: &Value) -> Result<Vec<Discussion>, String> {
         resolved: false,
         place: None,
         notes: vec![n],
+        hidden: 0,
     };
     let mut list: Vec<Discussion> = Vec::new();
     for c in pr["comments"]["nodes"].as_array().into_iter().flatten() {
@@ -667,10 +683,18 @@ pub fn parse_activity(value: &Value) -> Result<Vec<Discussion>, String> {
         .into_iter()
         .flatten()
     {
-        let notes: Vec<Note> = t["comments"]["nodes"]
-            .as_array()
-            .map(|a| a.iter().map(|c| note(c, "createdAt")).collect())
-            .unwrap_or_default();
+        let end = |part: &str| -> Vec<(String, Note)> {
+            t[part]["nodes"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .map(|c| (str_of(&c["id"]), note(c, "createdAt")))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let total = t["tail"]["totalCount"].as_u64().unwrap_or(0) as usize;
+        let (notes, hidden) = thread_notes(end("head"), end("tail"), total);
         let place = t["path"].as_str().map(|path| {
             match t["line"].as_u64().or_else(|| t["originalLine"].as_u64()) {
                 Some(line) => format!("{path}:{line}"),
@@ -683,6 +707,7 @@ pub fn parse_activity(value: &Value) -> Result<Vec<Discussion>, String> {
             resolved: t["isResolved"].as_bool().unwrap_or(false),
             place,
             notes,
+            hidden,
         });
     }
     list.retain(|d| !d.notes.is_empty());
@@ -743,11 +768,7 @@ pub fn reply(thread: &str, body: &str) -> Result<bool, String> {
     let mut cmd = cli::command("gh");
     cmd.args(input_args("graphql", "POST"));
     let out = cli::run_input("gh", cmd, HOST, reply_body(thread, body))?;
-    if !out.success && cli::not_logged_in(&out.stderr) {
-        return Err(String::from(Failure::NotLoggedIn));
-    }
-    let value = serde_json::from_slice::<Value>(&out.stdout)
-        .map_err(|_| cli::explain_failure("gh", HOST, &out.stderr))?;
+    let value = answer(&out)?;
     if let Some(msg) = cli::graphql_errors(&value) {
         return Err(format!("GitHub: {msg}"));
     }
@@ -859,6 +880,149 @@ pub fn request_changes(mr: &MergeRequest, reason: &str) -> Result<(), String> {
     }
 }
 
+/// The pull request's head and the check suites of its newest commit,
+/// loaded when a retry is confirmed: the list loads only the rollup state.
+const RETRY_HEAD: &str = r#"
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      headRefOid
+      commits(last: 1) {
+        nodes {
+          commit {
+            checkSuites(first: 100) {
+              nodes { conclusion repository { nameWithOwner } workflowRun { databaseId } }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"#;
+
+/// The failed GitHub Actions runs of the newest commit, as `(repository,
+/// run id)`, from [`RETRY_HEAD`]'s answer, only while the head is still
+/// `shown_head`. Other apps' checks and commit statuses can't be started
+/// again with the user's login, so they are left out. `r` is `#2903`.
+fn failed_runs(
+    value: &Value,
+    shown_head: &str,
+    project: &str,
+    r: &str,
+) -> Result<Vec<(String, u64)>, String> {
+    if let Some(msg) = cli::graphql_errors(value) {
+        return Err(format!("GitHub: {msg}"));
+    }
+    let pr = &value["data"]["repository"]["pullRequest"];
+    if pr.is_null() {
+        return Err(format!("GitHub did not return {r}: refresh first (r)"));
+    }
+    if !shown_head.is_empty() && pr["headRefOid"].as_str() != Some(shown_head) {
+        return Err(format!(
+            "{r} changed since the list loaded: refresh first (r)"
+        ));
+    }
+    let mut runs = Vec::new();
+    let suites = pr
+        .pointer("/commits/nodes/0/commit/checkSuites/nodes")
+        .and_then(Value::as_array);
+    for suite in suites.into_iter().flatten() {
+        let failed = suite["conclusion"]
+            .as_str()
+            .is_some_and(|c| matches!(c, "FAILURE" | "TIMED_OUT" | "CANCELLED"));
+        let Some(id) = suite["workflowRun"]["databaseId"].as_u64() else {
+            continue;
+        };
+        if !failed {
+            continue;
+        }
+        // The run lives where its suite does (the base repository, also
+        // for a fork's pull request); a name GitHub gave that is no plain
+        // `owner/name` never goes into the path.
+        let repo = suite["repository"]["nameWithOwner"]
+            .as_str()
+            .filter(|n| plain_repo(n))
+            .unwrap_or(project);
+        runs.push((repo.to_string(), id));
+    }
+    if runs.is_empty() {
+        return Err(format!(
+            "No failed GitHub Actions run of {r} to start again: its other failed checks can't be started again from the list"
+        ));
+    }
+    Ok(runs)
+}
+
+/// The arguments of `gh api` that start the failed jobs of one workflow
+/// run again (REST "Re-run failed jobs from a workflow run").
+fn rerun_args(repo: &str, run: u64) -> Vec<String> {
+    [
+        "api",
+        "--hostname",
+        HOST,
+        "--method",
+        "POST",
+        &format!("repos/{repo}/actions/runs/{run}/rerun-failed-jobs"),
+    ]
+    .map(String::from)
+    .to_vec()
+}
+
+/// What the list says after starting the failed runs of `r` again, from one
+/// answer per run. When some started, it is a success (the list refreshes)
+/// that names how many and why the others did not.
+fn rerun_outcome(r: &str, results: Vec<Result<(), String>>) -> Result<String, String> {
+    let total = results.len();
+    let started = results.iter().filter(|r| r.is_ok()).count();
+    // Each reason once: several runs are often refused for the same one.
+    let mut why: Vec<String> = Vec::new();
+    for e in results.into_iter().filter_map(Result::err) {
+        if !why.contains(&e) {
+            why.push(e);
+        }
+    }
+    let why = why.join(" · ");
+    match started {
+        _ if started == total => Ok(format!("Failed checks of {r} started again")),
+        0 => Err(why),
+        _ => Ok(format!(
+            "Started {started} of {total} failed runs of {r} again; the others did not: {why}"
+        )),
+    }
+}
+
+/// Starts the failed jobs of every failed GitHub Actions run of the pull
+/// request's newest commit again, only if its head is still the one the
+/// list showed.
+pub fn retry_checks(mr: &MergeRequest) -> Result<String, String> {
+    let r = mr.reference();
+    let (owner, name) = mr
+        .project
+        .split_once('/')
+        .ok_or("not a GitHub repository")?;
+    let number = format!("$int:{}", mr.iid);
+    let head = graphql(
+        RETRY_HEAD,
+        &[("owner", owner), ("name", name), ("number", &number)],
+    )?;
+    let runs = failed_runs(&head, &mr.head_sha, &mr.project, &r)?;
+    let results = runs
+        .iter()
+        .map(|(repo, run)| {
+            let mut cmd = cli::command("gh");
+            cmd.args(rerun_args(repo, *run));
+            let out = cli::run("gh", cmd, HOST)?;
+            if out.success {
+                Ok(())
+            } else {
+                Err(cli::api_error("gh", HOST, "GitHub", &out))
+            }
+        })
+        .collect();
+    rerun_outcome(&r, results)
+}
+
 /// The pull request's changes as a unified diff, without colours.
 pub fn fetch_diff(mr: &MergeRequest) -> Result<String, String> {
     pr_command(mr, &["diff", "--color", "never"])
@@ -954,6 +1118,7 @@ mod tests {
             "$int:@/etc/passwd",
             "two\nlines",
             "\"quotes\" and {owner}",
+            "/merge later",
         ] {
             let sent: Value = serde_json::from_slice(&reply_body("PRRT_x", body)).unwrap();
             assert_eq!(sent["variables"]["body"], body);
@@ -1094,7 +1259,8 @@ mod tests {
                 {"body": "", "state": "COMMENTED", "submittedAt": "2026-11-02T08:00:00Z", "author": {"login": "kim"}}
             ]},
             "reviewThreads": {"nodes": [{"id": "PRRT_1", "isResolved": false, "path": "src/a.rs", "line": null, "originalLine": 7,
-                "comments": {"nodes": [{"body": "Why?", "createdAt": "2026-11-02T09:00:00Z", "author": {"login": "kim"}}]}}]}
+                "head": {"nodes": [{"id": "PRRC_1", "body": "Why?", "createdAt": "2026-11-02T09:00:00Z", "author": {"login": "kim"}}]},
+                "tail": {"totalCount": 1, "nodes": [{"id": "PRRC_1", "body": "Why?", "createdAt": "2026-11-02T09:00:00Z", "author": {"login": "kim"}}]}}]}
         }}}});
         let a = parse_activity(&v).unwrap();
         assert_eq!(a.len(), 3);
@@ -1104,6 +1270,60 @@ mod tests {
         assert!(a[1].resolvable);
         assert_eq!(a[1].place.as_deref(), Some("src/a.rs:7"));
         assert!(!a[2].resolvable);
+    }
+
+    /// A comment of a review thread as `ACTIVITY` loads it.
+    fn thread_comment(id: u32, author: &str, at: &str) -> Value {
+        json!({"id": format!("PRRC_{id}"), "body": format!("Comment {id}"), "createdAt": at, "author": {"login": author}})
+    }
+
+    #[test]
+    fn activity_loads_the_newest_hundred_threads_with_both_ends() {
+        assert!(ACTIVITY.contains("reviewThreads(last: 100)"), "{ACTIVITY}");
+        assert!(ACTIVITY.contains("head: comments(first: 1)"), "{ACTIVITY}");
+        assert!(
+            ACTIVITY.contains("tail: comments(last: 49) { totalCount"),
+            "{ACTIVITY}"
+        );
+    }
+
+    #[test]
+    fn review_threads_show_both_ends_once() {
+        let at = |h: u32, m: u32| format!("2026-11-02T{h:02}:{m:02}:00Z");
+        // 60 comments, one a minute: the tail has comments 12 to 60.
+        let tail: Vec<Value> = (12..=60)
+            .map(|i| thread_comment(i, "sam", &at(8 + (i - 1) / 60, (i - 1) % 60)))
+            .collect();
+        let short = [
+            thread_comment(100, "kim", &at(8, 30)),
+            thread_comment(101, "me", &at(8, 31)),
+        ];
+        let v = json!({"data": {"repository": {"pullRequest": {
+            "comments": {"nodes": []}, "reviews": {"nodes": []},
+            "reviewThreads": {"nodes": [
+                {"id": "PRRT_short", "isResolved": false, "path": "src/b.rs", "line": 3, "originalLine": 3,
+                 "head": {"nodes": [short[0].clone()]},
+                 "tail": {"totalCount": 2, "nodes": short}},
+                {"id": "PRRT_long", "isResolved": true, "path": "src/a.rs", "line": null, "originalLine": 7,
+                 "head": {"nodes": [thread_comment(1, "alex", &at(8, 0))]},
+                 "tail": {"totalCount": 60, "nodes": tail}}
+            ]}
+        }}}});
+        let a = parse_activity(&v).unwrap();
+        // The long thread sorts by its real newest reply (08:59).
+        assert_eq!(a[0].id, "PRRT_long");
+        let long = &a[0];
+        assert_eq!(long.notes.len(), 50);
+        assert_eq!(long.notes[0].body, "Comment 1");
+        assert_eq!(long.notes[1].body, "Comment 12");
+        assert_eq!(long.notes[49].body, "Comment 60");
+        assert_eq!(long.hidden, 10, "comments 2 to 11");
+        assert_eq!(long.place.as_deref(), Some("src/a.rs:7"));
+        assert!(long.resolvable && long.resolved);
+        // The short one: each comment once, oldest first.
+        let bodies: Vec<&str> = a[1].notes.iter().map(|n| n.body.as_str()).collect();
+        assert_eq!(bodies, ["Comment 100", "Comment 101"]);
+        assert_eq!(a[1].hidden, 0);
     }
 
     #[test]
@@ -1180,9 +1400,219 @@ mod tests {
         assert_eq!(part.total, 41);
     }
 
+    fn output(success: bool, stdout: &str, stderr: &str) -> cli::Output {
+        cli::Output {
+            success,
+            code: Some(if success { 0 } else { 1 }),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.into(),
+        }
+    }
+
+    #[test]
+    fn a_refused_login_leaves_github_out() {
+        // What gh 2.x writes without a login, and with a token GitHub
+        // refuses (HTTP 401).
+        let logged_out = output(
+            false,
+            "",
+            "To get started with GitHub CLI, please run:  gh auth login\nAlternatively, populate the GH_TOKEN environment variable with a GitHub API authentication token.",
+        );
+        assert!(matches!(answer(&logged_out), Err(Failure::NotLoggedIn)));
+        let refused = output(
+            false,
+            r#"{"message":"Bad credentials","documentation_url":"https://docs.github.com/rest","status":"401"}"#,
+            "gh: Bad credentials (HTTP 401)",
+        );
+        assert!(matches!(answer(&refused), Err(Failure::NotLoggedIn)));
+        assert_eq!(
+            error_of(&refused),
+            "gh is not logged in to github.com: run gh auth login"
+        );
+    }
+
+    fn error_of(out: &cli::Output) -> String {
+        match answer(out) {
+            Err(f) => String::from(f),
+            Ok(_) => panic!("an error"),
+        }
+    }
+
+    #[test]
+    fn errors_that_mention_401_stay_errors() {
+        // A GraphQL error while logged in: GitHub's own answer, shown.
+        let complex = output(
+            false,
+            r#"{"errors":[{"message":"Query has complexity of 401, which exceeds max complexity of 400"}]}"#,
+            "gh: Query has complexity of 401, which exceeds max complexity of 400",
+        );
+        let Ok(value) = answer(&complex) else {
+            panic!("GitHub's answer");
+        };
+        assert_eq!(
+            parse(&value).unwrap_err(),
+            "GitHub: Query has complexity of 401, which exceeds max complexity of 400"
+        );
+        // A REST error answer is the error, also when it mentions 401.
+        let rest = output(
+            false,
+            r#"{"message":"Rate limit of 401 requests exceeded","status":"403"}"#,
+            "gh: Rate limit of 401 requests exceeded (HTTP 403)",
+        );
+        assert_eq!(
+            error_of(&rest),
+            "GitHub: Rate limit of 401 requests exceeded"
+        );
+        // Without JSON, the tool's error output is the error.
+        let unauthorized = output(false, "", "gh: Unauthorized to view repository acme/app401");
+        assert_eq!(
+            error_of(&unauthorized),
+            "gh failed: gh: Unauthorized to view repository acme/app401"
+        );
+        let offline = output(
+            false,
+            "",
+            "Post \"https://api.github.com/graphql\": dial tcp: lookup api.github.com: no such host",
+        );
+        assert_eq!(
+            error_of(&offline),
+            "Cannot reach github.com: check the connection"
+        );
+    }
+
     #[test]
     fn errors_are_reported() {
         let e = parse(&json!({"errors": [{"message": "boom"}]})).unwrap_err();
         assert!(e.contains("boom"));
+    }
+
+    /// The answer of the retry query for a head `sha` with `suites`.
+    fn retry_head(sha: &str, suites: Value) -> Value {
+        json!({"data": {"repository": {"pullRequest": {
+            "headRefOid": sha,
+            "commits": {"nodes": [{"commit": {"checkSuites": {"nodes": suites}}}]}
+        }}}})
+    }
+
+    fn suite(conclusion: Option<&str>, run: Option<u64>) -> Value {
+        json!({
+            "conclusion": conclusion,
+            "repository": {"nameWithOwner": "acme/app"},
+            "workflowRun": run.map(|id| json!({"databaseId": id})),
+        })
+    }
+
+    #[test]
+    fn a_retry_picks_the_failed_actions_runs() {
+        let suites = json!([
+            suite(Some("FAILURE"), Some(11)),
+            suite(Some("SUCCESS"), Some(12)),
+            suite(Some("SKIPPED"), Some(13)),
+            suite(Some("TIMED_OUT"), Some(14)),
+            suite(Some("CANCELLED"), Some(15)),
+            // Another app's check: no workflow run.
+            suite(Some("FAILURE"), None),
+            // Still running.
+            suite(None, Some(16)),
+            // Waiting for a maintainer's approval, or a broken workflow
+            // file: a re-run can't start them.
+            suite(Some("ACTION_REQUIRED"), Some(17)),
+            suite(Some("STARTUP_FAILURE"), Some(18)),
+        ]);
+        let runs = failed_runs(&retry_head("abc123", suites), "abc123", "acme/app", "#2903");
+        let ids: Vec<u64> = runs.unwrap().into_iter().map(|(_, id)| id).collect();
+        assert_eq!(ids, [11, 14, 15]);
+    }
+
+    #[test]
+    fn a_run_is_started_where_its_suite_lives() {
+        let mut s = suite(Some("FAILURE"), Some(11));
+        s["repository"]["nameWithOwner"] = json!("acme/base");
+        let runs = failed_runs(&retry_head("abc", json!([s])), "abc", "acme/app", "#1");
+        assert_eq!(runs, Ok(vec![("acme/base".into(), 11)]));
+        // A name that is no plain `owner/name` never goes into the path.
+        let mut s = suite(Some("FAILURE"), Some(11));
+        s["repository"]["nameWithOwner"] = json!("acme/app/../../user");
+        let runs = failed_runs(&retry_head("abc", json!([s])), "abc", "acme/app", "#1");
+        assert_eq!(runs, Ok(vec![("acme/app".into(), 11)]));
+    }
+
+    #[test]
+    fn other_apps_checks_are_not_started() {
+        let only_other = json!([
+            suite(Some("FAILURE"), None),
+            suite(Some("SUCCESS"), Some(3))
+        ]);
+        let expected = Err(
+            "No failed GitHub Actions run of #2903 to start again: its other failed checks can't be started again from the list"
+                .to_string(),
+        );
+        assert_eq!(
+            failed_runs(&retry_head("abc", only_other), "abc", "acme/app", "#2903"),
+            expected
+        );
+        // A commit status of an outside CI service brings no suite at all.
+        assert_eq!(
+            failed_runs(&retry_head("abc", json!([])), "abc", "acme/app", "#2903"),
+            expected
+        );
+    }
+
+    #[test]
+    fn checks_of_a_pushed_head_are_not_started() {
+        let suites = json!([suite(Some("FAILURE"), Some(11))]);
+        assert_eq!(
+            failed_runs(&retry_head("def456", suites), "abc123", "acme/app", "#2903"),
+            Err("#2903 changed since the list loaded: refresh first (r)".into())
+        );
+        // Without a head from the list there is nothing to compare, like
+        // approving and merging.
+        let suites = json!([suite(Some("FAILURE"), Some(11))]);
+        assert!(failed_runs(&retry_head("def456", suites), "", "acme/app", "#2903").is_ok());
+        let refused = json!({"errors": [{"message": "Could not resolve to a Repository"}]});
+        assert!(failed_runs(&refused, "abc", "acme/app", "#2903")
+            .unwrap_err()
+            .starts_with("GitHub: Could not resolve"));
+    }
+
+    #[test]
+    fn a_rerun_asks_for_the_failed_jobs_only() {
+        assert_eq!(
+            rerun_args("acme/app", 4711),
+            [
+                "api",
+                "--hostname",
+                "github.com",
+                "--method",
+                "POST",
+                "repos/acme/app/actions/runs/4711/rerun-failed-jobs",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_rerun_says_how_many_started() {
+        assert_eq!(
+            rerun_outcome("#2903", vec![Ok(()), Ok(())]),
+            Ok("Failed checks of #2903 started again".into())
+        );
+        assert_eq!(
+            rerun_outcome(
+                "#2903",
+                vec![
+                    Ok(()),
+                    Err("GitHub: This workflow run cannot be retried".into()),
+                    Err("GitHub: This workflow run cannot be retried".into()),
+                ]
+            ),
+            Ok("Started 1 of 3 failed runs of #2903 again; the others did not: GitHub: This workflow run cannot be retried".into())
+        );
+        assert_eq!(
+            rerun_outcome(
+                "#2903",
+                vec![Err("GitHub: Resource not accessible by integration".into())]
+            ),
+            Err("GitHub: Resource not accessible by integration".into())
+        );
     }
 }

@@ -8,6 +8,17 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `Ctrl+r` starts a failed pipeline again, after `y`: on GitLab the failed
+  jobs of the merge request's head pipeline, on GitHub the failed jobs of
+  every failed GitHub Actions run of the newest commit. It starts nothing
+  when someone pushed since the list loaded, and says why when there is
+  nothing to start or the forge refuses. The details panel shows the key
+  next to a failed pipeline (#12).
+
+- The help (`?`) shows the plugin's version in its bottom border; a click
+  on it opens the plugin's repository on GitHub, for example to report a
+  bug (#14).
+
 - `!` requests changes on someone else's open merge request or pull
   request, with a reason written in the same box as replies and comments
   (`Ctrl+s` shows it, only `y` sends it). On GitHub it is a review with
@@ -52,11 +63,38 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- On a GitLab Community Edition server, which has no approval rules, the
+  list now shows the merge requests instead of
+  only the error "Field 'approvalsLeft' doesn't exist on type
+  'MergeRequest'". The Approvals column shows how many approved, and the
+  details who did (#28).
+- On a narrow pane, the footer leaves out whole key hints from the right
+  end instead of cutting one in the middle of its word, and always keeps
+  two blanks before "r refresh" (#18).
+- The activity tab and the overview say "now" and "opened now" for
+  something less than a minute old, instead of "now ago" (#23).
+- A thread with more than 50 notes shows its first note and its newest
+  replies, with a dim line "… 12 earlier replies not shown" in between,
+  instead of only its oldest 50 notes, and sorts by its newest reply. A
+  merge request or pull request with more than 100 threads loads the 100
+  started last instead of the first 100 (#23).
+- A `gitlab_host` with a port (such as `git.acme.test:8443`), which `glab`
+  refuses, now makes the list say to set the host name without the port and
+  to give `glab` the port with `--api-host`, instead of showing `glab`'s
+  "invalid hostname". The README says how to set up a GitLab on another
+  port (#25).
+- On GitLab a line of a reply or comment from the activity tab that starts
+  with `/` is posted as text instead of running as a GitLab command such as
+  `/merge` or `/approve` (#31).
 - With `glab` installed but not logged in, GitLab is now left out quietly,
   like GitHub without `gh`'s login, instead of showing "GitLab: Invalid
   token" in the footer on every refresh. When no forge can be used, the list
   names the tools that need `auth login`, for a self-hosted GitLab with
   `glab auth login --hostname <host>` (#19).
+- An error that only mentions 401 or "unauthorized", such as one about
+  merge request !401, now shows as itself instead of leaving GitHub out
+  without a word or saying "run … auth login"; only a refused login counts
+  as not logged in (#29).
 - The "Review" and "CI" dots and their headings start at the left edge of
   their column, like every other column, instead of sitting centred.
 

@@ -24,6 +24,7 @@ and how users install it: [README.md](README.md). Why it is built this way:
   Examples and tests use made-up projects and people (`acme/app`, `@alex`).
 - Every write to a forge (approve, merge, reply, comment) asks for `y` first,
   except ones the same key undoes (resolve a thread, draft on or off).
+- Starting a failed pipeline again (`Ctrl+r`) is such a write: it asks too.
 
 ## Checks
 
