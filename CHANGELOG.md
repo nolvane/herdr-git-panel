@@ -52,6 +52,11 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- On a GitLab Community Edition server (such as a self-hosted Free one
+  without approval rules) the list now shows the merge requests instead of
+  only the error "Field 'approvalsLeft' doesn't exist on type
+  'MergeRequest'". The Approvals column shows how many approved, and the
+  details who did (#28).
 - With `glab` installed but not logged in, GitLab is now left out quietly,
   like GitHub without `gh`'s login, instead of showing "GitLab: Invalid
   token" in the footer on every refresh. When no forge can be used, the list

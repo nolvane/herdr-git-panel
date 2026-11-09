@@ -299,6 +299,10 @@ Changes apply the next time the list opens.
 | `compact` | `false` | `true`: one line per merge request instead of two, with the number in a column |
 | `gitlab_host` | `gitlab.com` | GitLab host `glab` is logged in to |
 
+A GitLab Community Edition server works too. It has no approval rules, so
+the list shows how many people approved and who, but not how many are
+needed or which rule waits.
+
 ## How it works
 
 When the list opens, it reads the git remote of its directory from
