@@ -379,7 +379,9 @@ fn request(host: &str, query: &str, vars: &[(&str, &str)]) -> Result<Value, Fail
 fn answer(out: &cli::Output, host: &str) -> Result<Value, Failure> {
     // GitLab's own errors come as JSON, also when glab exits with an error.
     if let Ok(value) = serde_json::from_slice::<Value>(&out.stdout) {
-        if refused(&value) {
+        // A refusal comes without data; one error next to data is not one.
+        let no_data = value.get("data").is_none_or(Value::is_null);
+        if refused(&value) && (!out.success || no_data) {
             return Err(Failure::NotLoggedIn);
         }
         return Ok(value);
@@ -1203,14 +1205,21 @@ mod tests {
         );
         assert!(matches!(
             answer(&offline, "gitlab401.acme.test"),
-            Err(Failure::Other(_))
+            Err(Failure::Other(e)) if e == "Cannot reach gitlab401.acme.test: check the connection"
         ));
-        // GitLab's refusal is one also when glab exits without an error.
+        // GitLab's refusal is one also when glab exits without an error, but
+        // not as one error next to the data of an answer.
         let quiet = output(true, r#"{"errors":[{"message":"Invalid token"}]}"#, "");
         assert!(matches!(
             answer(&quiet, "gitlab.com"),
             Err(Failure::NotLoggedIn)
         ));
+        let partial = output(
+            true,
+            r#"{"errors":[{"message":"Invalid token"}],"data":{"currentUser":{"username":"me"}}}"#,
+            "",
+        );
+        assert!(answer(&partial, "gitlab.com").is_ok());
     }
 
     #[test]

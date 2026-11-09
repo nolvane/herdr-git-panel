@@ -178,11 +178,12 @@ pub fn login_hint(name: &str, host: &str) -> String {
 /// banner line such as "ERROR".
 pub fn explain_failure(name: &str, host: &str, stderr: &str) -> String {
     let lower = stderr.to_lowercase();
-    if not_logged_in(stderr) {
-        return login_hint(name, host);
-    }
+    // First: a host name may hold "401", and no network is never a login.
     if lower.contains("no such host") || lower.contains("dial tcp") {
         return format!("Cannot reach {host}: check the connection");
+    }
+    if not_logged_in(stderr) {
+        return login_hint(name, host);
     }
     let reason = stderr
         .lines()

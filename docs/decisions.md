@@ -517,9 +517,12 @@ Now both forges work the same way (#19).
   whole error message means not logged in, so an error that merely mentions
   401 or a token (a query's complexity, an integration) still shows. Without
   JSON, glab's stderr decides, by words such as "(HTTP 401)" or "auth
-  login" but not a bare "401", which may be part of a host name.
-  `cli::not_logged_in`, which the messages of writes and of gh use, now
-  also knows "invalid token".
+  login" but not a bare "401", which may be part of a host name; such an
+  error shows instead of leaving GitLab out. `cli::explain_failure` now
+  names a network error before it looks for login words, and
+  `cli::not_logged_in`, which the messages of writes and of gh use, also
+  knows "invalid token". Its loose "401" and "unauthorized" stay for now
+  (#29).
 - When one request of a refresh fails without an answer (no network, the
   time limit) and another looks logged out, the error wins and shows. A
   GraphQL error next to a logged-out answer means the login changed during
