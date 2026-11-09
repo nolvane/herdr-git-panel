@@ -1984,15 +1984,10 @@ mod tests {
 
     /// The list opened in a clone of `acme/app` on gitlab.com, inside Herdr.
     fn app_in_clone(dir: &std::path::Path) -> App {
-        let mut app = app();
-        let project = Project {
-            host: "gitlab.com".into(),
-            path: "acme/app".into(),
-        };
-        app.project = Some(project.clone());
+        let mut app = app_in("gitlab.com", "acme/app");
         app.remotes = vec![crate::repo::Remote {
             name: "origin".into(),
-            project,
+            project: app.project.clone().unwrap(),
         }];
         app.workdir = Some(dir.to_path_buf());
         app.herdr = true;

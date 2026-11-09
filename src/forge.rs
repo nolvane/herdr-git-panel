@@ -194,7 +194,9 @@ fn combine(
 /// logged in.
 fn not_available(p: &Project) -> String {
     let tool = if p.on(github::HOST) { "gh" } else { "glab" };
-    format!("{tool} is not installed or not logged in to {}", p.host)
+    // The host as the tools write it, whatever the remote's spelling.
+    let host = p.host.to_ascii_lowercase();
+    format!("{tool} is not installed or not logged in to {host}")
 }
 
 pub fn fetch_activity(mr: &MergeRequest) -> Result<Vec<Discussion>, String> {
@@ -333,7 +335,7 @@ mod tests {
         assert!(!known(&project("github.com.evil.test"), "gitlab.com"));
         assert_eq!(
             not_available(&project("GitHub.com")),
-            "gh is not installed or not logged in to GitHub.com"
+            "gh is not installed or not logged in to github.com"
         );
     }
 

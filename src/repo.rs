@@ -155,7 +155,14 @@ pub fn parse_remote(url: &str) -> Option<Project> {
         (host.to_string(), path.to_string())
     };
     let path = path.trim_matches('/');
-    let path = path.strip_suffix(".git").unwrap_or(path).to_string();
+    // `.git` in any case, as the forges accept `App.GIT` too.
+    let path = match path.len().checked_sub(4) {
+        Some(cut) if path.is_char_boundary(cut) && path[cut..].eq_ignore_ascii_case(".git") => {
+            &path[..cut]
+        }
+        _ => path,
+    }
+    .to_string();
     if host.is_empty() || !path.contains('/') {
         return None;
     }
@@ -224,6 +231,9 @@ mod tests {
         assert!(!p.is("github.com", "acme/ap"));
         assert!(!p.is("gitlab.com", "acme/app"));
         assert!(!p.on("github.co"));
+        // The `.git` ending counts in any case too.
+        let p = parse_remote("https://GitHub.com/Acme/App.GIT").unwrap();
+        assert!(p.is("github.com", "acme/app"), "{}", p.path);
     }
 
     #[test]
