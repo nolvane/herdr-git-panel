@@ -1363,7 +1363,7 @@ fn draw_details(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
             Span::styled(format!("{} ", mr.author), Style::new().fg(TEXT)),
             Span::styled(
                 mr.created
-                    .map(|t| format!(" opened {} ago", time::age(time::now() - t)))
+                    .map(|t| format!(" opened {}", time::ago(time::now() - t)))
                     .unwrap_or_default(),
                 Style::new().fg(FAINT),
             ),
@@ -1718,10 +1718,7 @@ fn activity_lines(
         return (lines, hits, None, urls);
     }
 
-    let age = |t: Option<i64>| {
-        t.map(|t| format!("{} ago", time::age(time::now() - t)))
-            .unwrap_or_default()
-    };
+    let age = |t: Option<i64>| t.map(|t| time::ago(time::now() - t)).unwrap_or_default();
     let mut last_was_system = false;
     for (index, d) in shown {
         // GitLab's own notes: one dim line each, grouped.
@@ -1840,6 +1837,28 @@ fn activity_lines(
                 let mut spans = vec![bar.clone(), Span::raw(pad.to_string())];
                 spans.extend(l.spans);
                 lines.push(Line::from(spans));
+            }
+            // Replies between the first note and the newest ones that were
+            // not loaded.
+            if i == 0 && d.hidden > 0 {
+                let what = if d.hidden == 1 { "reply" } else { "replies" };
+                let gap = text::wrap(
+                    vec![Span::styled(
+                        format!("… {} earlier {what} not shown", d.hidden),
+                        Style::new().fg(FAINT),
+                    )],
+                    width.saturating_sub(2),
+                    Span::raw(""),
+                    Span::raw("  "),
+                );
+                for l in gap {
+                    if d.resolvable {
+                        hits.push((lines.len(), 0, width, Hit::Thread(index)));
+                    }
+                    let mut spans = vec![bar.clone(), Span::raw(" ")];
+                    spans.extend(l.spans);
+                    lines.push(Line::from(spans));
+                }
             }
         }
     }
@@ -3212,5 +3231,149 @@ mod tests {
             .expect("click area of / search");
         assert_eq!(hit, Hit::Key('/'));
         assert!(rect.width >= 1);
+    }
+
+    /// The text of each line `activity_lines` gives for `list`.
+    fn activity_text(list: Vec<crate::model::Discussion>) -> Vec<String> {
+        let activity = Activity::Loaded(list);
+        let (lines, _, _, _) =
+            activity_lines(Some(&activity), "me", 80, ThreadFilter::All, None, true);
+        lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect()
+    }
+
+    fn note_at(author: &str, body: &str, created: i64) -> crate::model::Note {
+        crate::model::Note {
+            author: author.into(),
+            body: body.into(),
+            created: Some(created),
+            system: false,
+        }
+    }
+
+    #[test]
+    fn fresh_notes_say_now_without_ago() {
+        let now = time::now();
+        let rows = activity_text(vec![
+            crate::model::Discussion {
+                id: String::new(),
+                resolvable: false,
+                resolved: false,
+                place: None,
+                notes: vec![note_at("sam", "Just now.", now - 5)],
+                hidden: 0,
+            },
+            crate::model::Discussion {
+                id: String::new(),
+                resolvable: false,
+                resolved: false,
+                place: None,
+                notes: vec![note_at("kim", "A bit ago.", now - 300)],
+                hidden: 0,
+            },
+            crate::model::Discussion {
+                id: String::new(),
+                resolvable: false,
+                resolved: false,
+                place: None,
+                notes: vec![crate::model::Note {
+                    system: true,
+                    ..note_at("alex", "added 2 commits", now + 20)
+                }],
+                hidden: 0,
+            },
+        ]);
+        assert!(!rows.iter().any(|r| r.contains("now ago")), "{rows:#?}");
+        assert!(
+            rows.iter().any(|r| r.contains("sam") && r.ends_with("now")),
+            "{rows:#?}"
+        );
+        assert!(rows.iter().any(|r| r.contains("kim  5m ago")), "{rows:#?}");
+        assert!(
+            rows.iter()
+                .any(|r| r.contains("added 2 commits") && r.ends_with("now")),
+            "clock skew: {rows:#?}"
+        );
+    }
+
+    #[test]
+    fn a_cut_thread_says_how_many_replies_are_not_shown() {
+        let now = time::now();
+        let thread = |hidden| crate::model::Discussion {
+            id: "gid://gitlab/Discussion/abc".into(),
+            resolvable: true,
+            resolved: false,
+            place: Some("src/a.rs:12".into()),
+            notes: vec![
+                note_at("alex", "First.", now - 7200),
+                note_at("sam", "Newest.", now - 60),
+            ],
+            hidden,
+        };
+        let rows = activity_text(vec![thread(12)]);
+        let first = rows.iter().position(|r| r.contains("First.")).unwrap();
+        let gap = rows
+            .iter()
+            .position(|r| r.contains("… 12 earlier replies not shown"))
+            .expect("the gap line");
+        let newest = rows.iter().position(|r| r.contains("↳ sam")).unwrap();
+        assert!(first < gap && gap < newest, "{rows:#?}");
+        // The header keeps its place and its button.
+        assert!(
+            rows.iter()
+                .any(|r| r.contains("src/a.rs:12") && r.contains(" Resolve ")),
+            "{rows:#?}"
+        );
+        let rows = activity_text(vec![thread(1)]);
+        assert!(
+            rows.iter()
+                .any(|r| r.contains("… 1 earlier reply not shown")),
+            "{rows:#?}"
+        );
+        let rows = activity_text(vec![thread(0)]);
+        assert!(!rows.iter().any(|r| r.contains("not shown")), "{rows:#?}");
+        // A narrow pane wraps the line instead of cutting it.
+        let activity = Activity::Loaded(vec![thread(12)]);
+        let (lines, _, _, _) =
+            activity_lines(Some(&activity), "me", 20, ThreadFilter::All, None, true);
+        let rows: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        let gap = rows.iter().position(|r| r.contains("… 12")).unwrap();
+        assert!(
+            rows[gap..gap + 3].iter().all(|r| r.chars().count() <= 20),
+            "{rows:#?}"
+        );
+        let words: Vec<&str> = rows.iter().flat_map(|r| r.split_whitespace()).collect();
+        assert!(
+            words.join(" ").contains("… 12 earlier replies not shown"),
+            "{rows:#?}"
+        );
+    }
+
+    #[test]
+    fn a_fresh_merge_request_was_opened_now() {
+        let overview = |created| {
+            let mut mr = sample_mr(1, ReviewState::Unreviewed, Pipeline::None);
+            mr.created = Some(created);
+            let mut app = app_with(vec![], vec![mr], false);
+            app.details = true;
+            app.mine_state.select(Some(0));
+            screen(&mut app, 160, 40)
+        };
+        let rows = overview(time::now() - 5);
+        assert!(
+            rows.iter().any(|r| r.contains("alex  opened now")),
+            "{rows:#?}"
+        );
+        assert!(!rows.iter().any(|r| r.contains("now ago")), "{rows:#?}");
+        let rows = overview(time::now() - 300);
+        assert!(
+            rows.iter().any(|r| r.contains("opened 5m ago")),
+            "{rows:#?}"
+        );
     }
 }

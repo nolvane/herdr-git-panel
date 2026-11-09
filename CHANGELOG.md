@@ -68,11 +68,16 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   only the error "Field 'approvalsLeft' doesn't exist on type
   'MergeRequest'". The Approvals column shows how many approved, and the
   details who did (#28).
-
 - On a narrow pane, the footer leaves out whole key hints from the right
   end instead of cutting one in the middle of its word, and always keeps
   two blanks before "r refresh" (#18).
-
+- The activity tab and the overview say "now" and "opened now" for
+  something less than a minute old, instead of "now ago" (#23).
+- A thread with more than 50 notes shows its first note and its newest
+  replies, with a dim line "… 12 earlier replies not shown" in between,
+  instead of only its oldest 50 notes, and sorts by its newest reply. A
+  merge request or pull request with more than 100 threads loads the 100
+  started last instead of the first 100 (#23).
 - With `glab` installed but not logged in, GitLab is now left out quietly,
   like GitHub without `gh`'s login, instead of showing "GitLab: Invalid
   token" in the footer on every refresh. When no forge can be used, the list

@@ -94,6 +94,16 @@ pub fn age(secs: i64) -> String {
     }
 }
 
+/// Age for "… ago" text: `now` under a minute, else `5m ago`.
+pub fn ago(secs: i64) -> String {
+    let short = age(secs);
+    if short == "now" {
+        short
+    } else {
+        format!("{short} ago")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,5 +136,16 @@ mod tests {
         assert_eq!(age(21 * 86_400), "3w");
         assert_eq!(age(90 * 86_400), "3mo");
         assert_eq!(age(800 * 86_400), "2y");
+    }
+
+    #[test]
+    fn agos_say_now_without_ago() {
+        assert_eq!(ago(0), "now");
+        assert_eq!(ago(59), "now");
+        assert_eq!(ago(-30), "now", "clock skew");
+        assert_eq!(ago(60), "1m ago");
+        assert_eq!(ago(300), "5m ago");
+        assert_eq!(ago(7200), "2h ago");
+        assert_eq!(ago(3 * 86_400), "3d ago");
     }
 }

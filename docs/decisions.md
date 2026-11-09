@@ -702,3 +702,26 @@ still only closes it. The version is `CARGO_PKG_VERSION`, the same value as
 `--version`, and the address is `repository` in `Cargo.toml`, so neither is
 written twice. `App::opener` starts the browser, so tests can put in one that
 starts nothing, like `App::poster` for posting.
+
+## 2026-11-09: Both ends of long threads, the newest 100 threads
+
+The activity request loads per thread its first note (`head: notes(first:
+1)`, on GitHub `comments`) and its newest 49 (`tail: notes(last: 49)`) with
+the thread's total (`count`, on GitHub `totalCount`), and the newest 100
+threads (`discussions(last: 100)`, `reviewThreads(last: 100)`). Both forges
+give notes oldest first, so `first: 50` dropped exactly the newest replies,
+and `first: 100` the newest threads.
+- `last: 100` counts threads by when they were started, not by their
+  latest reply: on a merge request with more than 100 threads (on GitLab
+  each system note is one), an old thread that just got a reply can still
+  be left out. Neither forge sorts threads by activity in this connection.
+- The first note stays because the thread's place (file and line) and the
+  reply marks hang on it. Head and tail overlap on a thread of up to 50
+  notes; `model::thread_notes` merges them by note id, so each note shows
+  once.
+- What lies between shows as one dim line "… N earlier replies not shown",
+  so a cut thread does not look complete. Paging through every note would
+  cost requests per thread, against "Comments loaded on demand".
+- GitLab complexity of the whole new request, measured on gitlab.com on
+  2026-11-09 with `queryComplexity`: 35 of the 250 allowed. GitHub accepts
+  the query; at most 100 × 50 comments stay far below its node limit.
