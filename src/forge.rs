@@ -632,7 +632,7 @@ mod tests {
         };
         assert_eq!(
             nobody([true, false]),
-            "glab is not logged in to git.acme.test: run glab auth login"
+            "glab is not logged in to git.acme.test: run glab auth login --hostname git.acme.test"
         );
         assert_eq!(
             nobody([false, true]),
@@ -640,7 +640,7 @@ mod tests {
         );
         assert_eq!(
             nobody(BOTH),
-            "glab is not logged in to git.acme.test: run glab auth login · \
+            "glab is not logged in to git.acme.test: run glab auth login --hostname git.acme.test · \
              gh is not logged in to github.com: run gh auth login"
         );
     }

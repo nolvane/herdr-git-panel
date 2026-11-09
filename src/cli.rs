@@ -163,9 +163,15 @@ pub fn not_logged_in(stderr: &str) -> bool {
         || lower.contains("invalid_token")
 }
 
-/// What to do about a tool that is not logged in to `host`.
+/// What to do about a tool that is not logged in to `host`. glab logs in
+/// to gitlab.com unless it is told another host.
 pub fn login_hint(name: &str, host: &str) -> String {
-    format!("{name} is not logged in to {host}: run {name} auth login")
+    let hostname = if name == "glab" && !host.eq_ignore_ascii_case("gitlab.com") {
+        format!(" --hostname {host}")
+    } else {
+        String::new()
+    };
+    format!("{name} is not logged in to {host}: run {name} auth login{hostname}")
 }
 
 /// A one-line reason from a tool's error output, which may start with a
@@ -399,9 +405,18 @@ mod tests {
                 "glab is not logged in to gitlab.com: run glab auth login"
             );
         }
+        // A self-hosted GitLab needs its host, or glab logs in to gitlab.com.
         assert_eq!(
             login_hint("glab", "git.acme.test"),
-            "glab is not logged in to git.acme.test: run glab auth login"
+            "glab is not logged in to git.acme.test: run glab auth login --hostname git.acme.test"
+        );
+        assert_eq!(
+            login_hint("glab", "GitLab.com"),
+            "glab is not logged in to GitLab.com: run glab auth login"
+        );
+        assert_eq!(
+            login_hint("gh", "github.com"),
+            "gh is not logged in to github.com: run gh auth login"
         );
     }
 }

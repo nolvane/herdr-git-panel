@@ -512,9 +512,13 @@ Now both forges work the same way (#19).
   `{"errors":[{"message":"Invalid token"}]}` on stdout and `glab: Invalid
   token` on stderr. For a host it was never logged in to it sends no token,
   and GitLab answers anonymously with `currentUser: null`.
-- One check for both: `cli::not_logged_in` also counts "invalid token" and
-  `invalid_token` (an expired OAuth token). GitLab's requests look at it
-  before the JSON answer, like GitHub's.
+- GitLab's JSON answer decides when there is one: "Invalid token",
+  `invalid_token` (an expired OAuth token) or "401 Unauthorized" in GitLab's
+  own error means not logged in, so an error that merely mentions 401 (a
+  query's complexity) still shows. Without JSON, `cli::not_logged_in` reads
+  glab's stderr as for gh; it now also knows "invalid token".
+- When one request of a refresh fails and another looks logged out, the
+  error wins and shows.
 - The list queries (open, merged and closed, "All" in one project and in
   your projects) return `None` when not logged in or answered anonymously;
   every one of them asks for `currentUser`, so "All" in your projects can
@@ -523,7 +527,12 @@ Now both forges work the same way (#19).
   on #19): "All" in a clone of that server's project still says that glab is
   not installed or not logged in there.
 - When no forge answers, the list names each installed tool that is not
-  logged in, with its `auth login` command, instead of always naming `gh`.
+  logged in, with its `auth login` command, instead of always naming `gh`;
+  for a GitLab host other than gitlab.com with `--hostname <host>`, since a
+  plain `glab auth login` logs in to gitlab.com.
+- Not done: one login check per refresh before the lists (such as `glab
+  auth status`). It would cost a request on every refresh while logged in
+  and change nothing the user sees.
 - Activity and resolving a thread act on one merge request the user chose,
   so they say "glab is not logged in to … : run glab auth login" instead of
   "GitLab: Invalid token"; that never reaches the footer.

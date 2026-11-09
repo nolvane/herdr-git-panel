@@ -217,13 +217,12 @@ pub fn fetch_all_of(
             .map(|r| r.join().unwrap_or_else(|_| Err("glab crashed".into())))
             .collect()
     });
-    // Logged out between the steps: quiet like the first step.
-    if answers.iter().any(|a| matches!(a, Ok(None))) {
+    let Some(answers) = all_answers(answers)? else {
         return Ok(None);
-    }
+    };
     let mut items = Vec::new();
-    for answer in answers.into_iter().flat_map(Result::transpose) {
-        items.extend(parse_members(&answer?, host)?);
+    for answer in answers {
+        items.extend(parse_members(&answer, host)?);
     }
     let mut part = newest(items, pick.total, ALL_LIMIT);
     part.projects = pick.members.iter().map(|p| format!("{host}/{p}")).collect();
@@ -307,10 +306,8 @@ pub fn fetch(host: &str, status: Status, project: Option<&str>) -> Result<Option
             mine.join().unwrap_or_else(|_| Err("glab crashed".into())),
         )
     });
-    let (mut merged, mine) = match (review, mine) {
-        (Ok(Some(review)), Ok(Some(mine))) => (review, mine),
-        (Ok(None), _) | (_, Ok(None)) => return Ok(None),
-        (Err(e), _) | (_, Err(e)) => return Err(e),
+    let Some((mut merged, mine)) = both_lists(review, mine)? else {
+        return Ok(None);
     };
     if merged.get("errors").is_none() && mine.get("errors").is_some() {
         merged = mine;
@@ -326,6 +323,22 @@ pub fn fetch(host: &str, status: Status, project: Option<&str>) -> Result<Option
         }
     }
     parse(&merged, host).map(Some)
+}
+
+/// Both answers of [`fetch`], `None` when either was not logged in. An error
+/// wins: it may be why the other one looked logged out.
+fn both_lists(
+    review: Result<Option<Value>, String>,
+    mine: Result<Option<Value>, String>,
+) -> Result<Option<(Value, Value)>, String> {
+    Ok(review?.zip(mine?))
+}
+
+/// The second step's answers, `None` when one was not logged in (logged
+/// out between the steps). An error wins, as in [`both_lists`].
+fn all_answers(answers: Vec<Result<Option<Value>, String>>) -> Result<Option<Vec<Value>>, String> {
+    let answers: Vec<Option<Value>> = answers.into_iter().collect::<Result<_, _>>()?;
+    Ok(answers.into_iter().collect())
 }
 
 /// Runs one list query through glab and returns GitLab's JSON answer,
@@ -364,14 +377,15 @@ fn request(host: &str, query: &str, vars: &[(&str, &str)]) -> Result<Value, Fail
 
 /// GitLab's answer in glab's output.
 fn answer(out: &cli::Output, host: &str) -> Result<Value, Failure> {
-    // Without a token GitLab answers 401 with a JSON error ("Invalid
-    // token"); glab says it on stderr too, so this comes first.
-    if !out.success && cli::not_logged_in(&out.stderr) {
-        return Err(Failure::NotLoggedIn);
-    }
     // GitLab's own errors come as JSON, also when glab exits with an error.
     if let Ok(value) = serde_json::from_slice::<Value>(&out.stdout) {
+        if !out.success && refused(&value) {
+            return Err(Failure::NotLoggedIn);
+        }
         return Ok(value);
+    }
+    if !out.success && cli::not_logged_in(&out.stderr) {
+        return Err(Failure::NotLoggedIn);
     }
     if !out.success {
         return Err(Failure::Other(cli::explain_failure(
@@ -381,6 +395,27 @@ fn answer(out: &cli::Output, host: &str) -> Result<Value, Failure> {
         )));
     }
     Err(Failure::Other("unreadable answer from GitLab".into()))
+}
+
+/// Whether GitLab's JSON answer refuses the token: without one, or with
+/// one it no longer takes, it answers 401 with "Invalid token" (GraphQL),
+/// `invalid_token` (an expired OAuth token) or "401 Unauthorized" (REST).
+/// Read from GitLab's own words only, so an error that merely mentions 401
+/// (a query's complexity) stays an error.
+fn refused(value: &Value) -> bool {
+    let text = cli::graphql_errors(value)
+        .into_iter()
+        .chain(
+            ["error", "message"]
+                .iter()
+                .filter_map(|k| value.get(*k).and_then(Value::as_str).map(String::from)),
+        )
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    ["invalid token", "invalid_token", "401 unauthorized"]
+        .iter()
+        .any(|w| text.contains(w))
 }
 
 /// [`request`] for one merge request the user acts on: not being logged in
@@ -1111,11 +1146,61 @@ mod tests {
         assert!(!anonymous(&json!({"data": {"project": null}})));
         // Every list query asks who you are, so an anonymous answer shows.
         for status in [Status::Open, Status::Merged, Status::Closed] {
-            assert!(list_query("authoredMergeRequests", status, true).contains("currentUser"));
-            assert!(PROJECT_ALL.contains("currentUser"));
-            assert!(MEMBER_PROJECTS.contains("currentUser { username }"));
-            assert!(member_query(&["acme/app".into()], None, status).contains("currentUser"));
+            let state = state_word(status);
+            for scoped in [false, true] {
+                assert!(
+                    list_query("authoredMergeRequests", status, scoped).contains("currentUser {")
+                );
+            }
+            assert!(PROJECT_ALL
+                .replace("STATE", state)
+                .contains("currentUser { username }"));
+            assert!(MEMBER_PROJECTS
+                .replace("STATE", state)
+                .contains("currentUser { username }"));
+            assert!(member_query(&["acme/app".into()], None, status)
+                .contains("currentUser { username }"));
         }
+    }
+
+    #[test]
+    fn an_error_that_mentions_401_is_not_a_login() {
+        // A logged-in query that GitLab refuses for another reason.
+        let complex = output(
+            false,
+            r#"{"errors":[{"message":"Query has complexity of 401, which exceeds max complexity of 250"}]}"#,
+            "glab: Query has complexity of 401, which exceeds max complexity of 250",
+        );
+        assert!(answer(&complex, "gitlab.com").is_ok());
+    }
+
+    #[test]
+    fn an_error_wins_over_being_logged_out() {
+        let timeout =
+            || Err::<Option<Value>, String>("gitlab.com did not answer within 30 s".into());
+        assert_eq!(
+            both_lists(Ok(None), timeout()).unwrap_err(),
+            "gitlab.com did not answer within 30 s"
+        );
+        assert_eq!(
+            both_lists(timeout(), Ok(None)).unwrap_err(),
+            "gitlab.com did not answer within 30 s"
+        );
+        assert!(both_lists(Ok(None), Ok(Some(json!({})))).unwrap().is_none());
+        assert_eq!(
+            all_answers(vec![timeout(), Ok(None)]).unwrap_err(),
+            "gitlab.com did not answer within 30 s"
+        );
+        assert!(all_answers(vec![Ok(Some(json!({}))), Ok(None)])
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            all_answers(vec![Ok(Some(json!({})))])
+                .unwrap()
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
