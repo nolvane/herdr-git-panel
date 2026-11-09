@@ -1264,6 +1264,27 @@ mod tests {
     }
 
     #[test]
+    fn escaped_lines_show_in_the_list_as_typed() {
+        let shown = |saved: &str| -> Vec<String> {
+            crate::text::markdown_links(saved, 80)
+                .0
+                .iter()
+                .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+                .collect()
+        };
+        let typed = "/merge later\nok /approve here\n/approve";
+        // A reply or comment: GitLab saves the note as sent.
+        assert_eq!(
+            shown(&escape_quick_actions(typed)),
+            typed.lines().collect::<Vec<_>>()
+        );
+        // A change request: GitLab saves it without the quick action line.
+        let note = request_changes_note(typed);
+        let saved = note.strip_prefix(REQUEST_CHANGES).unwrap().trim_start();
+        assert_eq!(shown(saved), typed.lines().collect::<Vec<_>>());
+    }
+
+    #[test]
     fn a_reason_is_sent_as_typed_otherwise() {
         for reason in [
             "\"quotes\" and 'single' and \\ backslashes",
