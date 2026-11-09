@@ -64,6 +64,8 @@ impl Section {
 pub enum Hit {
     Section(Section),
     Scope,
+    /// The title: steps open, merged, closed.
+    Status,
     /// A column heading: sorts by it, a second click turns the order round.
     Sort(SortKey),
     /// A table row, by its index in the current section.
@@ -156,6 +158,22 @@ struct Parked {
     data: Option<Data>,
     error: Option<String>,
     updated_at: Option<Instant>,
+    /// Where each section was, so coming back shows it as it was left.
+    tables: Option<[TableState; 3]>,
+}
+
+impl Parked {
+    /// Keeps a refresh's answer.
+    fn store(&mut self, result: Result<Fetched, String>) {
+        match result {
+            Ok(fetched) => {
+                self.data = Some(fetched.data);
+                self.error = fetched.warning;
+                self.updated_at = Some(Instant::now());
+            }
+            Err(e) => self.error = Some(e),
+        }
+    }
 }
 
 /// The built-in changes viewer.
@@ -575,6 +593,7 @@ impl App {
             data: self.data.take(),
             error: self.error.take(),
             updated_at: self.updated_at.take(),
+            tables: Some(Section::ORDER.map(|s| *self.table_state(s))),
         };
         self.parked.insert(self.status, shown);
         let back = self.parked.remove(&next).unwrap_or_default();
@@ -586,19 +605,33 @@ impl App {
         if next != Status::Open {
             self.show = Show::All;
         }
-        self.after_view_change();
+        match back.tables {
+            Some(tables) => {
+                for (section, table) in Section::ORDER.into_iter().zip(tables) {
+                    *self.table_state_mut(section) = table;
+                }
+                self.clamp_selection();
+            }
+            None => self.after_view_change(),
+        }
+        self.details_scroll = 0;
         // Other merge requests now: a thread chosen before is not theirs.
         self.thread = None;
-        // Missing, for the other scope or old: load at once (after the
-        // refresh running now, if any). Otherwise as usual.
+        self.schedule_shown();
+    }
+
+    /// Whether any section still waits for its list for this scope.
+    fn any_section_loading(&self) -> bool {
+        Section::ORDER.iter().any(|s| self.loading_section(*s))
+    }
+
+    /// When to load the state on screen: at once when its lists are
+    /// missing, for the other scope or old (after the refresh running now,
+    /// if any), otherwise one interval after they were loaded.
+    fn schedule_shown(&mut self) {
         let every = Duration::from_secs(self.config.refresh_secs);
         self.next_refresh = match self.updated_at {
-            Some(at)
-                if at.elapsed() < every
-                    && !Section::ORDER.iter().any(|s| self.loading_section(*s)) =>
-            {
-                at + every
-            }
+            Some(at) if at.elapsed() < every && !self.any_section_loading() => at + every,
             _ => Instant::now(),
         };
     }
@@ -1070,6 +1103,7 @@ impl App {
                 }
                 Some(Hit::Section(s)) => self.section = s,
                 Some(Hit::Scope) => self.toggle_scope(),
+                Some(Hit::Status) => self.step_status(),
                 Some(Hit::Sort(k)) => self.sort_by(k),
                 Some(Hit::Row(i)) => {
                     // A second click on the same row within half a second
@@ -1108,17 +1142,9 @@ impl App {
             self.next_refresh = Instant::now() + Duration::from_secs(self.config.refresh_secs);
             if status != self.status {
                 // Asked for before the state changed: keep it for that state,
-                // and load the one on screen now.
-                let parked = self.parked.entry(status).or_default();
-                match result {
-                    Ok(fetched) => {
-                        parked.data = Some(fetched.data);
-                        parked.error = fetched.warning;
-                        parked.updated_at = Some(Instant::now());
-                    }
-                    Err(e) => parked.error = Some(e),
-                }
-                self.next_refresh = Instant::now();
+                // and load the one on screen when it needs it.
+                self.parked.entry(status).or_default().store(result);
+                self.schedule_shown();
                 continue;
             }
             match result {
@@ -1131,7 +1157,7 @@ impl App {
                     // closed lists) are for the other scope. Only after an
                     // answer, so a failing forge is not asked again at once,
                     // over and over.
-                    if Section::ORDER.iter().any(|s| self.loading_section(*s)) {
+                    if self.any_section_loading() {
                         self.next_refresh = Instant::now();
                     }
                 }
@@ -1258,7 +1284,7 @@ impl App {
         // "All", and merged and closed ones, list other merge requests per
         // scope: load them now (the main loop starts it; one already running
         // is followed by another).
-        if Section::ORDER.iter().any(|s| self.loading_section(*s)) {
+        if self.any_section_loading() {
             self.next_refresh = Instant::now();
         }
     }
@@ -2141,6 +2167,55 @@ mod tests {
         press(&mut app, KeyCode::Char('z'));
         assert_eq!(iids(&app.rows(Section::Mine)), [13], "shown at once");
         assert!(app.next_refresh <= Instant::now(), "and loaded again");
+    }
+
+    #[test]
+    fn a_late_answer_does_not_reload_a_fresh_list() {
+        let mut app = app();
+        app.updated_at = Some(Instant::now());
+        // A refresh of open ones runs; z goes round to open ones again.
+        app.loading = true;
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Char('z'));
+        }
+        assert_eq!(app.status, Status::Open);
+        app.loading = true;
+        answer(&mut app, Status::Merged, merged_data(None));
+        assert!(
+            app.next_refresh > Instant::now(),
+            "open ones were loaded a moment ago"
+        );
+    }
+
+    #[test]
+    fn coming_back_keeps_where_each_section_was() {
+        let mut app = app();
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Char('2'));
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Char('z'));
+        answer(&mut app, Status::Merged, merged_data(None));
+        assert_eq!(app.review_state.selected(), Some(0), "a new list");
+        press(&mut app, KeyCode::Char('z'));
+        press(&mut app, KeyCode::Char('z'));
+        assert_eq!(app.review_state.selected(), Some(1));
+        assert_eq!(app.mine_state.selected(), Some(2));
+        assert_eq!(app.selected().map(|mr| mr.iid), Some(2));
+    }
+
+    #[test]
+    fn clicking_the_title_while_searching_switches_the_state() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('/'));
+        press(&mut app, KeyCode::Char('x'));
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let title: String = (0..20).map(|x| buf[(x, 0)].symbol()).collect();
+        click(&mut app, title.find("Merge").unwrap() as u16, 0);
+        assert_eq!(app.status, Status::Merged);
+        assert_eq!(app.filter, "x", "nothing typed into the search");
     }
 
     #[test]

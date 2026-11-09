@@ -423,15 +423,17 @@ the list opens on open ones, like its other filters.
 - GitHub's search string now goes in as a GraphQL variable, and a repository
   name only goes into it when it is a plain `owner/name`, so a remote's path
   cannot add search terms.
-- The lists of each state are kept while the list is open, so going back is
-  instant; a kept state that is older than the refresh interval, or kept from
+- The lists of each state are kept while the list is open, with each
+  section's selected row, so going back is instant and shows them as left;
+  a kept state that is older than the refresh interval, or kept from
   before an approve, merge or draft change, loads again when shown. An answer
   for a state no longer on screen is kept for that state, and the shown one
-  loads at once.
+  loads at once when it is missing or old.
 - Approve, merge, draft and opening the branch are refused on merged and
   closed ones, and their hints left out: they act on an open merge request
   (a merged branch is often deleted). Resolving a thread stays as it is:
-  the forge decides whether it is allowed there. The quick filters (`f`) are about what still
-  needs doing, so they are off for merged and closed ones.
+  the forge decides whether it is allowed there. The quick filters (`f`)
+  are about what still needs doing, so they are off for merged and closed
+  ones.
 - `state` adds about 3 to the complexity of GitLab's "All" request over 50
   projects, measured at 209 of the 250 allowed.

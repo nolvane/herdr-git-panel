@@ -100,8 +100,8 @@ a narrow pane). Every section follows it, each row says "Merged" or
   on GitLab, 30 on GitHub). With "this project" they are that project's own
   newest, asked from its forge only, so `a` loads them again.
 - The lists of each state are kept while the list is open: switching back to
-  open ones shows them at once. `r` and the automatic refresh load the state
-  on screen.
+  open ones shows them at once, with the rows selected where you left them.
+  `r` and the automatic refresh load the state on screen.
 - Merged and closed ones can be opened, copied, looked at in the details
   panel, the activity tab and the changes viewer, searched and sorted.
   Approving (`v`), merging (`m`), draft (`w`) and opening the branch (`b`)

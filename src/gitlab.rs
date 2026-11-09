@@ -311,6 +311,7 @@ pub fn fetch(host: &str, status: Status, project: Option<&str>) -> Result<Data, 
 
 /// Runs one list query through glab and returns GitLab's JSON answer.
 fn query(host: &str, list: &str, status: Status, project: Option<&str>) -> Result<Value, String> {
+    // Only a query that declares `$project` may get it.
     let project = project.filter(|_| status != Status::Open);
     let vars: Vec<(&str, &str)> = project.map(|p| ("project", p)).into_iter().collect();
     graphql(host, &list_query(list, status, project.is_some()), &vars)

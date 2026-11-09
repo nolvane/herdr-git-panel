@@ -467,7 +467,7 @@ fn draw_header(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
     // A click on the title steps the state, like its key.
     let title_width = Line::from(title.as_str()).width() as u16;
     app.hits
-        .push((Rect::new(line.x, line.y, title_width, 1), Hit::Key('z')));
+        .push((Rect::new(line.x, line.y, title_width, 1), Hit::Status));
     let mut spans = vec![Span::styled(
         format!("{title}   "),
         Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
@@ -864,26 +864,26 @@ fn draw_table(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
             let state = app.status.name();
             let what = match (app.section, app.status) {
                 (Section::Review, Status::Open) => "Nothing to review",
-                (Section::Review, _) => &format!("No {state} {noun} you reviewed"),
+                (Section::Review, _) => &format!("No {state} {noun} with you as reviewer"),
                 (Section::Mine, _) => &format!("No {state} {noun} of yours"),
                 (Section::All, _) => &format!("No {state} {noun}"),
             };
             (format!("{what}{place}{hint}"), MUTED)
         };
         // Wrapped on narrow panes instead of cut off.
-        let lines = (Line::from(text.as_str()).width() as u16).div_ceil(inner.width.max(1));
+        let lines = text::wrap(
+            vec![Span::styled(text, Style::new().fg(color))],
+            inner.width,
+            Span::raw(""),
+            Span::raw(""),
+        );
         let [_, mid, _] = Layout::vertical([
             Constraint::Fill(1),
-            Constraint::Length(lines.max(1) + 1),
+            Constraint::Length(lines.len().max(1) as u16),
             Constraint::Fill(1),
         ])
         .areas(inner);
-        frame.render_widget(
-            Paragraph::new(Span::styled(text, Style::new().fg(color)))
-                .alignment(Alignment::Center)
-                .wrap(ratatui::widgets::Wrap { trim: true }),
-            mid,
-        );
+        frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), mid);
         return;
     }
 
@@ -2436,7 +2436,10 @@ mod tests {
         let mut app = empty(Status::Merged);
         assert!(shown(&mut app, "No merged merge requests of yours"));
         app.section = Section::Review;
-        assert!(shown(&mut app, "No merged merge requests you reviewed"));
+        assert!(shown(
+            &mut app,
+            "No merged merge requests with you as reviewer"
+        ));
         app.section = Section::All;
         assert!(shown(&mut app, "No merged merge requests in your projects"));
         // This project, with the hint for all projects.
@@ -2470,13 +2473,14 @@ mod tests {
         };
         app.project = Some(project.clone());
         app.data.as_mut().unwrap().of = Some(project);
-        let rows = screen(&mut app, 60, 20);
-        let text = rows.join(" ");
-        assert!(
-            text.contains("No closed merge requests of yours"),
-            "{rows:#?}"
-        );
-        assert!(text.contains("shows all projects)"), "{rows:#?}");
+        for width in [60, 25] {
+            let rows = screen(&mut app, width, 20);
+            let words: Vec<&str> = rows.iter().flat_map(|r| r.split_whitespace()).collect();
+            let text = words.join(" ");
+            let message =
+                "No closed merge requests of yours in herdr-git-panel (a shows all projects)";
+            assert!(text.contains(message), "{rows:#?}");
+        }
     }
 
     #[test]
