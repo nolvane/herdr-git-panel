@@ -1165,6 +1165,7 @@ impl App {
         }
         if self.typing {
             let line: String = text
+                .replace("\r\n", "\n")
                 .chars()
                 .map(|c| if c.is_control() { ' ' } else { c })
                 .collect();
@@ -2924,7 +2925,7 @@ mod tests {
     fn a_paste_goes_into_the_search_on_one_line() {
         let mut app = app();
         press(&mut app, KeyCode::Char('/'));
-        app.event(Event::Paste("change\n5".into()));
+        app.event(Event::Paste("change\r\n5".into()));
         assert_eq!(app.filter, "change 5");
         assert_eq!(iids(&app.rows(Section::Mine)), [5]);
         // Outside of any field a paste does nothing (no y copies, no q).
