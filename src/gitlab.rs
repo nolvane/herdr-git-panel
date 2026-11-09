@@ -675,10 +675,35 @@ fn request_changes_note(reason: &str) -> String {
     format!("{REQUEST_CHANGES}\n\n{}", escaped.join("\n"))
 }
 
+/// Whether GitLab ran the quick action of a change request: it takes the
+/// line out of the note it saves, so a saved note that still holds it
+/// (a server before 17.2, or one with request changes off) means only the
+/// comment was posted. `stdout` is GitLab's answer to the note.
+fn took_change_request(stdout: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(stdout)
+        .ok()
+        .and_then(|v| v["body"].as_str().map(str::to_string))
+        .is_none_or(|body| !body.lines().any(|l| l.trim() == REQUEST_CHANGES))
+}
+
 /// Requests changes with `reason`: a comment on the merge request that
 /// also submits your review as "requested changes".
 pub fn request_changes(mr: &MergeRequest, reason: &str) -> Result<(), String> {
-    post_note(mr, None, &request_changes_note(reason))
+    let mut cmd = cli::command("glab");
+    cmd.args(note_args(&mr.host, &mr.project, mr.iid, None)?);
+    let note = request_changes_note(reason);
+    let out = cli::run_input("glab", cmd, &mr.host, note_body(&note))?;
+    if !out.success {
+        return Err(cli::api_error("glab", &mr.host, "GitLab", &out));
+    }
+    if took_change_request(&out.stdout) {
+        Ok(())
+    } else {
+        Err(format!(
+            "GitLab posted the reason as a comment but did not request changes: {} needs GitLab 17.2 or newer with request changes on",
+            mr.host
+        ))
+    }
 }
 
 /// Merges the merge request with its own settings (squash, delete branch),
@@ -955,6 +980,24 @@ mod tests {
         // GitLab would read commands in as text.
         let note = request_changes_note("```\nunclosed");
         assert!(note.starts_with("/submit_review requested_changes\n"));
+    }
+
+    #[test]
+    fn a_saved_note_that_still_holds_the_quick_action_requested_nothing() {
+        // As gitlab.com answered on 2026-11-09: the quick action taken out.
+        assert!(took_change_request(
+            br#"{"id":1,"body":"Please rename it.","commands_changes":{}}"#
+        ));
+        // A server that did not run it keeps the line in the note.
+        assert!(!took_change_request(
+            br#"{"id":1,"body":"/submit_review requested_changes\n\nPlease rename it."}"#
+        ));
+        // The escaped reason itself does not count.
+        assert!(took_change_request(
+            br#"{"id":1,"body":"\\/submit_review requested_changes"}"#
+        ));
+        // An answer that is no note (only commands) counts as taken.
+        assert!(took_change_request(br#"{"commands_changes":{}}"#));
     }
 
     #[test]

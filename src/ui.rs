@@ -1975,7 +1975,7 @@ fn draw_footer(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
 /// preview the question with clickable buttons (only `y` posts).
 fn draw_compose_footer(frame: &mut Frame, app: &mut App, c: Compose, area: Rect) {
     let bold = Style::new().fg(TEXT).add_modifier(Modifier::BOLD);
-    let button = |text: &'static str, bg| {
+    let button = |text: String, bg| {
         Span::styled(
             text,
             Style::new()
@@ -1990,7 +1990,7 @@ fn draw_compose_footer(frame: &mut Frame, app: &mut App, c: Compose, area: Rect)
         Stage::Writing => (
             format!(" {}  ", cut(&c.title(), 60)),
             vec![
-                (button(" Ctrl+s send ", GREEN), Some('s')),
+                (button(" Ctrl+s send ".into(), GREEN), Some('s')),
                 (Span::raw(" "), None),
                 (plain(" Esc discard "), Some('\u{1b}')),
                 (Span::styled("   ⏎ new line ", Style::new().fg(FAINT)), None),
@@ -1999,17 +1999,7 @@ fn draw_compose_footer(frame: &mut Frame, app: &mut App, c: Compose, area: Rect)
         Stage::Preview => (
             format!(" {} ", cut(&c.question(), 70)),
             vec![
-                (
-                    button(
-                        if c.verb() == "send" {
-                            " y send "
-                        } else {
-                            " y post "
-                        },
-                        GREEN,
-                    ),
-                    Some('y'),
-                ),
+                (button(format!(" y {} ", c.verb()), GREEN), Some('y')),
                 (Span::raw(" "), None),
                 (plain(" n edit "), Some('n')),
                 (Span::raw(" "), None),
@@ -2670,7 +2660,9 @@ mod tests {
                 .iter()
                 .position(|r| r.contains("d changes"))
                 .expect("actions");
-            let line = rows[at..=at + 1].join(" ").replace('\u{a0}', " ");
+            let line = rows[at..rows.len().min(at + 2)]
+                .join(" ")
+                .replace('\u{a0}', " ");
             (line, rows)
         };
         let mut app = app_in(Status::Merged);

@@ -152,7 +152,7 @@ impl Compose {
     pub fn verb(&self) -> &'static str {
         match self.target {
             Target::RequestChanges => "send",
-            _ => "post",
+            Target::Reply { .. } | Target::Comment => "post",
         }
     }
 
@@ -189,7 +189,7 @@ impl Compose {
     pub fn blank(&self) -> &'static str {
         match self.target {
             Target::RequestChanges => "Nothing to send: write what should change first",
-            _ => "Nothing to post: write something first",
+            Target::Reply { .. } | Target::Comment => "Nothing to post: write something first",
         }
     }
 
@@ -198,7 +198,7 @@ impl Compose {
     pub fn past(&self) -> &'static str {
         match self.target {
             Target::RequestChanges => "sent",
-            _ => "posted",
+            Target::Reply { .. } | Target::Comment => "posted",
         }
     }
 

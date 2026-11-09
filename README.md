@@ -327,7 +327,8 @@ to a thread, a comment or a change request (all after confirming), and
 resolving a thread or opening it again. Replies, comments and change
 requests go through `glab api` (GitLab's REST API) and `gh api` (GitHub's
 GraphQL API for replies, REST for comments and reviews), with the text as
-typed, sent to them on standard input. `b` runs
+typed, sent to them on standard input; on GitLab a change request adds the
+quick action line in front and a backslash before lines starting with `/`. `b` runs
 `git fetch` against the clone's remote, creates or moves forward a local
 branch that is not checked out anywhere, sets its upstream when it has
 none, and asks Herdr to create the folder. Nothing else is stored and

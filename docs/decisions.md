@@ -577,11 +577,11 @@ failure keeps the text in the open box with the reason.
   `REQUESTED_CHANGES` (GitLab's documentation of the quick action). Like the web's
   "Request changes", it also publishes your pending draft comments. The
   quick action goes first, so nothing in the reason (an unclosed code
-  block, an HTML block, `>>>`) can hide it. Its success is not read back:
-  GitLab answers the same whether the quick action ran or not; the Review
-  dot (for reviewers) and the system note in the activity tab show it at
-  the refresh. A server older than 17.2, or one with "request changes"
-  off, posts only the comment.
+  block, an HTML block, `>>>`) can hide it. GitLab answers with the note
+  as it saved it, without the line when the quick action ran; a server
+  older than 17.2, or one with "request changes" off, keeps the line, and
+  the list then says that only the comment was posted instead of
+  "Changes requested".
 - GitLab runs every line of a note that starts with `/` in its first column
   as a quick action, so a reason such as "/merge later" would merge. Each
   such line gets a backslash in front (`\/merge later`), which GitLab leaves
