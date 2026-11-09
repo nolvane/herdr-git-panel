@@ -22,8 +22,8 @@ and how users install it: [README.md](README.md). Why it is built this way:
   date).
 - The repository is public: no personal data, no secrets, no private setup.
   Examples and tests use made-up projects and people (`acme/app`, `@alex`).
-- Every write to a forge (approve, merge) asks for `y` first, except ones the
-  same key undoes (resolve a thread, draft on or off).
+- Every write to a forge (approve, merge, reply, comment) asks for `y` first,
+  except ones the same key undoes (resolve a thread, draft on or off).
 
 ## Checks
 

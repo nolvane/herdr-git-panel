@@ -457,6 +457,70 @@ pub fn set_resolved(host: &str, discussion: &str, resolve: bool) -> Result<(), S
     }
 }
 
+/// A project path as one segment of a REST path: `acme/app` → `acme%2Fapp`.
+fn encode_path(path: &str) -> String {
+    path.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+/// The arguments of `glab api` that post a note on merge request `iid`: a
+/// reply to the discussion `thread` (GraphQL's global id, such as
+/// `gid://gitlab/Discussion/<hex>`), or a comment on the merge request
+/// itself. The text goes on standard input ([`note_body`]), never in an
+/// argument, so glab reads nothing in it as a file or `:placeholder`.
+fn note_args(
+    host: &str,
+    project: &str,
+    iid: u64,
+    thread: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let mut endpoint = format!("projects/{}/merge_requests/{iid}", encode_path(project));
+    if let Some(thread) = thread {
+        let hex = thread
+            .strip_prefix("gid://gitlab/Discussion/")
+            .filter(|h| !h.is_empty() && h.bytes().all(|b| b.is_ascii_hexdigit()))
+            .ok_or("GitLab: this is not a thread that takes replies")?;
+        endpoint.push_str(&format!("/discussions/{hex}"));
+    }
+    endpoint.push_str("/notes");
+    Ok([
+        "api",
+        "--hostname",
+        host,
+        "--method",
+        "POST",
+        &endpoint,
+        "--input",
+        "-",
+    ]
+    .map(String::from)
+    .to_vec())
+}
+
+/// The request body of a note: the text as typed, as JSON.
+fn note_body(body: &str) -> Vec<u8> {
+    serde_json::json!({ "body": body }).to_string().into_bytes()
+}
+
+/// Posts `body` as a reply to a thread (`Some`) or as a comment on the
+/// merge request.
+pub fn post_note(mr: &MergeRequest, thread: Option<&str>, body: &str) -> Result<(), String> {
+    let mut cmd = cli::command("glab");
+    cmd.args(note_args(&mr.host, &mr.project, mr.iid, thread)?);
+    let out = cli::run_input("glab", cmd, &mr.host, note_body(body))?;
+    if out.success {
+        Ok(())
+    } else {
+        Err(cli::api_error("glab", &mr.host, "GitLab", &out))
+    }
+}
+
 /// Merges the merge request with its own settings (squash, delete branch),
 /// only if its head is still the one the list showed.
 pub fn merge(mr: &MergeRequest) -> Result<(), String> {
@@ -677,6 +741,64 @@ mod tests {
         );
         assert_eq!(approval_args(false, ""), ["approve"]);
         assert_eq!(approval_args(true, "abc123"), ["revoke"]);
+    }
+
+    #[test]
+    fn a_reply_goes_to_its_discussion_and_a_comment_to_the_merge_request() {
+        let reply = note_args(
+            "gitlab.com",
+            "acme/web app",
+            90,
+            Some("gid://gitlab/Discussion/3f2a9c"),
+        )
+        .unwrap();
+        assert_eq!(
+            reply,
+            [
+                "api",
+                "--hostname",
+                "gitlab.com",
+                "--method",
+                "POST",
+                "projects/acme%2Fweb%20app/merge_requests/90/discussions/3f2a9c/notes",
+                "--input",
+                "-",
+            ]
+        );
+        let comment = note_args("git.acme.test", "acme/app", 7, None).unwrap();
+        assert_eq!(comment[2], "git.acme.test");
+        assert_eq!(comment[5], "projects/acme%2Fapp/merge_requests/7/notes");
+    }
+
+    #[test]
+    fn note_text_is_sent_as_typed() {
+        for body in [
+            "@alex please check",
+            "@/etc/passwd",
+            "line one\nline two",
+            "see :branch and :id",
+            "[a,b]",
+            "\"quotes\" and \\ backslashes",
+        ] {
+            let sent: Value = serde_json::from_slice(&note_body(body)).unwrap();
+            assert_eq!(sent, json!({ "body": body }));
+        }
+    }
+
+    #[test]
+    fn only_gitlab_discussion_ids_take_replies() {
+        for thread in [
+            "",
+            "PRRT_kwDOabc",
+            "gid://gitlab/Discussion/",
+            "gid://gitlab/Discussion/../../projects",
+            "gid://gitlab/Note/12",
+        ] {
+            assert!(
+                note_args("gitlab.com", "acme/app", 7, Some(thread)).is_err(),
+                "{thread}"
+            );
+        }
     }
 
     use super::*;

@@ -49,7 +49,13 @@ first, with replies, the file and line a thread is on and the forge's own
 notes (approvals, new commits) as short lines. Show all, only open or only resolved
 threads (`t`, or click the chips); `n` selects the next thread and `N` the
 previous one, `e` (or the thread's "Mark resolved" / "Reopen thread" button)
-resolves the selected thread or opens it again. Links in both tabs (the merge
+resolves the selected thread or opens it again. On open ones, `>` replies to
+the selected thread and `+` writes a comment on the merge request itself: a
+box at the bottom of the panel takes the text, over several lines (`Enter`
+adds a line break, pasted text goes in whole). `Ctrl+s` shows what will be
+posted and where (`↑` `↓` scroll a long text), `y` posts it (`n` goes back to
+the text, `Esc` throws it away). The new reply or comment then shows in the tab; when posting fails,
+the box says why and keeps the text. Links in both tabs (the merge
 request's link, Markdown links and plain URLs in descriptions and comments)
 open in the browser with a click.
 
@@ -194,6 +200,9 @@ the pointer is over it.
 | `t` | Activity: all, open or resolved threads |
 | `n` `N` | Activity: select the next or previous thread |
 | `e` | Activity: resolve the selected thread, or open it again |
+| `>` | Activity, open ones: reply to the selected thread |
+| `+` | Activity, open ones: write a comment on the merge request |
+| `Enter` `Ctrl+s` `Esc` | In the text of a reply or comment: line break, show it before posting (`y` posts), discard |
 | `v` | Open ones: approve (or take your approval back), after confirming |
 | `m` | Open ones: merge, after confirming, when GitLab or GitHub allows it |
 | `w` | Your own open ones: mark as draft, or as ready for review again |
@@ -299,8 +308,11 @@ When the list opens, it reads the git remote of its directory from
   for that project only.
 
 Comments load when a merge request's activity tab is open. The list only
-writes what you asked for: an approval or taking one back, a merge (both
-after confirming), and resolving a thread or opening it again. `b` runs
+writes what you asked for: an approval or taking one back, a merge, a reply
+to a thread or a comment (all after confirming), and resolving a thread or
+opening it again. Replies and comments go through `glab api` (GitLab's REST
+API) and `gh api` (GitHub's GraphQL API for replies, REST for comments),
+with the text as typed, sent to them on standard input. `b` runs
 `git fetch` against the clone's remote, creates or moves forward a local
 branch that is not checked out anywhere, sets its upstream when it has
 none, and asks Herdr to create the folder. Nothing else is stored and

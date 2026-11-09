@@ -8,6 +8,7 @@
 mod app;
 mod branch;
 mod cli;
+mod compose;
 mod config;
 mod diff;
 mod forge;
@@ -45,13 +46,17 @@ fn list() -> std::io::Result<()> {
     app.remotes = here.as_deref().map(repo::remotes_of).unwrap_or_default();
     app.workdir = here;
     let mut terminal = ratatui::init();
+    // Bracketed paste: pasted text comes as one piece, so a line break or a
+    // `y` in it is text, not a key.
     let _ = ratatui::crossterm::execute!(
         std::io::stdout(),
-        ratatui::crossterm::event::EnableMouseCapture
+        ratatui::crossterm::event::EnableMouseCapture,
+        ratatui::crossterm::event::EnableBracketedPaste
     );
     let result = app.run(&mut terminal);
     let _ = ratatui::crossterm::execute!(
         std::io::stdout(),
+        ratatui::crossterm::event::DisableBracketedPaste,
         ratatui::crossterm::event::DisableMouseCapture
     );
     ratatui::restore();

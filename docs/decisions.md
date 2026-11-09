@@ -437,3 +437,58 @@ the list opens on open ones, like its other filters.
   ones.
 - `state` adds about 3 to the complexity of GitLab's "All" request over 50
   projects, measured at 209 of the 250 allowed.
+
+## 2026-11-09: Replies and comments from the activity tab
+
+`>` replies to the selected thread and `+` writes a comment on the merge
+request (the owner's decision on #10); both keys only act in the activity
+tab, like `t`, `n` and `e`. The text field takes several lines: `Enter` adds a
+line break, `Ctrl+s` finishes, `Esc` throws the text away (also the owner's
+decision). Finishing shows the text and where it goes; only `y` (or a click
+on its button) posts, never `Enter`, so a second `Enter` can't post unread
+text. `n` goes back to the text instead of throwing it away, since a reply
+can be long.
+
+- The field lives in `src/compose.rs` with no forge or drawing code, and its
+  target is an enum (`Reply`, `Comment`), so requesting changes with a text
+  (#11) adds a target and reuses the field and the preview.
+- The field keeps a copy of the merge request and the thread's forge id,
+  not their places in the lists, so a refresh while writing can't send the
+  text elsewhere. While it is open every key goes into it; clicks only work
+  on its own buttons and the wheel only scrolls the panel.
+- GitLab gets REST through `glab api` (`…/discussions/<id>/notes` for a
+  reply, `…/notes` for a comment), which needs no new field in the list's
+  query; the thread id must be a GitLab discussion id before it goes into
+  the path. GitHub gets `addPullRequestReviewThreadReply` (GraphQL, with the
+  thread id already loaded) and the conversation's REST comments endpoint.
+  A GitHub reply that lands in a review of yours that is not submitted yet
+  says so instead of "Reply posted".
+- The text never goes into an argument: it is the JSON body of the request
+  on the tool's standard input (`--input -`). As an argument, `-F` would
+  read `@…` as a file, glab fills in `:placeholders` for `-F`, the GitHub
+  GraphQL helper sends values starting with `$int:` as `-F`, Linux allows at
+  most 128 KiB in one argument, and the text would show in the process list.
+- Bracketed paste is on: pasted text arrives in one piece, so a line break
+  or a `y` in it can't finish or confirm anything. The search field takes a
+  paste on one line.
+- Replies and comments are refused on merged and closed ones, like approve,
+  merge, draft and the branch, so the merged and closed lists stay for
+  looking back. Both forges would accept them; this is easy to turn around.
+- A text taller than the box scrolls (`↑` `↓`, the wheel over the box); the
+  preview starts at its top, so all of it can be read before `y`. A post
+  that runs out of time may still have reached the forge, so the list says
+  so and loads the comments again instead of inviting a second post. What
+  other writes report (a merge that failed) still shows next to the box.
+- After a post the merge request's comments load again (answers of loads
+  started before it are dropped), the list refreshes, and the same merge
+  request and thread stay selected by key and id: they move to the top,
+  since both lists are sorted newest first. The list now keeps each
+  section's merge request selected by key on every refresh, not by its row.
+- Posting runs through the official APIs with the user's own login (the
+  logged-in `glab` and `gh`), one text the user wrote and confirmed at a
+  time. GitHub's Acceptable Use Policies forbid spam and "excessive automated
+  bulk activity", its API terms abuse of the API; GitLab's Acceptable Use
+  Policy forbids sending spam. None of that covers this use (read on
+  2026-11-09: docs.github.com/en/site-policy/github-terms/github-terms-of-service,
+  docs.github.com/en/site-policy/acceptable-use-policies/github-acceptable-use-policies,
+  handbook.gitlab.com/handbook/legal/acceptable-use-policy/).

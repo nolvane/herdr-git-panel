@@ -205,6 +205,37 @@ pub fn set_resolved(mr: &MergeRequest, thread: &str, resolve: bool) -> Result<()
     }
 }
 
+/// How a forge took a reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Posted {
+    /// Everyone sees it now.
+    Now,
+    /// GitHub added it to a review of yours that is not submitted yet.
+    InPendingReview,
+}
+
+/// Replies `body` to the thread with the forge's id `thread`.
+pub fn reply(mr: &MergeRequest, thread: &str, body: &str) -> Result<Posted, String> {
+    match mr.forge {
+        Forge::GitLab => gitlab::post_note(mr, Some(thread), body).map(|()| Posted::Now),
+        Forge::GitHub => github::reply(thread, body).map(|pending| {
+            if pending {
+                Posted::InPendingReview
+            } else {
+                Posted::Now
+            }
+        }),
+    }
+}
+
+/// Posts `body` as a comment on the merge request itself.
+pub fn comment(mr: &MergeRequest, body: &str) -> Result<(), String> {
+    match mr.forge {
+        Forge::GitLab => gitlab::post_note(mr, None, body),
+        Forge::GitHub => github::comment(mr, body),
+    }
+}
+
 pub fn set_draft(mr: &MergeRequest, draft: bool) -> Result<(), String> {
     match mr.forge {
         Forge::GitLab => gitlab::set_draft(mr, draft),

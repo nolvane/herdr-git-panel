@@ -367,7 +367,7 @@ impl From<Failure> for String {
 }
 
 /// Runs a GraphQL query through gh. Variables starting with `$int:` are sent
-/// as numbers.
+/// as numbers, so text someone typed never goes in here (see [`reply`]).
 fn graphql(query: &str, vars: &[(&str, &str)]) -> Result<Value, Failure> {
     let mut cmd = cli::command("gh");
     cmd.args(["api", "graphql", "--hostname", HOST, "-f"])
@@ -707,6 +707,75 @@ pub fn set_resolved(thread: &str, resolve: bool) -> Result<(), String> {
     }
 }
 
+const REPLY: &str = "mutation($thread: ID!, $body: String!) { addPullRequestReviewThreadReply(input: {pullRequestReviewThreadId: $thread, body: $body}) { comment { state } } }";
+
+/// The arguments of `gh api` that send a request whose body (JSON) comes on
+/// standard input: the text never goes into an argument, where `-F` would
+/// read `@…` as a file and a long text would meet the length limit of one
+/// argument.
+fn input_args(endpoint: &str, method: &str) -> Vec<String> {
+    [
+        "api",
+        "--hostname",
+        HOST,
+        "--method",
+        method,
+        endpoint,
+        "--header",
+        "Content-Type: application/json",
+        "--input",
+        "-",
+    ]
+    .map(String::from)
+    .to_vec()
+}
+
+/// The GraphQL request that replies `body` to the review thread `thread`.
+fn reply_body(thread: &str, body: &str) -> Vec<u8> {
+    serde_json::json!({ "query": REPLY, "variables": { "thread": thread, "body": body } })
+        .to_string()
+        .into_bytes()
+}
+
+/// Replies to a review thread. `Ok(true)` when GitHub kept the reply in a
+/// review of yours that is not submitted yet, so nobody sees it until then.
+pub fn reply(thread: &str, body: &str) -> Result<bool, String> {
+    let mut cmd = cli::command("gh");
+    cmd.args(input_args("graphql", "POST"));
+    let out = cli::run_input("gh", cmd, HOST, reply_body(thread, body))?;
+    if !out.success && cli::not_logged_in(&out.stderr) {
+        return Err(String::from(Failure::NotLoggedIn));
+    }
+    let value = serde_json::from_slice::<Value>(&out.stdout)
+        .map_err(|_| cli::explain_failure("gh", HOST, &out.stderr))?;
+    if let Some(msg) = cli::graphql_errors(&value) {
+        return Err(format!("GitHub: {msg}"));
+    }
+    let state = value
+        .pointer("/data/addPullRequestReviewThreadReply/comment/state")
+        .and_then(Value::as_str)
+        .ok_or("GitHub did not confirm the reply")?;
+    Ok(state == "PENDING")
+}
+
+/// The REST endpoint of a pull request's conversation comments.
+fn comments_endpoint(project: &str, iid: u64) -> String {
+    format!("repos/{project}/issues/{iid}/comments")
+}
+
+/// Posts a comment on the pull request, in its conversation.
+pub fn comment(mr: &MergeRequest, body: &str) -> Result<(), String> {
+    let mut cmd = cli::command("gh");
+    cmd.args(input_args(&comments_endpoint(&mr.project, mr.iid), "POST"));
+    let data = serde_json::json!({ "body": body }).to_string().into_bytes();
+    let out = cli::run_input("gh", cmd, HOST, data)?;
+    if out.success {
+        Ok(())
+    } else {
+        Err(cli::api_error("gh", HOST, "GitHub", &out))
+    }
+}
+
 /// Merges the pull request with the repository's default method, only if
 /// its head is still the one the list showed.
 pub fn merge(mr: &MergeRequest) -> Result<(), String> {
@@ -794,6 +863,48 @@ mod tests {
             ]
         );
         assert_eq!(approve_args("acme/app", 7, "").len(), 8);
+    }
+
+    #[test]
+    fn a_reply_names_its_thread_and_a_comment_its_pull_request() {
+        assert_eq!(
+            input_args("graphql", "POST"),
+            [
+                "api",
+                "--hostname",
+                "github.com",
+                "--method",
+                "POST",
+                "graphql",
+                "--header",
+                "Content-Type: application/json",
+                "--input",
+                "-",
+            ]
+        );
+        let sent: Value = serde_json::from_slice(&reply_body("PRRT_kwDOabc", "Done.")).unwrap();
+        assert_eq!(
+            sent,
+            json!({"query": REPLY, "variables": {"thread": "PRRT_kwDOabc", "body": "Done."}})
+        );
+        assert_eq!(
+            comments_endpoint("acme/app", 2903),
+            "repos/acme/app/issues/2903/comments"
+        );
+    }
+
+    #[test]
+    fn reply_text_is_sent_as_typed() {
+        for body in [
+            "@alex please check",
+            "$int:5",
+            "$int:@/etc/passwd",
+            "two\nlines",
+            "\"quotes\" and {owner}",
+        ] {
+            let sent: Value = serde_json::from_slice(&reply_body("PRRT_x", body)).unwrap();
+            assert_eq!(sent["variables"]["body"], body);
+        }
     }
 
     fn pr(number: u64, author: &str) -> Value {

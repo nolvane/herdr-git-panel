@@ -1,8 +1,9 @@
 //! The list's state and its event loop: keys, mouse, approvals, automatic
 //! and manual refresh.
 
+use crate::compose::{Compose, Edit, Stage, Target};
 use crate::config::{Config, Scope};
-use crate::forge::{self, Fetched};
+use crate::forge::{self, Fetched, Posted};
 use crate::model::{AllList, Data, Forge, MergeRequest, MergeState, Status};
 use crate::repo::Project;
 use crate::ui;
@@ -88,6 +89,23 @@ pub enum Hit {
     Link(usize),
     /// Anywhere while the help is open: closes it.
     Help,
+    /// A button of the text field in the footer, by its key (`s` for
+    /// `Ctrl+s`, `\u{1b}` for `Esc`); the only clicks while it is open.
+    Compose(char),
+    /// The text field's box (the wheel scrolls it).
+    ComposeBox,
+}
+
+/// Sends a text to the forge: the list's own is [`post`]; tests put in one
+/// that never runs glab or gh.
+pub type Poster = fn(&MergeRequest, &Target, &str) -> Result<Posted, String>;
+
+/// Posts a reply or a comment through the merge request's forge.
+pub fn post(mr: &MergeRequest, target: &Target, body: &str) -> Result<Posted, String> {
+    match target {
+        Target::Reply { thread, .. } => forge::reply(mr, thread, body),
+        Target::Comment => forge::comment(mr, body).map(|()| Posted::Now),
+    }
 }
 
 /// What waits for confirmation.
@@ -123,6 +141,14 @@ pub enum Activity {
 }
 
 type ActivityKey = (String, u64);
+
+/// A load of comments as it comes back: for which merge request, which
+/// load (see `App::activity_wanted`) and its answer.
+type ActivityAnswer = (
+    ActivityKey,
+    u64,
+    Result<Vec<crate::model::Discussion>, String>,
+);
 
 /// Which threads the activity tab shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -276,12 +302,27 @@ pub struct App {
     pub thread: Option<usize>,
     /// Comments per merge request, with the update time they were loaded for.
     pub activity: std::collections::HashMap<ActivityKey, (Option<i64>, Activity)>,
-    activity_tx: Sender<(ActivityKey, Result<Vec<crate::model::Discussion>, String>)>,
+    /// The newest load asked for per merge request; answers of older ones
+    /// are dropped, so a load started before a post can't hide the post.
+    activity_wanted: std::collections::HashMap<ActivityKey, u64>,
+    activity_seq: u64,
+    /// The thread (by the forge's id) to select again once the comments of
+    /// that merge request have loaded again: they are sorted newest first,
+    /// so a thread moves when someone replies.
+    keep_thread: Option<(ActivityKey, String)>,
+    activity_tx: Sender<ActivityAnswer>,
     resolve_tx: Sender<(ActivityKey, usize, bool, Result<(), String>)>,
     resolve_rx: Receiver<(ActivityKey, usize, bool, Result<(), String>)>,
     /// Scroll the activity tab to the selected thread on the next frame.
     pub scroll_to_thread: bool,
-    activity_rx: Receiver<(ActivityKey, Result<Vec<crate::model::Discussion>, String>)>,
+    activity_rx: Receiver<ActivityAnswer>,
+    /// A reply or comment being written; while open, every key goes into it.
+    pub compose: Option<Compose>,
+    pub poster: Poster,
+    post_tx: Sender<Result<Posted, String>>,
+    post_rx: Receiver<Result<Posted, String>>,
+    /// Refresh again as soon as the one running now has answered.
+    refresh_again: bool,
     pub sort: SortKey,
     pub descending: bool,
     pub show: Show,
@@ -328,6 +369,7 @@ impl App {
         let (diff_tx, diff_rx) = mpsc::channel();
         let (resolve_tx, resolve_rx) = mpsc::channel();
         let (branch_tx, branch_rx) = mpsc::channel();
+        let (post_tx, post_rx) = mpsc::channel();
         let scope = config.scope;
         // Until icons are chosen, say how to fix "?" or boxes in place of icons.
         let flash = (!config.icons_chosen).then(|| {
@@ -362,8 +404,16 @@ impl App {
             thread_filter: ThreadFilter::All,
             thread: None,
             activity: std::collections::HashMap::new(),
+            activity_wanted: std::collections::HashMap::new(),
+            activity_seq: 0,
+            keep_thread: None,
             activity_tx,
             activity_rx,
+            compose: None,
+            poster: post,
+            post_tx,
+            post_rx,
+            refresh_again: false,
             resolve_tx,
             resolve_rx,
             scroll_to_thread: false,
@@ -579,6 +629,15 @@ impl App {
         });
     }
 
+    /// Refreshes from the main loop at once, or right after the refresh that
+    /// is running now, which may have been asked before a write.
+    fn refresh_soon(&mut self) {
+        self.next_refresh = Instant::now();
+        if self.loading {
+            self.refresh_again = true;
+        }
+    }
+
     /// What a refresh asks for: the state on screen, and "All" (and merged
     /// or closed lists) for the scope on screen.
     pub fn fetch_request(&self) -> (Status, Option<Project>) {
@@ -645,7 +704,8 @@ impl App {
     }
 
     /// Says so when `mr` is merged or closed, where only open ones can be
-    /// approved, merged, set to draft or opened as a branch.
+    /// approved, merged, set to draft, opened as a branch, replied to or
+    /// commented on.
     fn refuse_closed(&mut self, mr: &MergeRequest) -> bool {
         if mr.status == Status::Open {
             return false;
@@ -869,12 +929,25 @@ impl App {
             Some((at, _)) if *at == updated => return,
             _ => {}
         }
+        // The selected thread is found again by its id once loaded.
+        if let (Some(i), Some((_, Activity::Loaded(list)))) = (self.thread, self.activity.get(&key))
+        {
+            if let Some(d) = list.get(i) {
+                // A thread kept by a post for this merge request wins.
+                if self.keep_thread.as_ref().is_none_or(|(k, _)| *k != key) {
+                    self.keep_thread = Some((key.clone(), d.id.clone()));
+                }
+            }
+        }
         self.activity
             .insert(key.clone(), (updated, Activity::Loading));
+        self.activity_seq += 1;
+        let seq = self.activity_seq;
+        self.activity_wanted.insert(key.clone(), seq);
         let tx = self.activity_tx.clone();
         std::thread::spawn(move || {
             let result = forge::fetch_activity(&mr);
-            let _ = tx.send((key, result));
+            let _ = tx.send((key, seq, result));
         });
     }
 
@@ -885,13 +958,262 @@ impl App {
     }
 
     fn receive_activity(&mut self) {
-        while let Ok((key, result)) = self.activity_rx.try_recv() {
+        while let Ok((key, seq, result)) = self.activity_rx.try_recv() {
+            if self.activity_wanted.get(&key) != Some(&seq) {
+                // An older load, or one from before a post.
+                continue;
+            }
             let updated = self.activity.get(&key).and_then(|(u, _)| *u);
             let value = match result {
-                Ok(list) => Activity::Loaded(list),
+                Ok(list) => {
+                    self.reselect_thread(&key, &list);
+                    Activity::Loaded(list)
+                }
                 Err(e) => Activity::Failed(e),
             };
             self.activity.insert(key, (updated, value));
+        }
+    }
+
+    /// Selects the kept thread again in the comments just loaded for `key`,
+    /// when that merge request is still the selected one.
+    fn reselect_thread(&mut self, key: &ActivityKey, list: &[crate::model::Discussion]) {
+        let Some((kept, id)) = self.keep_thread.clone() else {
+            return;
+        };
+        if &kept != key {
+            return;
+        }
+        self.keep_thread = None;
+        if self.selected().map(|mr| mr.key()).as_ref() != Some(key) {
+            return;
+        }
+        // Only when the filter shows it; otherwise `e` or `>` would act on
+        // a thread nobody sees.
+        self.thread = list
+            .iter()
+            .position(|d| d.id == id && d.resolvable && self.thread_filter.keeps(d));
+        self.scroll_to_thread = self.thread.is_some();
+    }
+
+    /// The selected thread, when it is one that takes replies.
+    fn selected_thread(&self) -> Option<&crate::model::Discussion> {
+        match self.selected_activity() {
+            Some(Activity::Loaded(list)) => self
+                .thread
+                .and_then(|i| list.get(i))
+                .filter(|d| d.resolvable && !d.id.is_empty()),
+            _ => None,
+        }
+    }
+
+    /// The forge's id of the selected thread, when it belongs to `key`.
+    fn selected_thread_id(&self, key: &ActivityKey) -> Option<String> {
+        if self.selected().map(|mr| mr.key()).as_ref() != Some(key) {
+            return None;
+        }
+        self.selected_thread().map(|d| d.id.clone())
+    }
+
+    /// `>`: opens the text field for a reply to the selected thread.
+    fn open_reply(&mut self) {
+        let Some(mr) = self.selected().cloned() else {
+            return;
+        };
+        if self.refuse_closed(&mr) {
+            return;
+        }
+        let thread = self
+            .selected_thread()
+            .map(|d| (d.id.clone(), d.place.clone()));
+        let Some((thread, place)) = thread else {
+            self.say("Choose a thread first: n");
+            return;
+        };
+        self.compose = Some(Compose::new(mr, Target::Reply { thread, place }));
+    }
+
+    /// `+`: opens the text field for a comment on the selected merge request.
+    fn open_comment(&mut self) {
+        let Some(mr) = self.selected().cloned() else {
+            return;
+        };
+        if self.refuse_closed(&mr) {
+            return;
+        }
+        self.compose = Some(Compose::new(mr, Target::Comment));
+    }
+
+    /// Keys while the text field is open: they all go to it.
+    fn compose_key(&mut self, code: KeyCode, mods: KeyModifiers) {
+        let Some(c) = self.compose.as_mut() else {
+            return;
+        };
+        // A text taller than the box scrolls, also in the preview, so all
+        // of it can be read before it is posted.
+        match code {
+            KeyCode::Up => return c.scroll(1),
+            KeyCode::Down => return c.scroll(-1),
+            KeyCode::PageUp => return c.scroll(5),
+            KeyCode::PageDown => return c.scroll(-5),
+            _ => {}
+        }
+        match c.stage {
+            Stage::Writing => match c.field.key(code, mods) {
+                Edit::Changed => {
+                    c.message = None;
+                    // Back to the end, where the typing is.
+                    c.scroll_up = 0;
+                }
+                Edit::Finish if c.field.is_blank() => {
+                    c.message = Some("Nothing to post: write something first".into());
+                }
+                Edit::Finish => {
+                    c.message = None;
+                    c.stage = Stage::Preview;
+                    // The preview starts at the top of the text.
+                    c.scroll_up = u16::MAX;
+                }
+                Edit::Discard => self.discard_compose(),
+                Edit::Ignored => {}
+            },
+            // Only y posts: Enter could be pressed once too often.
+            Stage::Preview => match code {
+                KeyCode::Char('y') if !mods.contains(KeyModifiers::CONTROL) => self.post(),
+                KeyCode::Char('n') if !mods.contains(KeyModifiers::CONTROL) => {
+                    c.stage = Stage::Writing
+                }
+                KeyCode::Esc => self.discard_compose(),
+                _ => {}
+            },
+            // Sent: wait for the forge.
+            Stage::Posting => {}
+        }
+    }
+
+    /// A click on one of the text field's buttons in the footer.
+    fn compose_click(&mut self, key: char) {
+        let Some(stage) = self.compose.as_ref().map(|c| c.stage) else {
+            return;
+        };
+        match (stage, key) {
+            (Stage::Writing, 's') => self.compose_key(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            (Stage::Preview, 'y' | 'n') => self.compose_key(KeyCode::Char(key), KeyModifiers::NONE),
+            (Stage::Writing | Stage::Preview, '\u{1b}') => {
+                self.compose_key(KeyCode::Esc, KeyModifiers::NONE)
+            }
+            _ => {}
+        }
+    }
+
+    fn discard_compose(&mut self) {
+        let noun = self.compose.take().map(|c| c.noun()).unwrap_or("text");
+        self.say(format!("Discarded the {noun}"));
+    }
+
+    /// Sends the text in the background; the field stays until the forge
+    /// answers, so a failure keeps the text.
+    fn post(&mut self) {
+        let Some(c) = self.compose.as_mut() else {
+            return;
+        };
+        c.stage = Stage::Posting;
+        c.message = None;
+        let job = c.clone();
+        let tx = self.post_tx.clone();
+        let poster = self.poster;
+        std::thread::spawn(move || {
+            // A panic still answers, so the field does not wait for ever.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                poster(&job.mr, &job.target, &job.field.text)
+            }))
+            .unwrap_or_else(|_| Err(format!("Posting the {} failed", job.noun())));
+            let _ = tx.send(result);
+        });
+    }
+
+    fn receive_posted(&mut self) {
+        while let Ok(result) = self.post_rx.try_recv() {
+            let Some(mut c) = self.compose.take() else {
+                continue;
+            };
+            match result {
+                Ok(posted) => {
+                    self.say(match posted {
+                        Posted::Now => c.done().to_string(),
+                        Posted::InPendingReview => {
+                            "Reply added to your pending review: submit it on GitHub".to_string()
+                        }
+                    });
+                    let key = c.mr.key();
+                    let keep = match &c.target {
+                        Target::Reply { thread, .. } => Some(thread.clone()),
+                        Target::Comment => {
+                            // New comments are at the top.
+                            if self.selected().map(|mr| mr.key()).as_ref() == Some(&key) {
+                                self.details_scroll = 0;
+                            }
+                            self.selected_thread_id(&key)
+                        }
+                    };
+                    self.keep_thread = keep.map(|id| (key.clone(), id));
+                    // Load its comments again, and drop any load still running.
+                    self.activity.remove(&key);
+                    self.activity_wanted.remove(&key);
+                    self.after_write();
+                    self.refresh_soon();
+                }
+                Err(e) => {
+                    // Out of time: the forge may have taken it all the same,
+                    // so load its comments again to see.
+                    let e = if e.contains("did not answer within") {
+                        let key = c.mr.key();
+                        self.activity.remove(&key);
+                        self.activity_wanted.remove(&key);
+                        format!(
+                            "{e}: the {} may have been posted, check above before sending again",
+                            c.noun()
+                        )
+                    } else {
+                        e
+                    };
+                    c.stage = Stage::Writing;
+                    c.message = Some(e.clone());
+                    self.compose = Some(c);
+                    self.say(e);
+                }
+            }
+        }
+    }
+
+    /// Pasted text (bracketed paste): whole into the text field or the
+    /// search, so a line break or a `y` in it acts on nothing else.
+    fn paste(&mut self, text: &str) {
+        if let Some(c) = self.compose.as_mut() {
+            if c.stage == Stage::Writing {
+                c.field.paste(text);
+                c.message = None;
+                c.scroll_up = 0;
+            }
+            return;
+        }
+        if self.typing {
+            let line: String = text
+                .replace("\r\n", "\n")
+                .chars()
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .collect();
+            self.filter.push_str(&line);
+            self.after_view_change();
+        }
+    }
+
+    fn event(&mut self, ev: Event) {
+        match ev {
+            Event::Key(k) if k.kind == KeyEventKind::Press => self.key(k.code, k.modifiers),
+            Event::Mouse(m) => self.mouse(m),
+            Event::Paste(text) => self.paste(&text),
+            _ => {}
         }
     }
 
@@ -1086,6 +1408,36 @@ impl App {
             }
             return;
         }
+        // While writing, clicks only reach the field's own buttons, and the
+        // wheel only scrolls the panel: nothing may change what the text is
+        // for or type into it.
+        if self.compose.is_some() {
+            let over_panel = matches!(
+                hit,
+                Some(Hit::Details | Hit::Thread(_) | Hit::Resolve(_) | Hit::Threads(_))
+            );
+            match m.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if let Some(Hit::Compose(c)) = hit {
+                        self.compose_click(c);
+                    }
+                }
+                MouseEventKind::ScrollDown if hit == Some(Hit::ComposeBox) => {
+                    self.compose_key(KeyCode::Down, KeyModifiers::NONE)
+                }
+                MouseEventKind::ScrollUp if hit == Some(Hit::ComposeBox) => {
+                    self.compose_key(KeyCode::Up, KeyModifiers::NONE)
+                }
+                MouseEventKind::ScrollDown if over_panel => {
+                    self.details_scroll = self.details_scroll.saturating_add(2)
+                }
+                MouseEventKind::ScrollUp if over_panel => {
+                    self.details_scroll = self.details_scroll.saturating_sub(2)
+                }
+                _ => {}
+            }
+            return;
+        }
         match m.kind {
             MouseEventKind::Down(MouseButton::Left) => match hit {
                 Some(Hit::Panel(tab)) => self.switch_panel(tab),
@@ -1147,12 +1499,34 @@ impl App {
                 self.schedule_shown();
                 continue;
             }
+            if self.refresh_again {
+                // Asked for before a write: load again with it.
+                self.refresh_again = false;
+                self.next_refresh = Instant::now();
+            }
             match result {
                 Ok(fetched) => {
+                    // Each section keeps its merge request selected, also
+                    // when it moved (the newest come first, and a write
+                    // makes it the newest).
+                    let kept = Section::ORDER.map(|s| self.selected_key_in(s));
+                    let shown = self.selected().map(|mr| mr.key());
                     self.data = Some(fetched.data);
                     self.error = fetched.warning;
                     self.updated_at = Some(Instant::now());
+                    for (section, key) in Section::ORDER.into_iter().zip(kept) {
+                        let Some(key) = key else {
+                            continue;
+                        };
+                        if let Some(i) = self.rows(section).iter().position(|mr| mr.key() == key) {
+                            self.table_state_mut(section).select(Some(i));
+                        }
+                    }
                     self.clamp_selection();
+                    if self.selected().map(|mr| mr.key()) != shown {
+                        // Another merge request now: the thread is not its.
+                        self.thread = None;
+                    }
                     // `a` was pressed while loading: "All" (or merged and
                     // closed lists) are for the other scope. Only after an
                     // answer, so a failing forge is not asked again at once,
@@ -1164,6 +1538,12 @@ impl App {
                 Err(e) => self.error = Some(e),
             }
         }
+    }
+
+    /// The merge request selected in a section, by its key.
+    fn selected_key_in(&self, section: Section) -> Option<ActivityKey> {
+        let i = self.table_state(section).selected()?;
+        self.rows(section).get(i).map(|mr| mr.key())
     }
 
     /// Keeps each section's selection inside its list.
@@ -1312,6 +1692,11 @@ impl App {
     }
 
     fn key(&mut self, code: KeyCode, mods: KeyModifiers) {
+        // While a reply or comment is written, every key goes into it.
+        if self.compose.is_some() {
+            self.compose_key(code, mods);
+            return;
+        }
         if self.diff.is_some() {
             self.diff_key(code, mods);
             return;
@@ -1380,6 +1765,8 @@ impl App {
                 self.thread = None;
                 self.details_scroll = 0;
             }
+            KeyCode::Char('>') if self.in_activity() => self.open_reply(),
+            KeyCode::Char('+') if self.in_activity() => self.open_comment(),
             KeyCode::Char('e') if self.in_activity() => {
                 if let Some(t) = self.thread {
                     self.toggle_resolved(t);
@@ -1471,6 +1858,7 @@ impl App {
             self.receive_diff();
             self.receive_resolved();
             self.receive_branch();
+            self.receive_posted();
             self.load_activity();
             if !self.loading && Instant::now() >= self.next_refresh {
                 self.refresh();
@@ -1482,11 +1870,7 @@ impl App {
             }
             terminal.draw(|frame| ui::draw(frame, &mut self))?;
             if event::poll(Duration::from_millis(250))? {
-                match event::read()? {
-                    Event::Key(k) if k.kind == KeyEventKind::Press => self.key(k.code, k.modifiers),
-                    Event::Mouse(m) => self.mouse(m),
-                    _ => {}
-                }
+                self.event(event::read()?);
             }
         }
         Ok(())
@@ -2228,6 +2612,732 @@ mod tests {
         let x = title.find("Merge").expect("title") as u16;
         click(&mut app, x, 0);
         assert_eq!(app.status, Status::Merged);
+    }
+
+    /// Comments of a merge request: an open thread on a line, a plain
+    /// comment, and a resolved thread.
+    fn discussions() -> Vec<crate::model::Discussion> {
+        let note = |author: &str, body: &str, at: i64| crate::model::Note {
+            author: author.into(),
+            body: body.into(),
+            created: Some(at),
+            system: false,
+        };
+        vec![
+            crate::model::Discussion {
+                id: "gid://gitlab/Discussion/aaa".into(),
+                resolvable: true,
+                resolved: false,
+                place: Some("src/a.rs:7".into()),
+                notes: vec![note("sam", "Why?", 30)],
+            },
+            crate::model::Discussion {
+                id: String::new(),
+                resolvable: false,
+                resolved: false,
+                place: None,
+                notes: vec![note("alex", "Nice.", 20)],
+            },
+            crate::model::Discussion {
+                id: "gid://gitlab/Discussion/bbb".into(),
+                resolvable: true,
+                resolved: true,
+                place: None,
+                notes: vec![note("sam", "Typo.", 10)],
+            },
+        ]
+    }
+
+    /// The list with the details panel on the activity tab of !6, its
+    /// comments loaded, and a poster that only says what it was given.
+    fn in_activity() -> App {
+        let mut app = app();
+        app.details = true;
+        app.panel_tab = PanelTab::Activity;
+        let mr = app.selected().cloned().unwrap();
+        app.activity
+            .insert(mr.key(), (mr.updated, Activity::Loaded(discussions())));
+        app.poster = echo;
+        app
+    }
+
+    /// Never posts: fails with what it was asked to post, so tests see it.
+    fn echo(mr: &MergeRequest, target: &Target, body: &str) -> Result<Posted, String> {
+        let to = match target {
+            Target::Reply { thread, .. } => format!("reply {thread}"),
+            Target::Comment => "comment".to_string(),
+        };
+        Err(format!("{} {} {to}: {body}", mr.project, mr.reference()))
+    }
+
+    fn posts(_: &MergeRequest, _: &Target, _: &str) -> Result<Posted, String> {
+        Ok(Posted::Now)
+    }
+
+    fn pending(_: &MergeRequest, _: &Target, _: &str) -> Result<Posted, String> {
+        Ok(Posted::InPendingReview)
+    }
+
+    fn type_text(app: &mut App, text: &str) {
+        for c in text.chars() {
+            match c {
+                '\n' => press(app, KeyCode::Enter),
+                c => press(app, KeyCode::Char(c)),
+            }
+        }
+    }
+
+    fn ctrl_s(app: &mut App) {
+        app.key(KeyCode::Char('s'), KeyModifiers::CONTROL);
+    }
+
+    fn stage(app: &App) -> Option<Stage> {
+        app.compose.as_ref().map(|c| c.stage)
+    }
+
+    fn text(app: &App) -> &str {
+        app.compose
+            .as_ref()
+            .map(|c| c.field.text.as_str())
+            .unwrap_or("")
+    }
+
+    /// Waits for the background post to answer.
+    fn wait_posted(app: &mut App) {
+        let until = Instant::now() + Duration::from_secs(10);
+        while stage(app) == Some(Stage::Posting) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+            app.receive_posted();
+        }
+        assert_ne!(stage(app), Some(Stage::Posting), "no answer");
+    }
+
+    /// Writes `body` and posts it with y.
+    fn write_and_post(app: &mut App, key: char, body: &str) {
+        press(app, KeyCode::Char(key));
+        type_text(app, body);
+        ctrl_s(app);
+        press(app, KeyCode::Char('y'));
+        wait_posted(app);
+    }
+
+    /// Comments of `key` loaded again, as the background load sends them.
+    fn reload(app: &mut App, key: &ActivityKey, list: Vec<crate::model::Discussion>) {
+        app.activity_seq += 1;
+        let seq = app.activity_seq;
+        app.activity_wanted.insert(key.clone(), seq);
+        app.activity
+            .insert(key.clone(), (Some(99), Activity::Loading));
+        app.activity_tx.send((key.clone(), seq, Ok(list))).unwrap();
+        app.receive_activity();
+    }
+
+    fn screen_text(app: &mut App, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| ui::draw(frame, app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..height)
+            .map(|y| (0..width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn reply_opens_a_field_for_the_selected_thread() {
+        let mut app = in_activity();
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(app.thread, Some(0));
+        press(&mut app, KeyCode::Char('>'));
+        let c = app.compose.as_ref().expect("a field");
+        assert_eq!(
+            c.target,
+            Target::Reply {
+                thread: "gid://gitlab/Discussion/aaa".into(),
+                place: Some("src/a.rs:7".into()),
+            }
+        );
+        assert_eq!(c.mr.iid, 6);
+        assert!(screen_text(&mut app, 120, 40).contains("Reply to thread on src/a.rs:7 · !6"));
+    }
+
+    #[test]
+    fn reply_without_a_thread_says_to_choose_one() {
+        let mut app = in_activity();
+        press(&mut app, KeyCode::Char('>'));
+        assert!(app.compose.is_none());
+        assert_eq!(flash(&app), Some("Choose a thread first: n"));
+        // Comments still loading: no thread to reply to either.
+        let mut app = in_activity();
+        app.activity.clear();
+        app.thread = Some(0);
+        press(&mut app, KeyCode::Char('>'));
+        assert!(app.compose.is_none());
+    }
+
+    #[test]
+    fn comment_opens_a_field_also_without_comments() {
+        let mut app = in_activity();
+        let key = app.selected().unwrap().key();
+        app.activity
+            .insert(key, (Some(6), Activity::Loaded(Vec::new())));
+        assert!(screen_text(&mut app, 120, 40).contains("No activity yet."));
+        press(&mut app, KeyCode::Char('+'));
+        let c = app.compose.as_ref().expect("a field");
+        assert_eq!(c.target, Target::Comment);
+        assert!(screen_text(&mut app, 120, 40).contains("Comment on !6"));
+    }
+
+    #[test]
+    fn reply_and_comment_keys_only_work_in_the_activity_tab() {
+        let mut app = in_activity();
+        app.thread = Some(0);
+        app.panel_tab = PanelTab::Overview;
+        press(&mut app, KeyCode::Char('>'));
+        press(&mut app, KeyCode::Char('+'));
+        assert!(app.compose.is_none());
+        app.details = false;
+        app.panel_tab = PanelTab::Activity;
+        press(&mut app, KeyCode::Char('>'));
+        press(&mut app, KeyCode::Char('+'));
+        assert!(app.compose.is_none());
+    }
+
+    #[test]
+    fn every_key_goes_into_the_field() {
+        let mut app = in_activity();
+        press(&mut app, KeyCode::Char('+'));
+        let section = app.section;
+        type_text(&mut app, "q y n / r z a 1 2 c p ? d b v m x");
+        app.key(KeyCode::Char('Q'), KeyModifiers::SHIFT);
+        app.key(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(text(&app), "q y n / r z a 1 2 c p ? d b v m xQ    ");
+        assert!(!app.ask_quit && !app.quit);
+        assert!(!app.typing && app.filter.is_empty());
+        assert!(!app.loading && !app.help && app.diff.is_none());
+        assert_eq!(app.status, Status::Open);
+        assert_eq!(app.scope, Scope::Current);
+        assert_eq!(app.section, section);
+        assert_eq!(app.panel_tab, PanelTab::Activity);
+        assert!(app.details);
+        assert_eq!(app.mine_state.selected(), Some(0));
+        assert_eq!(stage(&app), Some(Stage::Writing));
+    }
+
+    #[test]
+    fn ctrl_s_shows_what_will_be_posted_and_where() {
+        let mut app = in_activity();
+        press(&mut app, KeyCode::Char('n'));
+        press(&mut app, KeyCode::Char('>'));
+        type_text(&mut app, "Fixed in\nthe next commit");
+        ctrl_s(&mut app);
+        assert_eq!(stage(&app), Some(Stage::Preview));
+        let shown = screen_text(&mut app, 150, 40);
+        assert!(
+            shown.contains("Post reply to thread on src/a.rs:7 · !6?"),
+            "{shown}"
+        );
+        assert!(shown.contains("y post"), "{shown}");
+        assert!(shown.contains("Fixed in"), "{shown}");
+        assert!(shown.contains("the next commit"), "{shown}");
+        // n goes back to the text.
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(stage(&app), Some(Stage::Writing));
+        assert_eq!(text(&app), "Fixed in\nthe next commit");
+    }
+
+    #[test]
+    fn only_y_posts_not_enter() {
+        let mut app = in_activity();
+        press(&mut app, KeyCode::Char('+'));
+        type_text(&mut app, "ok");
+        ctrl_s(&mut app);
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('x'));
+        assert_eq!(stage(&app), Some(Stage::Preview));
+        assert_eq!(text(&app), "ok");
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(stage(&app), Some(Stage::Posting));
+        wait_posted(&mut app);
+        // The echo poster got it.
+        let c = app.compose.as_ref().unwrap();
+        assert_eq!(c.message.as_deref(), Some("acme/app !6 comment: ok"));
+    }
+
+    #[test]
+    fn a_click_on_y_posts_and_other_clicks_do_nothing() {
+        let mut app = in_activity();
+        press(&mut app, KeyCode::Char('n'));
+        press(&mut app, KeyCode::Char('>'));
+        type_text(&mut app, "ok");
+        // While writing: rows, tabs, the resolve button and key hints are dead.
+        let mut terminal = Terminal::new(TestBackend::new(150, 40)).unwrap();
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        let spots: Vec<(Rect, Hit)> = app.hits.clone();
+        for (r, hit) in &spots {
+            if !matches!(hit, Hit::Compose(_)) {
+                click(&mut app, r.x, r.y);
+            }
+        }
+        assert_eq!(text(&app), "ok");
+        assert_eq!(stage(&app), Some(Stage::Writing));
+        assert_eq!(app.thread, Some(0));
+        let found = discussions();
+        let Some((_, Activity::Loaded(list))) =
+            app.activity.get(&app.compose.as_ref().unwrap().mr.key())
+        else {
+            panic!("comments gone");
+        };
+        assert_eq!(list, &found, "nothing resolved");
+        // Ctrl+s as a button, then y.
+        let button = |app: &App, k: char| {
+            app.hits
+                .iter()
+                .find(|(_, h)| *h == Hit::Compose(k))
+                .map(|(r, _)| *r)
+                .expect("button")
+        };
+        let send = button(&app, 's');
+        click(&mut app, send.x, send.y);
+        assert_eq!(stage(&app), Some(Stage::Preview));
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        let yes = button(&app, 'y');
+        click(&mut app, yes.x, yes.y);
+        assert_eq!(stage(&app), Some(Stage::Posting));
+    }
+
+    #[test]
+    fn esc_discards_while_writing_and_in_the_preview() {
+        let mut app = in_activity();
+        press(&mut app, KeyCode::Char('+'));
+        type_text(&mut app, "draft");
+        press(&mut app, KeyCode::Esc);
+        assert!(app.compose.is_none());
+        assert_eq!(flash(&app), Some("Discarded the comment"));
+        press(&mut app, KeyCode::Char('+'));
+        assert_eq!(text(&app), "", "a new field starts empty");
+        type_text(&mut app, "draft");
+        ctrl_s(&mut app);
+        press(&mut app, KeyCode::Esc);
+        assert!(app.compose.is_none());
+        assert!(app.post_rx.try_recv().is_err(), "nothing was sent");
+        // The list works as before.
+        press(&mut app, KeyCode::Char('q'));
+        assert!(app.ask_quit);
+    }
+
+    #[test]
+    fn a_blank_text_is_not_posted() {
+        let mut app = in_activity();
+        press(&mut app, KeyCode::Char('+'));
+        ctrl_s(&mut app);
+        assert_eq!(stage(&app), Some(Stage::Writing));
+        type_text(&mut app, "  \n  ");
+        ctrl_s(&mut app);
+        assert_eq!(stage(&app), Some(Stage::Writing));
+        assert_eq!(
+            app.compose.as_ref().unwrap().message.as_deref(),
+            Some("Nothing to post: write something first")
+        );
+        assert!(screen_text(&mut app, 120, 40).contains("Nothing to post"));
+        // Typing again clears the note.
+        type_text(&mut app, "x");
+        assert_eq!(app.compose.as_ref().unwrap().message, None);
+    }
+
+    #[test]
+    fn pasted_line_breaks_and_y_stay_in_the_text() {
+        let mut app = in_activity();
+        press(&mut app, KeyCode::Char('+'));
+        app.event(Event::Paste("first\ny\r\ny\n".into()));
+        assert_eq!(text(&app), "first\ny\ny\n");
+        assert_eq!(stage(&app), Some(Stage::Writing));
+        // In the preview a paste changes nothing.
+        type_text(&mut app, "end");
+        ctrl_s(&mut app);
+        app.event(Event::Paste("y".into()));
+        assert_eq!(stage(&app), Some(Stage::Preview));
+        assert_eq!(text(&app), "first\ny\ny\nend");
+    }
+
+    #[test]
+    fn a_paste_goes_into_the_search_on_one_line() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('/'));
+        app.event(Event::Paste("change\r\n5".into()));
+        assert_eq!(app.filter, "change 5");
+        assert_eq!(iids(&app.rows(Section::Mine)), [5]);
+        // Outside of any field a paste does nothing (no y copies, no q).
+        press(&mut app, KeyCode::Enter);
+        app.event(Event::Paste("qy".into()));
+        assert!(!app.ask_quit);
+        assert_eq!(app.filter, "change 5");
+    }
+
+    #[test]
+    fn a_reply_shows_under_its_thread_after_posting() {
+        let mut app = in_activity();
+        app.poster = posts;
+        press(&mut app, KeyCode::Char('n'));
+        write_and_post(&mut app, '>', "Done.");
+        assert!(app.compose.is_none());
+        assert_eq!(flash(&app), Some("Reply posted"));
+        let key = app.selected().unwrap().key();
+        assert!(!app.activity.contains_key(&key), "loads again without r");
+        assert!(app.next_refresh <= Instant::now(), "and the list refreshes");
+        // The reload has the reply; the thread moved to the top... of a list
+        // where another thread came first.
+        let mut list = discussions();
+        list[0].notes.push(crate::model::Note {
+            author: "me".into(),
+            body: "Done.".into(),
+            created: Some(40),
+            system: false,
+        });
+        list.swap(0, 2);
+        reload(&mut app, &key, list);
+        assert_eq!(app.thread, Some(2), "the same thread, by its id");
+        assert!(app.scroll_to_thread);
+        assert!(screen_text(&mut app, 150, 40).contains("Done."));
+    }
+
+    #[test]
+    fn a_comment_shows_at_the_top_after_posting() {
+        let mut app = in_activity();
+        app.poster = posts;
+        app.details_scroll = 7;
+        write_and_post(&mut app, '+', "Looks good");
+        assert_eq!(flash(&app), Some("Comment posted"));
+        assert_eq!(app.details_scroll, 0);
+        let key = app.selected().unwrap().key();
+        let mut list = discussions();
+        list.insert(
+            0,
+            crate::model::Discussion {
+                id: String::new(),
+                resolvable: false,
+                resolved: false,
+                place: None,
+                notes: vec![crate::model::Note {
+                    author: "me".into(),
+                    body: "Looks good".into(),
+                    created: Some(50),
+                    system: false,
+                }],
+            },
+        );
+        reload(&mut app, &key, list);
+        assert!(screen_text(&mut app, 150, 40).contains("Looks good"));
+    }
+
+    #[test]
+    fn a_reply_kept_in_a_pending_review_says_so() {
+        let mut app = in_activity();
+        app.poster = pending;
+        press(&mut app, KeyCode::Char('n'));
+        write_and_post(&mut app, '>', "Done.");
+        assert_eq!(
+            flash(&app),
+            Some("Reply added to your pending review: submit it on GitHub")
+        );
+    }
+
+    #[test]
+    fn an_older_load_of_comments_does_not_hide_the_post() {
+        let mut app = in_activity();
+        app.poster = posts;
+        let key = app.selected().unwrap().key();
+        // A load runs while posting.
+        app.activity_seq += 1;
+        let old = app.activity_seq;
+        app.activity_wanted.insert(key.clone(), old);
+        write_and_post(&mut app, '+', "Looks good");
+        reload(&mut app, &key, vec![]);
+        // The old load answers last, without the comment.
+        app.activity_tx
+            .send((key.clone(), old, Ok(discussions())))
+            .unwrap();
+        app.receive_activity();
+        let Some((_, Activity::Loaded(list))) = app.activity.get(&key) else {
+            panic!("not loaded");
+        };
+        assert!(list.is_empty(), "the newer load stays");
+    }
+
+    #[test]
+    fn a_reply_to_a_resolved_thread_leaves_it_resolved() {
+        let mut app = in_activity();
+        app.poster = posts;
+        app.thread_filter = ThreadFilter::Resolved;
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(app.thread, Some(2));
+        write_and_post(&mut app, '>', "Still fine.");
+        assert_eq!(flash(&app), Some("Reply posted"));
+        assert!(app.resolve_rx.try_recv().is_err(), "no resolve or reopen");
+        let key = app.selected().unwrap().key();
+        assert!(!app.activity.contains_key(&key), "loads again");
+        reload(&mut app, &key, discussions());
+        let Some((_, Activity::Loaded(list))) = app.activity.get(&key) else {
+            panic!("not loaded");
+        };
+        assert!(list[2].resolved);
+        assert_eq!(app.thread, Some(2));
+    }
+
+    #[test]
+    fn a_failed_post_keeps_the_text_and_says_why() {
+        let mut app = in_activity();
+        press(&mut app, KeyCode::Char('n'));
+        write_and_post(&mut app, '>', "@alex see\nline two");
+        assert_eq!(stage(&app), Some(Stage::Writing), "the field opens again");
+        assert_eq!(text(&app), "@alex see\nline two");
+        let why = "acme/app !6 reply gid://gitlab/Discussion/aaa: @alex see\nline two";
+        assert_eq!(app.compose.as_ref().unwrap().message.as_deref(), Some(why));
+        assert_eq!(flash(&app), Some(why));
+        assert!(app.activity.contains_key(&app.selected().unwrap().key()));
+        // It can be sent again from here.
+        ctrl_s(&mut app);
+        assert_eq!(stage(&app), Some(Stage::Preview));
+        let shown = screen_text(&mut app, 150, 40);
+        assert!(shown.contains("@alex see"), "{shown}");
+    }
+
+    #[test]
+    fn a_refresh_while_writing_keeps_where_the_text_goes() {
+        let mut app = in_activity();
+        press(&mut app, KeyCode::Char('n'));
+        press(&mut app, KeyCode::Char('>'));
+        type_text(&mut app, "ok");
+        // A refresh brings a newer merge request to the top of "Mine".
+        let mut data = app.data.clone().unwrap();
+        let mut newer = sample_mr(9);
+        newer.updated = Some(100);
+        data.mine.push(newer);
+        data.mine.retain(|m| m.iid != 6);
+        answer(&mut app, Status::Open, data);
+        ctrl_s(&mut app);
+        press(&mut app, KeyCode::Char('y'));
+        wait_posted(&mut app);
+        assert_eq!(
+            app.compose.as_ref().unwrap().message.as_deref(),
+            Some("acme/app !6 reply gid://gitlab/Discussion/aaa: ok")
+        );
+        // The box stays on screen although !6 left the list.
+        assert!(screen_text(&mut app, 150, 40).contains("Reply to thread on src/a.rs:7 · !6"));
+    }
+
+    #[test]
+    fn a_refresh_keeps_the_merge_request_selected_when_it_moves() {
+        let mut app = app();
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.selected().map(|mr| mr.iid), Some(5));
+        app.thread = Some(1);
+        // A comment on !5 makes it the newest.
+        let mut data = app.data.clone().unwrap();
+        data.mine.iter_mut().find(|m| m.iid == 5).unwrap().updated = Some(100);
+        answer(&mut app, Status::Open, data);
+        assert_eq!(app.selected().map(|mr| mr.iid), Some(5));
+        assert_eq!(app.mine_state.selected(), Some(0));
+        assert_eq!(app.thread, Some(1), "same merge request, same thread");
+        // Gone from the list: the next one, and no thread.
+        let mut data = app.data.clone().unwrap();
+        data.mine.retain(|m| m.iid != 5);
+        answer(&mut app, Status::Open, data);
+        assert_eq!(app.selected().map(|mr| mr.iid), Some(6));
+        assert_eq!(app.thread, None);
+    }
+
+    #[test]
+    fn a_github_pull_request_gets_replies_and_comments_too() {
+        let mut app = in_activity();
+        for mr in &mut app.data.as_mut().unwrap().mine {
+            mr.forge = Forge::GitHub;
+            mr.host = "github.com".into();
+        }
+        let mr = app.selected().cloned().unwrap();
+        let mut list = discussions();
+        list[0].id = "PRRT_kwDOabc".into();
+        app.activity
+            .insert(mr.key(), (mr.updated, Activity::Loaded(list)));
+        press(&mut app, KeyCode::Char('n'));
+        write_and_post(&mut app, '>', "ok");
+        assert_eq!(
+            app.compose.as_ref().unwrap().message.as_deref(),
+            Some("acme/app #6 reply PRRT_kwDOabc: ok")
+        );
+        press(&mut app, KeyCode::Esc);
+        write_and_post(&mut app, '+', "thanks");
+        assert_eq!(
+            app.compose.as_ref().unwrap().message.as_deref(),
+            Some("acme/app #6 comment: thanks")
+        );
+    }
+
+    #[test]
+    fn merged_and_closed_ones_take_no_replies_or_comments() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('z'));
+        answer(&mut app, Status::Merged, merged_data(None));
+        app.details = true;
+        app.panel_tab = PanelTab::Activity;
+        let mr = app.selected().cloned().unwrap();
+        app.activity
+            .insert(mr.key(), (mr.updated, Activity::Loaded(discussions())));
+        press(&mut app, KeyCode::Char('n'));
+        for key in ['>', '+'] {
+            app.flash = None;
+            press(&mut app, KeyCode::Char(key));
+            assert!(app.compose.is_none(), "{key}");
+            assert_eq!(flash(&app), Some("!13 is merged"), "{key}");
+        }
+        assert!(!screen_text(&mut app, 150, 40).contains("> reply"));
+    }
+
+    #[test]
+    fn the_activity_tab_names_reply_and_comment() {
+        let mut app = in_activity();
+        let shown = screen_text(&mut app, 150, 40);
+        assert!(shown.contains("> reply"), "{shown}");
+        assert!(shown.contains("+ comment"), "{shown}");
+        assert!(
+            shown.contains("e resolve / reopen"),
+            "each hint whole\n{shown}"
+        );
+        // A narrow panel wraps the hints instead of cutting them.
+        let shown = screen_text(&mut app, 60, 40);
+        assert!(shown.contains("+ comment"), "{shown}");
+    }
+
+    #[test]
+    fn help_names_reply_comment_and_the_fields_keys() {
+        for (w, h) in [(150, 60), (150, 30), (70, 60)] {
+            let mut app = app();
+            app.help = true;
+            let shown = screen_text(&mut app, w, h);
+            for k in [
+                "open ones: all, needs me, threads, failed, ready",
+                "close panel, search or filter (never the list)",
+                "reply to the selected thread",
+                "write a comment",
+                "in the text: new line / send (then y) / discard",
+            ] {
+                assert!(shown.contains(k), "{w}x{h}: {k}\n{shown}");
+            }
+        }
+        // Short but wide: two columns, so nothing is cut off.
+        let mut app = app();
+        app.help = true;
+        let shown = screen_text(&mut app, 150, 30);
+        assert!(shown.contains("Any key or click closes this."), "{shown}");
+        assert!(shown.contains("double-click"), "{shown}");
+    }
+
+    fn times_out(_: &MergeRequest, _: &Target, _: &str) -> Result<Posted, String> {
+        Err("gitlab.com did not answer within 30 s".into())
+    }
+
+    #[test]
+    fn a_long_text_can_be_read_whole_in_the_preview() {
+        let mut app = in_activity();
+        press(&mut app, KeyCode::Char('+'));
+        let text: Vec<String> = (1..=30).map(|i| format!("row {i:02}")).collect();
+        app.event(Event::Paste(text.join("\n")));
+        let shown = screen_text(&mut app, 150, 40);
+        assert!(
+            shown.contains("row 30") && !shown.contains("row 01"),
+            "the end while writing"
+        );
+        ctrl_s(&mut app);
+        let shown = screen_text(&mut app, 150, 40);
+        assert!(
+            shown.contains("row 01") && !shown.contains("row 30"),
+            "the start in the preview"
+        );
+        assert!(shown.contains("↑↓ scroll"), "{shown}");
+        for _ in 0..40 {
+            press(&mut app, KeyCode::Down);
+        }
+        let shown = screen_text(&mut app, 150, 40);
+        assert!(shown.contains("row 30"), "{shown}");
+        // The wheel over the box scrolls it too.
+        let (area, _) = *app
+            .hits
+            .iter()
+            .find(|(_, h)| *h == Hit::ComposeBox)
+            .unwrap();
+        for _ in 0..40 {
+            app.mouse(MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: area.x + 2,
+                row: area.y + 1,
+                modifiers: KeyModifiers::NONE,
+            });
+        }
+        let shown = screen_text(&mut app, 150, 40);
+        assert!(shown.contains("row 01"), "{shown}");
+        assert_eq!(stage(&app), Some(Stage::Preview), "scrolling posts nothing");
+    }
+
+    #[test]
+    fn a_post_out_of_time_may_have_gone_through() {
+        let mut app = in_activity();
+        app.poster = times_out;
+        write_and_post(&mut app, '+', "ok");
+        let why = app.compose.as_ref().unwrap().message.clone().unwrap();
+        assert_eq!(
+            why,
+            "gitlab.com did not answer within 30 s: the comment may have been posted, check above before sending again"
+        );
+        let key = app.selected().unwrap().key();
+        assert!(!app.activity.contains_key(&key), "its comments load again");
+        assert_eq!(text(&app), "ok");
+    }
+
+    #[test]
+    fn what_other_writes_say_still_shows_while_writing() {
+        let mut app = in_activity();
+        press(&mut app, KeyCode::Char('+'));
+        app.act_tx
+            .send(Err("GitLab: pipeline must succeed".into()))
+            .unwrap();
+        app.receive_actions();
+        let shown = screen_text(&mut app, 150, 40);
+        let footer = shown.lines().last().unwrap();
+        assert!(footer.contains("Ctrl+s send"), "{footer}");
+        assert!(footer.contains("GitLab: pipeline must succeed"), "{footer}");
+    }
+
+    #[test]
+    fn a_kept_thread_the_filter_hides_is_not_selected() {
+        let mut app = in_activity();
+        app.thread_filter = ThreadFilter::Open;
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(app.thread, Some(0));
+        let key = app.selected().unwrap().key();
+        app.keep_thread = Some((key.clone(), "gid://gitlab/Discussion/aaa".into()));
+        // Someone resolved it meanwhile.
+        let mut list = discussions();
+        list[0].resolved = true;
+        reload(&mut app, &key, list);
+        assert_eq!(app.thread, None);
+        press(&mut app, KeyCode::Char('>'));
+        assert!(app.compose.is_none());
+    }
+
+    #[test]
+    fn help_fits_a_middle_sized_pane() {
+        let mut app = app();
+        app.help = true;
+        let shown = screen_text(&mut app, 100, 42);
+        for k in [
+            "Any key or click closes this.",
+            "double-click",
+            "reply to the selected thread",
+            "ready",
+        ] {
+            assert!(shown.contains(k), "{k}\n{shown}");
+        }
     }
 
     #[test]

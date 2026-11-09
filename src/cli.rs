@@ -56,21 +56,49 @@ pub fn run(name: &str, cmd: Command, host: &str) -> Result<Output, String> {
     run_for(name, cmd, host, TIMEOUT)
 }
 
+/// Like [`run`], with `input` on the tool's standard input, such as a
+/// request body for `--input -`: a long text there meets no limit on the
+/// length of one argument and does not show in the process list.
+pub fn run_input(name: &str, cmd: Command, host: &str, input: Vec<u8>) -> Result<Output, String> {
+    run_with(name, cmd, host, TIMEOUT, Some(input))
+}
+
 /// Runs the command with this time limit. When it runs out, the tool is
 /// stopped together with its process group, if it leads one (git with the
 /// ssh it started).
-pub fn run_for(
+pub fn run_for(name: &str, cmd: Command, host: &str, limit: Duration) -> Result<Output, String> {
+    run_with(name, cmd, host, limit, None)
+}
+
+fn run_with(
     name: &str,
     mut cmd: Command,
     host: &str,
     limit: Duration,
+    input: Option<Vec<u8>>,
 ) -> Result<Output, String> {
+    if input.is_some() {
+        cmd.stdin(Stdio::piped());
+    }
     let mut child = cmd
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("{name} not found ({e}). Install it: brew install {name}"))?;
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => {
+                format!("{name} not found ({e}). Install it: brew install {name}")
+            }
+            // Such as a text too long for one argument.
+            _ => format!("{name} could not start: {e}"),
+        })?;
 
+    // Write the input on a thread too, and close it so the tool reads to
+    // the end; a tool that stops early only ends the write.
+    if let (Some(data), Some(mut pipe)) = (input, child.stdin.take()) {
+        std::thread::spawn(move || {
+            let _ = std::io::Write::write_all(&mut pipe, &data);
+        });
+    }
     // Read the pipes on threads so a large answer cannot block the tool.
     let mut out_pipe = child.stdout.take();
     let mut err_pipe = child.stderr.take();
@@ -152,6 +180,57 @@ pub fn explain_failure(name: &str, host: &str, stderr: &str) -> String {
     format!("{name} failed: {reason}")
 }
 
+/// Why a failed REST call (`glab api`, `gh api`) failed: the forge's own
+/// message from its JSON answer when there is one (`label` names the forge),
+/// else the tool's error output.
+pub fn api_error(name: &str, host: &str, label: &str, out: &Output) -> String {
+    if !not_logged_in(&out.stderr) {
+        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
+            if let Some(msg) = rest_message(&value) {
+                return format!("{label}: {msg}");
+            }
+        }
+    }
+    explain_failure(name, host, &out.stderr)
+}
+
+/// The text of a REST error answer: GitLab's `message` (a string, or an
+/// object of fields with their problems) and `error`, GitHub's `message`
+/// with its `errors`.
+fn rest_message(value: &serde_json::Value) -> Option<String> {
+    use serde_json::Value;
+    fn text(v: &Value) -> Option<String> {
+        match v {
+            Value::String(s) => Some(s.clone()),
+            Value::Array(a) => {
+                let parts: Vec<String> = a.iter().filter_map(text).collect();
+                (!parts.is_empty()).then(|| parts.join("; "))
+            }
+            Value::Object(o) => {
+                if let Some(m) = o.get("message").and_then(text) {
+                    return Some(m);
+                }
+                let parts: Vec<String> = o
+                    .iter()
+                    .filter_map(|(k, v)| text(v).map(|t| format!("{k} {t}")))
+                    .collect();
+                (!parts.is_empty()).then(|| parts.join("; "))
+            }
+            _ => None,
+        }
+    }
+    let mut parts: Vec<String> = Vec::new();
+    for key in ["message", "error"] {
+        if let Some(m) = value.get(key).and_then(text) {
+            parts.push(m);
+        }
+    }
+    if let Some(e) = value.get("errors").and_then(text) {
+        parts.push(e);
+    }
+    (!parts.is_empty()).then(|| parts.join(": "))
+}
+
 /// The messages of a GraphQL `errors` list, joined.
 pub fn graphql_errors(value: &serde_json::Value) -> Option<String> {
     let errors = value.get("errors")?.as_array()?;
@@ -193,6 +272,100 @@ mod tests {
             .unwrap()
             .success();
         assert!(!alive, "the sleep it started is gone too");
+    }
+
+    fn failed(stdout: &str, stderr: &str) -> Output {
+        Output {
+            success: false,
+            code: Some(1),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.into(),
+        }
+    }
+
+    #[test]
+    fn rest_errors_say_what_the_forge_said() {
+        let e = api_error(
+            "glab",
+            "gitlab.com",
+            "GitLab",
+            &failed(
+                r#"{"message":{"note":["is too long (maximum is 1000000 characters)"]}}"#,
+                "glab: 400 Bad Request",
+            ),
+        );
+        assert_eq!(
+            e,
+            "GitLab: note is too long (maximum is 1000000 characters)"
+        );
+        let e = api_error(
+            "glab",
+            "gitlab.com",
+            "GitLab",
+            &failed(r#"{"message":"403 Forbidden"}"#, "glab: 403 Forbidden"),
+        );
+        assert_eq!(e, "GitLab: 403 Forbidden");
+        let e = api_error(
+            "gh",
+            "github.com",
+            "GitHub",
+            &failed(
+                r#"{"message":"Validation Failed","errors":[{"resource":"IssueComment","code":"custom","field":"body","message":"body is too long (maximum is 65536 characters)"}],"status":"422"}"#,
+                "gh: Validation Failed (HTTP 422)",
+            ),
+        );
+        assert_eq!(
+            e,
+            "GitHub: Validation Failed: body is too long (maximum is 65536 characters)"
+        );
+        // Not logged in, or no JSON: the tool's own words.
+        let e = api_error(
+            "gh",
+            "github.com",
+            "GitHub",
+            &failed(
+                r#"{"message":"Bad credentials"}"#,
+                "gh: Bad credentials (HTTP 401)",
+            ),
+        );
+        assert_eq!(e, "gh is not logged in to github.com: run gh auth login");
+        let e = api_error(
+            "glab",
+            "x.com",
+            "GitLab",
+            &failed("", "dial tcp: lookup x.com: no such host"),
+        );
+        assert_eq!(e, "Cannot reach x.com: check the connection");
+    }
+
+    #[test]
+    fn input_reaches_the_tool_whole() {
+        let mut cmd = Command::new("wc");
+        cmd.arg("-c");
+        let text = "é".repeat(200_000);
+        let out = run_input("wc", cmd, "example.org", text.clone().into_bytes()).unwrap();
+        assert!(out.success);
+        let count: usize = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
+        assert_eq!(count, text.len());
+    }
+
+    #[test]
+    fn a_tool_that_cannot_start_says_why() {
+        let e = run_for(
+            "sh",
+            Command::new("/nonexistent/sh"),
+            "example.org",
+            Duration::from_secs(1),
+        )
+        .err()
+        .unwrap();
+        assert!(e.starts_with("sh not found"), "{e}");
+        let mut cmd = Command::new("sh");
+        cmd.arg("x".repeat(4 * 1024 * 1024));
+        let e = run_for("sh", cmd, "example.org", Duration::from_secs(1))
+            .err()
+            .unwrap();
+        assert!(e.starts_with("sh could not start: "), "{e}");
     }
 
     #[test]

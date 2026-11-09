@@ -26,7 +26,19 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   touching the current checkout; forks open through the merge request's own
   ref (#9).
 
+- In the activity tab, `>` replies to the selected thread and `+` writes a
+  comment on the merge request or pull request, in a box that takes several
+  lines (`Enter` line break, `Ctrl+s` shows what will be posted, `y` posts,
+  `Esc` discards). The new reply or comment shows in the tab right away; a
+  failed post keeps the text and says why. Pasted text goes into the box or
+  the search in one piece (#10).
+
 ### Changed
+
+- A refresh keeps the selected merge request or pull request selected when
+  it moves in the list, instead of the row it was on (#10).
+- The activity tab's key hints wrap instead of being cut off, and the key
+  overview (`?`) uses two columns when it is taller than the screen (#10).
 
 - "Mine" is now the first section, before "To review", and the list opens on
   it; `1` selects "Mine" and `2` "To review".
