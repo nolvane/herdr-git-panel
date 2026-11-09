@@ -85,7 +85,8 @@ pub enum Hit {
     Threads(ThreadFilter),
     /// A file in the changes viewer's tree.
     File(usize),
-    /// A link in the details panel (index into `App::links`).
+    /// A link in the details panel or the help's border (index into
+    /// `App::links`).
     Link(usize),
     /// Anywhere while the help is open: closes it.
     Help,
@@ -99,6 +100,21 @@ pub enum Hit {
 /// Sends a text to the forge: the list's own is [`post`]; tests put in one
 /// that never runs glab or gh.
 pub type Poster = fn(&MergeRequest, &Target, &str) -> Result<Posted, String>;
+
+/// Runs the system's opener (first argument) on a web link, true when it
+/// started; tests put in one that starts nothing.
+pub type Opener = fn(&str, &str) -> bool;
+
+/// Starts `opener` (`open`, `xdg-open`) on `url`.
+pub fn open_in_browser(opener: &str, url: &str) -> bool {
+    Command::new(opener)
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .is_ok()
+}
 
 /// Posts a reply, a comment or a change request through the merge
 /// request's forge.
@@ -321,6 +337,7 @@ pub struct App {
     /// A reply or comment being written; while open, every key goes into it.
     pub compose: Option<Compose>,
     pub poster: Poster,
+    pub opener: Opener,
     post_tx: Sender<Result<Posted, String>>,
     post_rx: Receiver<Result<Posted, String>>,
     /// Refresh again as soon as the one running now has answered.
@@ -413,6 +430,7 @@ impl App {
             activity_rx,
             compose: None,
             poster: post,
+            opener: open_in_browser,
             post_tx,
             post_rx,
             refresh_again: false,
@@ -1425,8 +1443,14 @@ impl App {
             return;
         }
         if self.help {
-            if let MouseEventKind::Down(_) = m.kind {
+            if let MouseEventKind::Down(button) = m.kind {
                 self.help = false;
+                // The version in the border opens the repository.
+                if let (MouseButton::Left, Some(Hit::Link(i))) = (button, hit) {
+                    if let Some(url) = self.links.get(i).cloned() {
+                        self.open_url(&url);
+                    }
+                }
             }
             return;
         }
@@ -1625,14 +1649,7 @@ impl App {
         } else {
             "xdg-open"
         };
-        let ok = Command::new(opener)
-            .arg(url)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .is_ok();
-        self.say(if ok {
+        self.say(if (self.opener)(opener, url) {
             "Opened in the browser".to_string()
         } else {
             format!("Could not run {opener}")
@@ -3596,6 +3613,111 @@ mod tests {
         assert_eq!(app.thread, None);
         press(&mut app, KeyCode::Char('>'));
         assert!(app.compose.is_none());
+    }
+
+    thread_local! {
+        /// What the test opener was asked to open, per test thread.
+        static OPENED: std::cell::RefCell<Vec<(String, String)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// An opener that starts nothing and only notes what it got.
+    fn opens(opener: &str, url: &str) -> bool {
+        OPENED.with(|o| o.borrow_mut().push((opener.into(), url.into())));
+        true
+    }
+
+    fn cannot_open(opener: &str, url: &str) -> bool {
+        opens(opener, url);
+        false
+    }
+
+    fn opened() -> Vec<String> {
+        OPENED.with(|o| o.borrow().iter().map(|(_, url)| url.clone()).collect())
+    }
+
+    /// The help open on a 100x42 pane, drawn once, and where its link to
+    /// the repository is.
+    fn help_with_link(opener: Opener) -> (App, Rect) {
+        let mut app = app();
+        app.opener = opener;
+        app.help = true;
+        screen_text(&mut app, 100, 42);
+        let spot = app
+            .hits
+            .iter()
+            .find_map(|(r, h)| matches!(h, Hit::Link(_)).then_some(*r))
+            .expect("a link in the help");
+        (app, spot)
+    }
+
+    const OPENER: &str = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+
+    #[test]
+    fn clicking_the_version_in_the_help_opens_the_repository() {
+        let (mut app, spot) = help_with_link(opens);
+        click(&mut app, spot.x + spot.width - 1, spot.y);
+        assert_eq!(opened(), ["https://github.com/nolvane/herdr-git-panel"]);
+        assert_eq!(OPENED.with(|o| o.borrow()[0].0.clone()), OPENER);
+        assert!(!app.help, "the help closes");
+        assert_eq!(flash(&app), Some("Opened in the browser"));
+        // Its first cell counts too.
+        let (mut app, spot) = help_with_link(opens);
+        click(&mut app, spot.x, spot.y);
+        assert_eq!(opened().len(), 2);
+        assert!(!app.help);
+    }
+
+    #[test]
+    fn a_failing_opener_is_named_and_the_list_goes_on() {
+        let (mut app, spot) = help_with_link(cannot_open);
+        click(&mut app, spot.x, spot.y);
+        assert!(!app.help);
+        assert_eq!(
+            flash(&app),
+            Some(format!("Could not run {OPENER}").as_str())
+        );
+        press(&mut app, KeyCode::Down);
+        assert!(!app.quit);
+    }
+
+    #[test]
+    fn other_clicks_and_keys_only_close_the_help() {
+        let (mut app, spot) = help_with_link(opens);
+        // On the border next to the version, inside the box, outside it.
+        for (x, y) in [
+            (spot.x - 1, spot.y),
+            (spot.right(), spot.y),
+            (50, 20),
+            (0, 0),
+        ] {
+            app.help = true;
+            screen_text(&mut app, 100, 42);
+            click(&mut app, x, y);
+            assert!(!app.help, "{x},{y}");
+        }
+        // A right click on the version only closes it too.
+        app.help = true;
+        screen_text(&mut app, 100, 42);
+        app.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: spot.x,
+            row: spot.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(!app.help);
+        for key in [KeyCode::Enter, KeyCode::Char('o'), KeyCode::Esc] {
+            app.help = true;
+            screen_text(&mut app, 100, 42);
+            press(&mut app, key);
+            assert!(!app.help, "{key:?}");
+        }
+        assert!(opened().is_empty(), "nothing opened: {:?}", opened());
+        assert_eq!(flash(&app), None);
     }
 
     #[test]

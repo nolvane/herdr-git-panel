@@ -592,3 +592,16 @@ failure keeps the text in the open box with the reason.
   Replies and comments from #10 send their text as typed, so there a line
   starting with `/` does run as a GitLab command, as in GitLab's own
   comment box; whether that should change is its own issue.
+
+## 2026-11-09: The version and the repository link sit in the help's border
+
+The help overlay (`?`) shows "Herdr Git Panel <version> ·
+github.com/nolvane/herdr-git-panel" in its bottom border (#14), so it takes
+no row from the list or the help text and stays visible when the box is cut
+to a short pane. A narrow box drops the address, then the name, but keeps
+the version. A click on it opens the repository through the same web-link
+check as links in the details panel and closes the help; every other click
+still only closes it. The version is `CARGO_PKG_VERSION`, the same value as
+`--version`, and the address is `repository` in `Cargo.toml`, so neither is
+written twice. `App::opener` starts the browser, so tests can put in one that
+starts nothing, like `App::poster` for posting.
