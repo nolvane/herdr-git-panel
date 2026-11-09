@@ -595,13 +595,18 @@ failure keeps the text in the open box with the reason.
 
 A line of a GitLab reply or comment that starts with `/` is posted as text,
 not run as a quick action (the owner's decision on #31), although GitLab's
-own comment box would run it: the preview shows the text as it will be
-posted, and a hidden `/merge` or `/approve` in a reply would be a surprise.
+own comment box would run it: a reply should post what it says, and a
+hidden `/merge` or `/approve` in it would be a surprise.
 
 - `post_note` sends the text through `escape_quick_actions`, the escape
   that change requests use (#11): a backslash before every line that starts
   with `/` in its first column, nothing else changed. The same limits hold:
-  inside a code block the backslash shows.
+  inside a code block the backslash shows, which is more common in
+  replies than in change requests (a path or command at a line start), but
+  skipping code blocks would need to find them exactly as GitLab does, and
+  a mismatch would run a command. The preview shows the text as typed.
+- Every line starting with `/` is escaped, not only known command names:
+  the commands differ between GitLab versions and editions.
 - An exception to "Replies and comments from the activity tab", which sends
   the text as typed otherwise. GitHub has no quick actions and is unchanged.
 - The list's own rendering of the posted note shows the backslash

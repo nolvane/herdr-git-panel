@@ -970,7 +970,7 @@ mod tests {
     }
 
     #[test]
-    fn note_text_is_sent_as_typed() {
+    fn note_body_wraps_the_text_as_json() {
         // The plain JSON wrapper; replies and comments also escape `/` lines.
         for body in [
             "@alex please check",

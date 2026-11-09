@@ -55,8 +55,10 @@ box at the bottom of the panel takes the text, over several lines (`Enter`
 adds a line break, pasted text goes in whole). `Ctrl+s` shows what will be
 posted and where (`↑` `↓` scroll a long text), `y` posts it (`n` goes back to
 the text, `Esc` throws it away). The new reply or comment then shows in the tab; when posting fails,
-the box says why and keeps the text. On GitLab a line of a reply or comment that starts with `/`
-is posted as text, never run as a GitLab command (`\/` in front, as for change requests). Links in both tabs (the merge
+the box says why and keeps the text. On GitLab a line of a reply or
+comment that starts with `/` is posted as text, never run as a GitLab
+command (`\/` in front, as for change requests; inside a code block the
+backslash shows). Links in both tabs (the merge
 request's link, Markdown links and plain URLs in descriptions and comments)
 open in the browser with a click.
 
@@ -329,7 +331,8 @@ resolving a thread or opening it again. Replies, comments and change
 requests go through `glab api` (GitLab's REST API) and `gh api` (GitHub's
 GraphQL API for replies, REST for comments and reviews), with the text as
 typed, sent to them on standard input; on GitLab a change request adds the
-quick action line in front, and replies, comments and change requests get a backslash before lines starting with `/`. `b` runs
+quick action line in front, and replies, comments and change requests
+get a backslash before lines starting with `/`. `b` runs
 `git fetch` against the clone's remote, creates or moves forward a local
 branch that is not checked out anywhere, sets its upstream when it has
 none, and asks Herdr to create the folder. Nothing else is stored and
