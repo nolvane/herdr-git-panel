@@ -8,6 +8,13 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `Ctrl+r` starts a failed pipeline again, after `y`: on GitLab the failed
+  jobs of the merge request's head pipeline, on GitHub the failed jobs of
+  every failed GitHub Actions run of the newest commit. It starts nothing
+  when someone pushed since the list loaded, and says why when there is
+  nothing to start or the forge refuses. The details panel shows the key
+  next to a failed pipeline (#12).
+
 - `!` requests changes on someone else's open merge request or pull
   request, with a reason written in the same box as replies and comments
   (`Ctrl+s` shows it, only `y` sends it). On GitHub it is a review with

@@ -716,6 +716,74 @@ pub fn merge(mr: &MergeRequest) -> Result<(), String> {
     mr_command(mr, &args).map(|_| ())
 }
 
+/// The merge request's head commit and head pipeline now, loaded when a
+/// retry is confirmed (the list loads no pipeline id).
+const RETRY_HEAD: &str = r#"
+query($project: ID!, $iid: String!) {
+  project(fullPath: $project) {
+    mergeRequest(iid: $iid) { diffHeadSha headPipeline { id status } }
+  }
+}
+"#;
+
+/// The id of the head pipeline to start again, from [`RETRY_HEAD`]'s
+/// answer: only while the head is still `shown_head` (the commit the list
+/// showed) and its pipeline still failed. `r` is the reference (`!90`).
+fn retry_target(value: &Value, shown_head: &str, r: &str) -> Result<String, String> {
+    if let Some(msg) = cli::graphql_errors(value) {
+        return Err(format!("GitLab: {msg}"));
+    }
+    let mr = &value["data"]["project"]["mergeRequest"];
+    if mr.is_null() {
+        return Err(format!("GitLab did not return {r}: refresh first (r)"));
+    }
+    if !shown_head.is_empty() && mr["diffHeadSha"].as_str() != Some(shown_head) {
+        return Err(format!(
+            "{r} changed since the list loaded: refresh first (r)"
+        ));
+    }
+    let pipeline = &mr["headPipeline"];
+    let id = str_of(&pipeline["id"]);
+    if pipeline["status"].as_str() != Some("FAILED") || id.is_empty() {
+        return Err(format!(
+            "The pipeline of {r} is no longer failed: refresh first (r)"
+        ));
+    }
+    Ok(id)
+}
+
+/// What GitLab said against `pipelineRetry`, empty when it started.
+fn retry_errors(value: &Value) -> Option<String> {
+    if let Some(msg) = cli::graphql_errors(value) {
+        return Some(format!("GitLab: {msg}"));
+    }
+    let errors: Vec<&str> = value
+        .pointer("/data/pipelineRetry/errors")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    (!errors.is_empty()).then(|| format!("GitLab: {}", errors.join("; ")))
+}
+
+/// Starts the failed (and cancelled) jobs of the merge request's head
+/// pipeline again, only if its head is still the one the list showed.
+pub fn retry_pipeline(mr: &MergeRequest) -> Result<String, String> {
+    let r = mr.reference();
+    let iid = mr.iid.to_string();
+    let head = graphql(
+        &mr.host,
+        RETRY_HEAD,
+        &[("project", &mr.project), ("iid", &iid)],
+    )?;
+    let id = retry_target(&head, &mr.head_sha, &r)?;
+    let mutation = "mutation($id: CiPipelineID!) { pipelineRetry(input: {id: $id}) { errors } }";
+    let value = graphql(&mr.host, mutation, &[("id", &id)])?;
+    match retry_errors(&value) {
+        Some(e) => Err(e),
+        None => Ok(format!("Pipeline of {r} started again")),
+    }
+}
+
 /// Marks the merge request as draft, or as ready.
 pub fn set_draft(mr: &MergeRequest, draft: bool) -> Result<(), String> {
     mr_command(mr, &["update", if draft { "--draft" } else { "--ready" }]).map(|_| ())
@@ -1500,5 +1568,66 @@ mod tests {
     fn graphql_errors_are_reported() {
         let e = parse(&json!({"errors": [{"message": "boom"}]}), "gitlab.com").unwrap_err();
         assert!(e.contains("boom"));
+    }
+
+    fn retry_head(sha: &str, status: Option<&str>) -> Value {
+        let pipeline = match status {
+            Some(s) => json!({"id": "gid://gitlab/Ci::Pipeline/4711", "status": s}),
+            None => Value::Null,
+        };
+        json!({"data": {"project": {"mergeRequest": {"diffHeadSha": sha, "headPipeline": pipeline}}}})
+    }
+
+    #[test]
+    fn a_retry_starts_the_failed_head_pipeline_of_the_shown_head() {
+        assert_eq!(
+            retry_target(&retry_head("abc123", Some("FAILED")), "abc123", "!90").as_deref(),
+            Ok("gid://gitlab/Ci::Pipeline/4711")
+        );
+    }
+
+    #[test]
+    fn a_retry_after_a_push_starts_nothing() {
+        assert_eq!(
+            retry_target(&retry_head("def456", Some("FAILED")), "abc123", "!90"),
+            Err("!90 changed since the list loaded: refresh first (r)".into())
+        );
+    }
+
+    #[test]
+    fn a_retry_of_a_pipeline_that_no_longer_failed_starts_nothing() {
+        for status in [Some("RUNNING"), Some("SUCCESS"), Some("PENDING"), None] {
+            assert_eq!(
+                retry_target(&retry_head("abc123", status), "abc123", "!90"),
+                Err("The pipeline of !90 is no longer failed: refresh first (r)".into()),
+                "{status:?}"
+            );
+        }
+        let gone = json!({"data": {"project": {"mergeRequest": null}}});
+        assert!(retry_target(&gone, "abc123", "!90").is_err());
+        let refused = json!({"errors": [{"message": "The resource that you are attempting to access does not exist"}]});
+        assert!(retry_target(&refused, "abc123", "!90")
+            .unwrap_err()
+            .starts_with("GitLab: The resource"));
+    }
+
+    #[test]
+    fn a_refused_retry_says_why() {
+        assert_eq!(
+            retry_errors(&json!({"data": {"pipelineRetry": {"errors": []}}})),
+            None
+        );
+        assert_eq!(
+            retry_errors(
+                &json!({"data": {"pipelineRetry": {"errors": ["Insufficient permissions"]}}})
+            ),
+            Some("GitLab: Insufficient permissions".into())
+        );
+        assert_eq!(
+            retry_errors(
+                &json!({"data": {"pipelineRetry": null}, "errors": [{"message": "Pipeline cannot be retried"}]})
+            ),
+            Some("GitLab: Pipeline cannot be retried".into())
+        );
     }
 }

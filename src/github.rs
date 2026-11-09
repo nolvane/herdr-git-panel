@@ -859,6 +859,149 @@ pub fn request_changes(mr: &MergeRequest, reason: &str) -> Result<(), String> {
     }
 }
 
+/// The pull request's head and the check suites of its newest commit,
+/// loaded when a retry is confirmed: the list loads only the rollup state.
+const RETRY_HEAD: &str = r#"
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      headRefOid
+      commits(last: 1) {
+        nodes {
+          commit {
+            checkSuites(first: 100) {
+              nodes { conclusion repository { nameWithOwner } workflowRun { databaseId } }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"#;
+
+/// The failed GitHub Actions runs of the newest commit, as `(repository,
+/// run id)`, from [`RETRY_HEAD`]'s answer, only while the head is still
+/// `shown_head`. Other apps' checks and commit statuses can't be started
+/// again with the user's login, so they are left out. `r` is `#2903`.
+fn failed_runs(
+    value: &Value,
+    shown_head: &str,
+    project: &str,
+    r: &str,
+) -> Result<Vec<(String, u64)>, String> {
+    if let Some(msg) = cli::graphql_errors(value) {
+        return Err(format!("GitHub: {msg}"));
+    }
+    let pr = &value["data"]["repository"]["pullRequest"];
+    if pr.is_null() {
+        return Err(format!("GitHub did not return {r}: refresh first (r)"));
+    }
+    if !shown_head.is_empty() && pr["headRefOid"].as_str() != Some(shown_head) {
+        return Err(format!(
+            "{r} changed since the list loaded: refresh first (r)"
+        ));
+    }
+    let mut runs = Vec::new();
+    let suites = pr
+        .pointer("/commits/nodes/0/commit/checkSuites/nodes")
+        .and_then(Value::as_array);
+    for suite in suites.into_iter().flatten() {
+        let failed = suite["conclusion"]
+            .as_str()
+            .is_some_and(|c| !matches!(c, "SUCCESS" | "NEUTRAL" | "SKIPPED" | "STALE"));
+        let Some(id) = suite["workflowRun"]["databaseId"].as_u64() else {
+            continue;
+        };
+        if !failed {
+            continue;
+        }
+        // The run lives where its suite does (the base repository, also
+        // for a fork's pull request); a name GitHub gave that is no plain
+        // `owner/name` never goes into the path.
+        let repo = suite["repository"]["nameWithOwner"]
+            .as_str()
+            .filter(|n| plain_repo(n))
+            .unwrap_or(project);
+        runs.push((repo.to_string(), id));
+    }
+    if runs.is_empty() {
+        return Err(format!(
+            "The failed checks of {r} are not GitHub Actions runs: they can't be started again from the list"
+        ));
+    }
+    Ok(runs)
+}
+
+/// The arguments of `gh api` that start the failed jobs of one workflow
+/// run again (REST "Re-run failed jobs from a workflow run").
+fn rerun_args(repo: &str, run: u64) -> Vec<String> {
+    [
+        "api",
+        "--hostname",
+        HOST,
+        "--method",
+        "POST",
+        &format!("repos/{repo}/actions/runs/{run}/rerun-failed-jobs"),
+    ]
+    .map(String::from)
+    .to_vec()
+}
+
+/// What the list says after starting the failed runs of `r` again, from one
+/// answer per run. When some started, it is a success (the list refreshes)
+/// that names how many and why the others did not.
+fn rerun_outcome(r: &str, results: Vec<Result<(), String>>) -> Result<String, String> {
+    let total = results.len();
+    let started = results.iter().filter(|r| r.is_ok()).count();
+    // Each reason once: several runs are often refused for the same one.
+    let mut why: Vec<String> = Vec::new();
+    for e in results.into_iter().filter_map(Result::err) {
+        if !why.contains(&e) {
+            why.push(e);
+        }
+    }
+    let why = why.join(" · ");
+    match started {
+        _ if started == total => Ok(format!("Failed checks of {r} started again")),
+        0 => Err(why),
+        _ => Ok(format!(
+            "Started {started} of {total} failed runs of {r} again; the others did not: {why}"
+        )),
+    }
+}
+
+/// Starts the failed jobs of every failed GitHub Actions run of the pull
+/// request's newest commit again, only if its head is still the one the
+/// list showed.
+pub fn retry_checks(mr: &MergeRequest) -> Result<String, String> {
+    let r = mr.reference();
+    let (owner, name) = mr
+        .project
+        .split_once('/')
+        .ok_or("not a GitHub repository")?;
+    let number = format!("$int:{}", mr.iid);
+    let head = graphql(
+        RETRY_HEAD,
+        &[("owner", owner), ("name", name), ("number", &number)],
+    )?;
+    let runs = failed_runs(&head, &mr.head_sha, &mr.project, &r)?;
+    let results = runs
+        .iter()
+        .map(|(repo, run)| {
+            let mut cmd = cli::command("gh");
+            cmd.args(rerun_args(repo, *run));
+            let out = cli::run("gh", cmd, HOST)?;
+            if out.success {
+                Ok(())
+            } else {
+                Err(cli::api_error("gh", HOST, "GitHub", &out))
+            }
+        })
+        .collect();
+    rerun_outcome(&r, results)
+}
+
 /// The pull request's changes as a unified diff, without colours.
 pub fn fetch_diff(mr: &MergeRequest) -> Result<String, String> {
     pr_command(mr, &["diff", "--color", "never"])
@@ -1184,5 +1327,131 @@ mod tests {
     fn errors_are_reported() {
         let e = parse(&json!({"errors": [{"message": "boom"}]})).unwrap_err();
         assert!(e.contains("boom"));
+    }
+
+    /// The answer of the retry query for a head `sha` with `suites`.
+    fn retry_head(sha: &str, suites: Value) -> Value {
+        json!({"data": {"repository": {"pullRequest": {
+            "headRefOid": sha,
+            "commits": {"nodes": [{"commit": {"checkSuites": {"nodes": suites}}}]}
+        }}}})
+    }
+
+    fn suite(conclusion: Option<&str>, run: Option<u64>) -> Value {
+        json!({
+            "conclusion": conclusion,
+            "repository": {"nameWithOwner": "acme/app"},
+            "workflowRun": run.map(|id| json!({"databaseId": id})),
+        })
+    }
+
+    #[test]
+    fn a_retry_picks_the_failed_actions_runs() {
+        let suites = json!([
+            suite(Some("FAILURE"), Some(11)),
+            suite(Some("SUCCESS"), Some(12)),
+            suite(Some("SKIPPED"), Some(13)),
+            suite(Some("TIMED_OUT"), Some(14)),
+            suite(Some("CANCELLED"), Some(15)),
+            // Another app's check: no workflow run.
+            suite(Some("FAILURE"), None),
+            // Still running.
+            suite(None, Some(16)),
+        ]);
+        let runs = failed_runs(&retry_head("abc123", suites), "abc123", "acme/app", "#2903");
+        let ids: Vec<u64> = runs.unwrap().into_iter().map(|(_, id)| id).collect();
+        assert_eq!(ids, [11, 14, 15]);
+    }
+
+    #[test]
+    fn a_run_is_started_where_its_suite_lives() {
+        let mut s = suite(Some("FAILURE"), Some(11));
+        s["repository"]["nameWithOwner"] = json!("acme/base");
+        let runs = failed_runs(&retry_head("abc", json!([s])), "abc", "acme/app", "#1");
+        assert_eq!(runs, Ok(vec![("acme/base".into(), 11)]));
+        // A name that is no plain `owner/name` never goes into the path.
+        let mut s = suite(Some("FAILURE"), Some(11));
+        s["repository"]["nameWithOwner"] = json!("acme/app/../../user");
+        let runs = failed_runs(&retry_head("abc", json!([s])), "abc", "acme/app", "#1");
+        assert_eq!(runs, Ok(vec![("acme/app".into(), 11)]));
+    }
+
+    #[test]
+    fn other_apps_checks_are_not_started() {
+        let only_other = json!([
+            suite(Some("FAILURE"), None),
+            suite(Some("SUCCESS"), Some(3))
+        ]);
+        let expected = Err(
+            "The failed checks of #2903 are not GitHub Actions runs: they can't be started again from the list"
+                .to_string(),
+        );
+        assert_eq!(
+            failed_runs(&retry_head("abc", only_other), "abc", "acme/app", "#2903"),
+            expected
+        );
+        // A commit status of an outside CI service brings no suite at all.
+        assert_eq!(
+            failed_runs(&retry_head("abc", json!([])), "abc", "acme/app", "#2903"),
+            expected
+        );
+    }
+
+    #[test]
+    fn checks_of_a_pushed_head_are_not_started() {
+        let suites = json!([suite(Some("FAILURE"), Some(11))]);
+        assert_eq!(
+            failed_runs(&retry_head("def456", suites), "abc123", "acme/app", "#2903"),
+            Err("#2903 changed since the list loaded: refresh first (r)".into())
+        );
+        // Without a head from the list there is nothing to compare, like
+        // approving and merging.
+        let suites = json!([suite(Some("FAILURE"), Some(11))]);
+        assert!(failed_runs(&retry_head("def456", suites), "", "acme/app", "#2903").is_ok());
+        let refused = json!({"errors": [{"message": "Could not resolve to a Repository"}]});
+        assert!(failed_runs(&refused, "abc", "acme/app", "#2903")
+            .unwrap_err()
+            .starts_with("GitHub: Could not resolve"));
+    }
+
+    #[test]
+    fn a_rerun_asks_for_the_failed_jobs_only() {
+        assert_eq!(
+            rerun_args("acme/app", 4711),
+            [
+                "api",
+                "--hostname",
+                "github.com",
+                "--method",
+                "POST",
+                "repos/acme/app/actions/runs/4711/rerun-failed-jobs",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_rerun_says_how_many_started() {
+        assert_eq!(
+            rerun_outcome("#2903", vec![Ok(()), Ok(())]),
+            Ok("Failed checks of #2903 started again".into())
+        );
+        assert_eq!(
+            rerun_outcome(
+                "#2903",
+                vec![
+                    Ok(()),
+                    Err("GitHub: This workflow run cannot be retried".into()),
+                    Err("GitHub: This workflow run cannot be retried".into()),
+                ]
+            ),
+            Ok("Started 1 of 3 failed runs of #2903 again; the others did not: GitHub: This workflow run cannot be retried".into())
+        );
+        assert_eq!(
+            rerun_outcome(
+                "#2903",
+                vec![Err("GitHub: Resource not accessible by integration".into())]
+            ),
+            Err("GitHub: Resource not accessible by integration".into())
+        );
     }
 }
