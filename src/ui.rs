@@ -460,6 +460,7 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
                 ("v", "approve / take approval back"),
                 ("!", "request changes, with a reason (then y)"),
                 ("m", "merge (when GitLab or GitHub allows it)"),
+                ("Ctrl+r", "open ones: start failed jobs again (then y)"),
                 ("w", "your own: draft / ready for review"),
                 ("", "b v ! m w: open ones only"),
                 ("y", "copy the link"),
@@ -1384,13 +1385,20 @@ fn draw_details(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
     };
     lines.extend(field("Threads", vec![threads]));
     let (picon, pcolor) = icons.pipeline(mr.pipeline);
-    lines.extend(field(
-        "Pipeline",
-        vec![Span::styled(
-            format!("{picon} {}", pipeline_word(mr.pipeline)),
-            Style::new().fg(pcolor),
-        )],
-    ));
+    let mut pipeline = vec![Span::styled(
+        format!("{picon} {}", pipeline_word(mr.pipeline)),
+        Style::new().fg(pcolor),
+    )];
+    // Only a failed one of the open ones can be started again (Ctrl+r).
+    if mr.pipeline == Pipeline::Failed && mr.status == Status::Open {
+        pipeline.push(Span::raw("   "));
+        pipeline.push(Span::styled(
+            "Ctrl+r",
+            Style::new().fg(MUTED).add_modifier(Modifier::BOLD),
+        ));
+        pipeline.push(Span::styled(" start again", Style::new().fg(FAINT)));
+    }
+    lines.extend(field("Pipeline", pipeline));
     if let (Some(a), Some(d)) = (mr.additions, mr.deletions) {
         lines.extend(field(
             "Changes",
@@ -1842,6 +1850,10 @@ fn draw_footer(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
             Action::Approve => "Approve",
             Action::Revoke => "Revoke your approval of",
             Action::Merge => "Merge",
+            Action::Retry if c.mr.forge == crate::model::Forge::GitLab => {
+                "Start the failed jobs of"
+            }
+            Action::Retry => "Start the failed checks of",
         };
         let question = format!(
             " {verb} {} {}? ",
@@ -2835,5 +2847,80 @@ mod tests {
         assert!(!offered(&mut app), "not inside Herdr");
         app.herdr = true;
         assert!(offered(&mut app));
+    }
+
+    #[test]
+    fn details_offer_ctrl_r_only_next_to_a_failed_pipeline() {
+        let rows = [
+            Pipeline::Failed,
+            Pipeline::Success,
+            Pipeline::Running,
+            Pipeline::Canceled,
+            Pipeline::Manual,
+            Pipeline::None,
+        ];
+        for pipeline in rows {
+            let mut app = app_with(
+                vec![],
+                vec![sample_mr(1, ReviewState::Unreviewed, pipeline)],
+                false,
+            );
+            app.details = true;
+            app.mine_state.select(Some(0));
+            let shown = screen(&mut app, 160, 40);
+            let line = shown.iter().find(|r| r.contains("Ctrl+r start again"));
+            assert_eq!(
+                line.is_some(),
+                pipeline == Pipeline::Failed,
+                "{pipeline:?}: {shown:#?}"
+            );
+            // On the panel's Pipeline line, behind the state.
+            if let Some(line) = line {
+                assert!(
+                    line.contains("Pipeline") && line.contains("failed   Ctrl+r"),
+                    "{line}"
+                );
+            }
+        }
+        // Merged and closed ones can only be looked at.
+        let mut merged = sample_mr(1, ReviewState::Unreviewed, Pipeline::Failed);
+        merged.status = Status::Merged;
+        let mut app = app_with(vec![], vec![merged], false);
+        app.details = true;
+        app.mine_state.select(Some(0));
+        let shown = screen(&mut app, 160, 40);
+        assert!(!shown.iter().any(|r| r.contains("Ctrl+r")), "{shown:#?}");
+    }
+
+    #[test]
+    fn the_confirm_bar_names_jobs_on_gitlab_and_checks_on_github() {
+        for (forge, question) in [
+            (Forge::GitLab, "Start the failed jobs of !1 Add export?"),
+            (Forge::GitHub, "Start the failed checks of #1 Add export?"),
+        ] {
+            let mut mr = sample_mr(1, ReviewState::Unreviewed, Pipeline::Failed);
+            mr.forge = forge;
+            let mut app = app_with(vec![], vec![mr.clone()], false);
+            app.confirm = Some(crate::app::Confirm {
+                action: Action::Retry,
+                mr,
+            });
+            let shown = screen(&mut app, 120, 20);
+            let footer = shown.last().unwrap();
+            assert!(footer.contains(question), "{footer}");
+            assert!(footer.contains("y yes"), "{footer}");
+        }
+    }
+
+    #[test]
+    fn help_names_ctrl_r() {
+        let mut app = app_with(vec![], vec![], false);
+        app.help = true;
+        let rows = screen(&mut app, 120, 50);
+        assert!(
+            rows.iter().any(|r| r.contains("Ctrl+r")
+                && r.contains("open ones: start failed jobs again (then y)")),
+            "{rows:#?}"
+        );
     }
 }

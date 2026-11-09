@@ -308,6 +308,15 @@ pub fn merge(mr: &MergeRequest) -> Result<(), String> {
     }
 }
 
+/// Starts the failed jobs of the merge request's pipeline (GitLab) or of its
+/// failed GitHub Actions runs (GitHub) again; the answer says what started.
+pub fn retry_pipeline(mr: &MergeRequest) -> Result<String, String> {
+    match mr.forge {
+        Forge::GitLab => gitlab::retry_pipeline(mr),
+        Forge::GitHub => github::retry_checks(mr),
+    }
+}
+
 pub fn fetch_diff(mr: &MergeRequest) -> Result<String, String> {
     match mr.forge {
         Forge::GitLab => gitlab::fetch_diff(mr),

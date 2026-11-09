@@ -158,6 +158,16 @@ Either way it only goes through if nobody pushed since the list loaded it.
 
 Both run through `glab` or `gh` and refresh the list.
 
+`Ctrl+r` starts a failed pipeline again after you confirm with `y`, on open
+ones with a red CI dot, your own and others'. On GitLab it retries the
+failed and cancelled jobs of the merge request's head pipeline; on GitHub
+the failed jobs of every failed GitHub Actions run of the newest commit.
+Other apps' checks and outside CI services' statuses can't be started from
+here, and the list says so. On any other pipeline it asks nothing and says
+why there is nothing to start. Like a merge, it only goes through if nobody
+pushed since the list loaded it. The CI dot shows it running at the latest
+at the next refresh.
+
 `w` marks your own merge request as a draft, or as ready for review again,
 without asking (the same key undoes it).
 
@@ -218,6 +228,7 @@ the pointer is over it.
 | `v` | Open ones: approve (or take your approval back), after confirming |
 | `!` | Open ones of others: request changes with a reason (`Ctrl+s`, then `y` sends) |
 | `m` | Open ones: merge, after confirming, when GitLab or GitHub allows it |
+| `Ctrl+r` | Open ones with a failed pipeline: start the failed jobs again, after confirming |
 | `w` | Your own open ones: mark as draft, or as ready for review again |
 | `b` | Open ones: open the branch in a new Herdr workspace (a git worktree) |
 | `?` | All keys |
@@ -328,7 +339,10 @@ When the list opens, it reads the git remote of its directory from
 Comments load when a merge request's activity tab is open. The list only
 writes what you asked for: an approval or taking one back, a merge, a reply
 to a thread, a comment or a change request (all after confirming), and
-resolving a thread or opening it again. Replies, comments and change
+resolving a thread or opening it again. Starting a failed pipeline again
+(after confirming) asks the forge for the current head first, then sends
+GitLab's GraphQL `pipelineRetry`, or GitHub's REST `rerun-failed-jobs` for
+each failed GitHub Actions run, through `gh api`. Replies, comments and change
 requests go through `glab api` (GitLab's REST API) and `gh api` (GitHub's
 GraphQL API for replies, REST for comments and reviews), with the text as
 typed, sent to them on standard input; on GitLab a change request adds the

@@ -658,3 +658,34 @@ without a word or showed "run … auth login" for a write (#29).
 - GitHub got an `answer` helper like GitLab's, so the decision is tested
   with recorded output. They stay two: GitLab also treats a refusal next to
   data differently, and the word lists are what they share.
+
+## 2026-11-09: Starting a failed pipeline again with `Ctrl+r`
+
+`Ctrl+r` starts a failed pipeline again (the owner's decision on #12, with
+the keys of #9 to #11). Herdr's prefix is `Ctrl+b` by default and Herdr
+binds no `Ctrl+r` of its own, so it reaches the list like `Ctrl+d`,
+`Ctrl+u` and `Ctrl+s`. It is a confirmed write like approve and merge
+(`Action::Retry`): the footer asks, `y` starts it in the background, and
+the refresh after it shows the CI dot running (on GitHub at the latest at
+the next refresh, once GitHub updated its rollup). Refused on merged and
+closed ones, like every write since #7.
+
+- What a retry needs is loaded when it is confirmed, not with the list: one
+  small query for the current head (GitLab: `diffHeadSha` and
+  `headPipeline { id status }`; GitHub: `headRefOid` and the check suites of
+  the newest commit). The list queries stay as heavy as they were, and the
+  same query pins the retry to the head the list showed: after a push, or
+  when the pipeline no longer failed, nothing starts and the list says to
+  refresh.
+- GitLab: the GraphQL mutation `pipelineRetry` on the head pipeline, which
+  starts its failed and cancelled jobs again; its `errors` are shown.
+- GitHub: only GitHub Actions runs (check suites with a `workflowRun`) can
+  be started again with the user's `gh` login. Each failed one (conclusion
+  failure, timed out or cancelled; not "action required" or "startup
+  failure", which a re-run can't start) gets `POST
+  repos/{repo}/actions/runs/{id}/rerun-failed-jobs` in the repository of
+  its suite. When some start and others are refused, it counts as started
+  (the list refreshes) and says how many and why. When only other apps'
+  checks or commit statuses failed, nothing starts. The CI dot is GitHub's
+  rollup of all of them, so it can stay red after the Actions runs started
+  when another app's check failed too.
