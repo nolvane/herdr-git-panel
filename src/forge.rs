@@ -47,20 +47,53 @@ pub fn list_forges<'a>(
     }
 }
 
+/// Whether a refresh asks GitLab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AskGitLab {
+    /// It answered with its lists before: every error, a 429 too, shows.
+    Yes,
+    /// Left out: it answered "not logged in" and its login has not changed.
+    No,
+    /// Not known to be logged in (the list just opened, it answered "not
+    /// logged in" last time, or its login changed): a 429 then is most
+    /// likely gitlab.com's limit for traffic without a login, which glab
+    /// can't tell from another one, so it counts as "not logged in".
+    Again,
+}
+
+/// What GitLab said about its login in a refresh.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitLabLogin {
+    /// Not asked: left out, glab missing, or not needed for the project.
+    NotAsked,
+    /// Every list asked answered "not logged in".
+    LoggedOut,
+    /// It answered with lists.
+    LoggedIn,
+    /// A real error, no lists.
+    Failed,
+}
+
 /// The lists in `status` of every forge, and "All" for `all_of` (`None`:
-/// your projects).
+/// your projects), with what GitLab said about its login.
 pub fn fetch_all(
     gitlab_host: &str,
     status: Status,
     all_of: Option<&Project>,
-) -> Result<Fetched, String> {
-    let use_gitlab = cli::find("glab").is_some();
+    gitlab: AskGitLab,
+) -> (GitLabLogin, Result<Fetched, String>) {
+    let has_gitlab = cli::find("glab").is_some();
     let use_github = github::available();
-    if !use_gitlab && !use_github {
-        return Err(
-            "Neither glab nor gh is installed: brew install glab (GitLab) or gh (GitHub)".into(),
+    if !has_gitlab && !use_github {
+        return (
+            GitLabLogin::NotAsked,
+            Err(
+                "Neither glab nor gh is installed: brew install glab (GitLab) or gh (GitHub)"
+                    .into(),
+            ),
         );
     }
+    let use_gitlab = has_gitlab && gitlab != AskGitLab::No;
     let (all_gitlab, all_github) = all_forges(all_of, gitlab_host);
     let (lists_gitlab, lists_github, lists_of) = list_forges(status, all_of, gitlab_host);
     let path = all_of.map(|p| p.path.as_str());
@@ -100,14 +133,51 @@ pub fn fetch_all(
             hub_all.join().unwrap_or_else(|_| Err("gh crashed".into())),
         )
     });
-    combine(
-        gitlab_host,
-        [use_gitlab, use_github],
-        status,
-        all_of,
-        [lab, hub],
-        [lab_all, hub_all],
+    let asked = use_gitlab && (lists_gitlab || all_gitlab);
+    let (login, lab, lab_all) = gitlab_login(asked, gitlab, lab, lab_all);
+    (
+        login,
+        combine(
+            gitlab_host,
+            [has_gitlab, use_github],
+            status,
+            all_of,
+            [lab, hub],
+            [lab_all, hub_all],
+        ),
     )
+}
+
+/// A forge's lists: `None` when it was not asked or is not logged in.
+type Lists = Result<Option<Data>, String>;
+/// A forge's part of "All", likewise.
+type All = Result<Option<AllPart>, String>;
+
+/// What GitLab's answers say about its login, and the answers with a 429
+/// taken as "not logged in" when it was asked [`AskGitLab::Again`].
+fn gitlab_login(
+    asked: bool,
+    gitlab: AskGitLab,
+    lists: Lists,
+    all: All,
+) -> (GitLabLogin, Lists, All) {
+    if !asked {
+        return (GitLabLogin::NotAsked, lists, all);
+    }
+    fn quiet<T>(again: bool, r: Result<Option<T>, String>) -> Result<Option<T>, String> {
+        match r {
+            Err(e) if again && gitlab::limited(&e) => Ok(None),
+            r => r,
+        }
+    }
+    let again = gitlab == AskGitLab::Again;
+    let (lists, all) = (quiet(again, lists), quiet(again, all));
+    let login = match (&lists, &all) {
+        (Ok(None), Ok(None)) => GitLabLogin::LoggedOut,
+        (Ok(Some(_)), _) | (_, Ok(Some(_))) => GitLabLogin::LoggedIn,
+        _ => GitLabLogin::Failed,
+    };
+    (login, lists, all)
 }
 
 /// Puts the forges' answers together: `installed`, `lists` and `all` are
@@ -680,5 +750,133 @@ mod tests {
         assert_eq!(all.total, 194);
         assert_eq!(all.of, None);
         assert_eq!(fetched.warning, None);
+    }
+
+    fn part() -> AllPart {
+        AllPart {
+            items: vec![mr(Forge::GitLab, 3, 3)],
+            total: 1,
+            projects: vec!["gitlab.com/acme/app".into()],
+        }
+    }
+
+    const LIMIT: &str = "glab failed: glab: HTTP 429";
+
+    #[test]
+    fn gitlab_says_whether_it_is_logged_in() {
+        use AskGitLab::*;
+        let login = |ask, lists, all| gitlab_login(true, ask, lists, all).0;
+        assert_eq!(login(Yes, Ok(None), Ok(None)), GitLabLogin::LoggedOut);
+        assert_eq!(
+            login(Yes, Ok(Some(lists())), Ok(Some(part()))),
+            GitLabLogin::LoggedIn
+        );
+        // Lists with "All" failing: logged in, the error shows.
+        assert_eq!(
+            login(Yes, Ok(Some(lists())), Err("boom".into())),
+            GitLabLogin::LoggedIn
+        );
+        assert_eq!(
+            login(Yes, Err("boom".into()), Ok(None)),
+            GitLabLogin::Failed
+        );
+        // Left out: nothing said.
+        let (said, lists, all) = gitlab_login(false, No, Ok(None), Ok(None));
+        assert_eq!(said, GitLabLogin::NotAsked);
+        assert!(matches!((lists, all), (Ok(None), Ok(None))));
+    }
+
+    #[test]
+    fn a_429_without_a_known_login_is_not_logged_in() {
+        // Not known as logged in: gitlab.com's limit for traffic without a
+        // login, quiet, also when only one of the requests got it.
+        for (lists, all) in [
+            (Err(LIMIT.to_string()), Err(LIMIT.to_string())),
+            (Ok(None), Err(LIMIT.to_string())),
+            (Err(LIMIT.to_string()), Ok(None)),
+        ] {
+            let (said, lists, all) = gitlab_login(true, AskGitLab::Again, lists, all);
+            assert_eq!(said, GitLabLogin::LoggedOut);
+            let fetched = combine(
+                "gitlab.com",
+                BOTH,
+                Status::Open,
+                None,
+                [lists, Ok(Some(lists_of_github()))],
+                [all, Ok(None)],
+            )
+            .unwrap();
+            assert_eq!(fetched.warning, None, "nothing in the footer");
+            assert_eq!(fetched.data.mine.len(), 1, "GitHub's lists stay");
+        }
+        // Another error stays one.
+        let (said, lists, _) = gitlab_login(
+            true,
+            AskGitLab::Again,
+            Err("glab: no network".into()),
+            Ok(None),
+        );
+        assert_eq!(said, GitLabLogin::Failed);
+        assert!(lists.is_err());
+    }
+
+    #[test]
+    fn a_429_while_logged_in_shows() {
+        let (said, lists, all) =
+            gitlab_login(true, AskGitLab::Yes, Err(LIMIT.into()), Err(LIMIT.into()));
+        assert_eq!(said, GitLabLogin::Failed);
+        let fetched = combine(
+            "gitlab.com",
+            BOTH,
+            Status::Open,
+            None,
+            [lists, Ok(Some(lists_of_github()))],
+            [all, Ok(None)],
+        )
+        .unwrap();
+        assert_eq!(fetched.warning.as_deref(), Some(LIMIT));
+    }
+
+    fn lists_of_github() -> Data {
+        Data {
+            review: vec![],
+            mine: vec![mr(Forge::GitHub, 5, 5)],
+            of: None,
+            all: None,
+        }
+    }
+
+    #[test]
+    fn gitlab_left_out_still_says_why() {
+        // In a GitLab project's clone, "All" is not "no merge requests".
+        let fetched = combine(
+            "gitlab.com",
+            BOTH,
+            Status::Open,
+            Some(&project("gitlab.com")),
+            [Ok(None), Ok(Some(lists_of_github()))],
+            [Ok(None), Ok(None)],
+        )
+        .unwrap();
+        assert_eq!(
+            fetched.data.all.unwrap().error.as_deref(),
+            Some("glab is not installed or not logged in to gitlab.com")
+        );
+        // Neither forge usable: still how to log in, with gh missing or
+        // not logged in.
+        for installed in [[true, false], BOTH] {
+            let Err(e) = combine(
+                "gitlab.com",
+                installed,
+                Status::Open,
+                None,
+                [Ok(None), Ok(None)],
+                [Ok(None), Ok(None)],
+            ) else {
+                panic!("lists without a forge");
+            };
+            assert!(e.contains("run glab auth login"), "{e}");
+            assert_eq!(e.contains("run gh auth login"), installed[1], "{e}");
+        }
     }
 }
