@@ -3034,8 +3034,8 @@ mod tests {
         assert_eq!(app.thread, Some(2));
         write_and_post(&mut app, '>', "Still fine.");
         assert_eq!(flash(&app), Some("Reply posted"));
-        assert!(app.resolve_rx.try_recv().is_err(), "no resolve or reopen");
         let key = app.selected().unwrap().key();
+        assert!(!app.activity.contains_key(&key), "loads again");
         reload(&mut app, &key, discussions());
         let Some((_, Activity::Loaded(list))) = app.activity.get(&key) else {
             panic!("not loaded");
@@ -3179,7 +3179,7 @@ mod tests {
                 "close panel, search or filter (never the list)",
                 "reply to the selected thread",
                 "write a comment",
-                "in the text: new line / send / discard",
+                "in the text: new line / send (then y) / discard",
             ] {
                 assert!(shown.contains(k), "{w}x{h}: {k}\n{shown}");
             }

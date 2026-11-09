@@ -35,6 +35,11 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- A refresh keeps the selected merge request or pull request selected when
+  it moves in the list, instead of the row it was on (#10).
+- The activity tab's key hints wrap instead of being cut off, and the key
+  overview (`?`) uses two columns when it is taller than the screen (#10).
+
 - "Mine" is now the first section, before "To review", and the list opens on
   it; `1` selects "Mine" and `2` "To review".
 

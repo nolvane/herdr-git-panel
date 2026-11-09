@@ -465,7 +465,10 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
                 (">", "reply to the selected thread"),
                 ("+", "write a comment"),
                 ("", "> +: open ones only"),
-                ("⏎ Ctrl+s Esc", "in the text: new line / send / discard"),
+                (
+                    "⏎ Ctrl+s Esc",
+                    "in the text: new line / send (then y) / discard",
+                ),
             ],
         ),
         (
@@ -1628,8 +1631,8 @@ fn activity_lines(
     }
     lines.push(Line::from(keys));
     lines.push(Line::from(""));
-    // Where the discussions start; each one but the first gets a blank
-    // line before it.
+    // The header ends here; every discussion after it gets a blank line
+    // before it, the first one too (as it always had).
     let top = lines.len() - 1;
     let mut selected_line = None;
 
@@ -1990,7 +1993,7 @@ fn draw_compose_footer(frame: &mut Frame, app: &mut App, c: Compose, area: Rect)
         &head,
         (area.width as usize).saturating_sub(buttons_width).max(4),
     );
-    let mut x = area.x + head.chars().count() as u16;
+    let mut x = area.x + Span::raw(head.as_str()).width() as u16;
     let mut spans = vec![Span::styled(head, bold)];
     for (span, key) in buttons {
         let w = span.width() as u16;
