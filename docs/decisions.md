@@ -592,3 +592,22 @@ failure keeps the text in the open box with the reason.
   Replies and comments from #10 send their text as typed, so there a line
   starting with `/` does run as a GitLab command, as in GitLab's own
   comment box; whether that should change is its own issue.
+
+## 2026-11-09: Both ends of long threads, the newest 100 threads
+
+The activity request loads per thread its first note (`head: notes(first:
+1)`, on GitHub `comments`) and its newest 49 (`tail: notes(last: 49)`) with
+the thread's total (`count`, on GitHub `totalCount`), and the newest 100
+threads (`discussions(last: 100)`, `reviewThreads(last: 100)`). Both forges
+give notes oldest first, so `first: 50` dropped exactly the newest replies,
+and `first: 100` the newest threads.
+- The first note stays because the thread's place (file and line) and the
+  reply marks hang on it. Head and tail overlap on a thread of up to 50
+  notes; `model::thread_notes` merges them by note id, so each note shows
+  once.
+- What lies between shows as one dim line "… N earlier replies not shown",
+  so a cut thread does not look complete. Paging through every note would
+  cost requests per thread, against "Comments loaded on demand".
+- GitLab complexity of the whole new request, measured on gitlab.com on
+  2026-11-09 with `queryComplexity`: 35 of the 250 allowed. GitHub accepts
+  the query; at most 100 × 50 comments stay far below its node limit.

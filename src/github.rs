@@ -592,10 +592,11 @@ query($owner: String!, $name: String!, $number: Int!) {
     pullRequest(number: $number) {
       comments(last: 100) { nodes { body createdAt author { login } } }
       reviews(last: 50) { nodes { body state submittedAt author { login } } }
-      reviewThreads(first: 100) {
+      reviewThreads(last: 100) {
         nodes {
           id isResolved path line originalLine
-          comments(first: 50) { nodes { body createdAt author { login } } }
+          head: comments(first: 1) { nodes { id body createdAt author { login } } }
+          tail: comments(last: 49) { totalCount nodes { id body createdAt author { login } } }
         }
       }
     }
@@ -641,6 +642,7 @@ pub fn parse_activity(value: &Value) -> Result<Vec<Discussion>, String> {
         resolved: false,
         place: None,
         notes: vec![n],
+        hidden: 0,
     };
     let mut list: Vec<Discussion> = Vec::new();
     for c in pr["comments"]["nodes"].as_array().into_iter().flatten() {
@@ -667,10 +669,18 @@ pub fn parse_activity(value: &Value) -> Result<Vec<Discussion>, String> {
         .into_iter()
         .flatten()
     {
-        let notes: Vec<Note> = t["comments"]["nodes"]
-            .as_array()
-            .map(|a| a.iter().map(|c| note(c, "createdAt")).collect())
-            .unwrap_or_default();
+        let end = |part: &str| -> Vec<(String, Note)> {
+            t[part]["nodes"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .map(|c| (str_of(&c["id"]), note(c, "createdAt")))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let total = t["tail"]["totalCount"].as_u64().unwrap_or(0) as usize;
+        let (notes, hidden) = thread_notes(end("head"), end("tail"), total);
         let place = t["path"].as_str().map(|path| {
             match t["line"].as_u64().or_else(|| t["originalLine"].as_u64()) {
                 Some(line) => format!("{path}:{line}"),
@@ -683,6 +693,7 @@ pub fn parse_activity(value: &Value) -> Result<Vec<Discussion>, String> {
             resolved: t["isResolved"].as_bool().unwrap_or(false),
             place,
             notes,
+            hidden,
         });
     }
     list.retain(|d| !d.notes.is_empty());
@@ -1094,7 +1105,8 @@ mod tests {
                 {"body": "", "state": "COMMENTED", "submittedAt": "2026-11-02T08:00:00Z", "author": {"login": "kim"}}
             ]},
             "reviewThreads": {"nodes": [{"id": "PRRT_1", "isResolved": false, "path": "src/a.rs", "line": null, "originalLine": 7,
-                "comments": {"nodes": [{"body": "Why?", "createdAt": "2026-11-02T09:00:00Z", "author": {"login": "kim"}}]}}]}
+                "head": {"nodes": [{"id": "PRRC_1", "body": "Why?", "createdAt": "2026-11-02T09:00:00Z", "author": {"login": "kim"}}]},
+                "tail": {"totalCount": 1, "nodes": [{"id": "PRRC_1", "body": "Why?", "createdAt": "2026-11-02T09:00:00Z", "author": {"login": "kim"}}]}}]}
         }}}});
         let a = parse_activity(&v).unwrap();
         assert_eq!(a.len(), 3);
@@ -1104,6 +1116,60 @@ mod tests {
         assert!(a[1].resolvable);
         assert_eq!(a[1].place.as_deref(), Some("src/a.rs:7"));
         assert!(!a[2].resolvable);
+    }
+
+    /// A comment of a review thread as `ACTIVITY` loads it.
+    fn thread_comment(id: u32, author: &str, at: &str) -> Value {
+        json!({"id": format!("PRRC_{id}"), "body": format!("Comment {id}"), "createdAt": at, "author": {"login": author}})
+    }
+
+    #[test]
+    fn activity_loads_the_newest_hundred_threads_with_both_ends() {
+        assert!(ACTIVITY.contains("reviewThreads(last: 100)"), "{ACTIVITY}");
+        assert!(ACTIVITY.contains("head: comments(first: 1)"), "{ACTIVITY}");
+        assert!(
+            ACTIVITY.contains("tail: comments(last: 49) { totalCount"),
+            "{ACTIVITY}"
+        );
+    }
+
+    #[test]
+    fn review_threads_show_both_ends_once() {
+        let at = |h: u32, m: u32| format!("2026-11-02T{h:02}:{m:02}:00Z");
+        // 60 comments, one a minute: the tail has comments 12 to 60.
+        let tail: Vec<Value> = (12..=60)
+            .map(|i| thread_comment(i, "sam", &at(8 + (i - 1) / 60, (i - 1) % 60)))
+            .collect();
+        let short = [
+            thread_comment(100, "kim", &at(8, 30)),
+            thread_comment(101, "me", &at(8, 31)),
+        ];
+        let v = json!({"data": {"repository": {"pullRequest": {
+            "comments": {"nodes": []}, "reviews": {"nodes": []},
+            "reviewThreads": {"nodes": [
+                {"id": "PRRT_short", "isResolved": false, "path": "src/b.rs", "line": 3, "originalLine": 3,
+                 "head": {"nodes": [short[0].clone()]},
+                 "tail": {"totalCount": 2, "nodes": short}},
+                {"id": "PRRT_long", "isResolved": true, "path": "src/a.rs", "line": null, "originalLine": 7,
+                 "head": {"nodes": [thread_comment(1, "alex", &at(8, 0))]},
+                 "tail": {"totalCount": 60, "nodes": tail}}
+            ]}
+        }}}});
+        let a = parse_activity(&v).unwrap();
+        // The long thread sorts by its real newest reply (08:59).
+        assert_eq!(a[0].id, "PRRT_long");
+        let long = &a[0];
+        assert_eq!(long.notes.len(), 50);
+        assert_eq!(long.notes[0].body, "Comment 1");
+        assert_eq!(long.notes[1].body, "Comment 12");
+        assert_eq!(long.notes[49].body, "Comment 60");
+        assert_eq!(long.hidden, 10, "comments 2 to 11");
+        assert_eq!(long.place.as_deref(), Some("src/a.rs:7"));
+        assert!(long.resolvable && long.resolved);
+        // The short one: each comment once, oldest first.
+        let bodies: Vec<&str> = a[1].notes.iter().map(|n| n.body.as_str()).collect();
+        assert_eq!(bodies, ["Comment 100", "Comment 101"]);
+        assert_eq!(a[1].hidden, 0);
     }
 
     #[test]

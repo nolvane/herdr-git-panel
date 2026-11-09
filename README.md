@@ -58,6 +58,9 @@ the text, `Esc` throws it away). The new reply or comment then shows in the tab;
 the box says why and keeps the text. Links in both tabs (the merge
 request's link, Markdown links and plain URLs in descriptions and comments)
 open in the browser with a click.
+The tab loads a merge request's newest 100 threads; a thread with more than
+50 notes shows its first note and its newest 49, with a dim line that says
+how many replies in between are not shown.
 
 `d` shows the changes inside the list: the changed files as a tree on the
 left (with lines added and removed; click one to jump to it, `f` hides the

@@ -2689,6 +2689,7 @@ mod tests {
                 resolved: false,
                 place: Some("src/a.rs:7".into()),
                 notes: vec![note("sam", "Why?", 30)],
+                hidden: 0,
             },
             crate::model::Discussion {
                 id: String::new(),
@@ -2696,6 +2697,7 @@ mod tests {
                 resolved: false,
                 place: None,
                 notes: vec![note("alex", "Nice.", 20)],
+                hidden: 0,
             },
             crate::model::Discussion {
                 id: "gid://gitlab/Discussion/bbb".into(),
@@ -2703,6 +2705,7 @@ mod tests {
                 resolved: true,
                 place: None,
                 notes: vec![note("sam", "Typo.", 10)],
+                hidden: 0,
             },
         ]
     }
@@ -3085,6 +3088,7 @@ mod tests {
                     created: Some(50),
                     system: false,
                 }],
+                hidden: 0,
             },
         );
         reload(&mut app, &key, list);

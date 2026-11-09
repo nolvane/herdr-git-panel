@@ -488,11 +488,15 @@ const ACTIVITY: &str = r#"
 query($project: ID!, $iid: String!) {
   project(fullPath: $project) {
     mergeRequest(iid: $iid) {
-      discussions(first: 100) {
+      discussions(last: 100) {
         nodes {
           id resolvable resolved
-          notes(first: 50) {
-            nodes { body system createdAt author { username } position { filePath newLine oldLine } }
+          head: notes(first: 1) {
+            nodes { id body system createdAt author { username } position { filePath newLine oldLine } }
+          }
+          tail: notes(last: 49) {
+            count
+            nodes { id body system createdAt author { username } position { filePath newLine oldLine } }
           }
         }
       }
@@ -523,20 +527,28 @@ pub fn parse_activity(value: &Value) -> Result<Vec<Discussion>, String> {
     let mut list: Vec<Discussion> = nodes
         .iter()
         .map(|d| {
-            let notes: Vec<Note> = d["notes"]["nodes"]
-                .as_array()
-                .map(|a| {
-                    a.iter()
-                        .map(|n| Note {
-                            author: str_of(&n["author"]["username"]),
-                            body: str_of(&n["body"]),
-                            created: n["createdAt"].as_str().and_then(time::parse_iso),
-                            system: n["system"].as_bool().unwrap_or(false),
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            let first = &d["notes"]["nodes"][0]["position"];
+            let end = |part: &str| -> Vec<(String, Note)> {
+                d[part]["nodes"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .map(|n| {
+                                let note = Note {
+                                    author: str_of(&n["author"]["username"]),
+                                    body: str_of(&n["body"]),
+                                    created: n["createdAt"].as_str().and_then(time::parse_iso),
+                                    system: n["system"].as_bool().unwrap_or(false),
+                                };
+                                (str_of(&n["id"]), note)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            let total = d["tail"]["count"].as_u64().unwrap_or(0) as usize;
+            let (notes, hidden) = thread_notes(end("head"), end("tail"), total);
+            // The thread's place is where its first note is.
+            let first = &d["head"]["nodes"][0]["position"];
             let place = first["filePath"].as_str().map(|path| {
                 match first["newLine"]
                     .as_u64()
@@ -552,6 +564,7 @@ pub fn parse_activity(value: &Value) -> Result<Vec<Discussion>, String> {
                 resolved: d["resolved"].as_bool().unwrap_or(false),
                 place,
                 notes,
+                hidden,
             }
         })
         .filter(|d| !d.notes.is_empty())
@@ -1126,15 +1139,20 @@ mod tests {
     #[test]
     fn activity_newest_first_with_place() {
         let v = json!({"data": {"project": {"mergeRequest": {"discussions": {"nodes": [
-            {"resolvable": false, "resolved": false, "notes": {"nodes": [
-                {"body": "approved this merge request", "system": true, "createdAt": "2026-11-01T08:00:00Z",
-                 "author": {"username": "alex"}, "position": null}]}},
-            {"id": "gid://gitlab/Discussion/abc", "resolvable": true, "resolved": false, "notes": {"nodes": [
-                {"body": "Why?", "system": false, "createdAt": "2026-11-02T08:00:00Z",
+            {"resolvable": false, "resolved": false,
+             "head": {"nodes": [{"id": "gid://gitlab/Note/1", "body": "approved this merge request", "system": true,
+                 "createdAt": "2026-11-01T08:00:00Z", "author": {"username": "alex"}, "position": null}]},
+             "tail": {"count": 1, "nodes": [{"id": "gid://gitlab/Note/1", "body": "approved this merge request", "system": true,
+                 "createdAt": "2026-11-01T08:00:00Z", "author": {"username": "alex"}, "position": null}]}},
+            {"id": "gid://gitlab/Discussion/abc", "resolvable": true, "resolved": false,
+             "head": {"nodes": [{"id": "gid://gitlab/DiscussionNote/2", "body": "Why?", "system": false, "createdAt": "2026-11-02T08:00:00Z",
+                 "author": {"username": "sam"}, "position": {"filePath": "src/a.rs", "newLine": 12, "oldLine": null}}]},
+             "tail": {"count": 2, "nodes": [
+                {"id": "gid://gitlab/DiscussionNote/2", "body": "Why?", "system": false, "createdAt": "2026-11-02T08:00:00Z",
                  "author": {"username": "sam"}, "position": {"filePath": "src/a.rs", "newLine": 12, "oldLine": null}},
-                {"body": "Because.", "system": false, "createdAt": "2026-11-03T08:00:00Z",
+                {"id": "gid://gitlab/DiscussionNote/3", "body": "Because.", "system": false, "createdAt": "2026-11-03T08:00:00Z",
                  "author": {"username": "me"}, "position": null}]}},
-            {"resolvable": false, "resolved": false, "notes": {"nodes": []}}
+            {"resolvable": false, "resolved": false, "head": {"nodes": []}, "tail": {"count": 0, "nodes": []}}
         ]}}}}});
         let a = parse_activity(&v).unwrap();
         assert_eq!(a.len(), 2);
@@ -1142,6 +1160,69 @@ mod tests {
         assert_eq!(a[0].id, "gid://gitlab/Discussion/abc");
         assert_eq!(a[0].notes.len(), 2);
         assert!(a[1].notes[0].system);
+    }
+
+    /// A note of a discussion as `ACTIVITY` loads it.
+    fn activity_note(id: u32, author: &str, at: &str, position: Value) -> Value {
+        json!({"id": format!("gid://gitlab/DiscussionNote/{id}"), "body": format!("Note {id}"), "system": false,
+               "createdAt": at, "author": {"username": author}, "position": position})
+    }
+
+    #[test]
+    fn activity_loads_the_newest_hundred_threads_with_both_ends() {
+        assert!(ACTIVITY.contains("discussions(last: 100)"), "{ACTIVITY}");
+        assert!(ACTIVITY.contains("head: notes(first: 1)"), "{ACTIVITY}");
+        assert!(ACTIVITY.contains("tail: notes(last: 49)"), "{ACTIVITY}");
+        assert!(ACTIVITY.contains("count"), "{ACTIVITY}");
+    }
+
+    #[test]
+    fn a_short_thread_shows_every_note_once_oldest_first() {
+        let at = |m| format!("2026-11-02T08:{m:02}:00Z");
+        let place = json!({"filePath": "src/a.rs", "newLine": 12, "oldLine": null});
+        let first = activity_note(1, "sam", &at(0), place);
+        let v = json!({"data": {"project": {"mergeRequest": {"discussions": {"nodes": [
+            {"id": "gid://gitlab/Discussion/abc", "resolvable": true, "resolved": false,
+             "head": {"nodes": [first.clone()]},
+             "tail": {"count": 3, "nodes": [first, activity_note(2, "me", &at(1), Value::Null),
+                                            activity_note(3, "sam", &at(2), Value::Null)]}}
+        ]}}}}});
+        let a = parse_activity(&v).unwrap();
+        let bodies: Vec<&str> = a[0].notes.iter().map(|n| n.body.as_str()).collect();
+        assert_eq!(bodies, ["Note 1", "Note 2", "Note 3"]);
+        assert_eq!(a[0].hidden, 0);
+        assert_eq!(a[0].place.as_deref(), Some("src/a.rs:12"));
+    }
+
+    #[test]
+    fn a_long_thread_shows_its_first_note_and_the_newest_replies() {
+        let at = |h: u32, m: u32| format!("2026-11-02T{h:02}:{m:02}:00Z");
+        let place = json!({"filePath": "src/a.rs", "newLine": 12, "oldLine": null});
+        // 60 notes, one a minute: the tail has notes 12 to 60.
+        let tail: Vec<Value> = (12..=60)
+            .map(|i| activity_note(i, "sam", &at(8 + (i - 1) / 60, (i - 1) % 60), Value::Null))
+            .collect();
+        let v = json!({"data": {"project": {"mergeRequest": {"discussions": {"nodes": [
+            // A short thread whose only note is newer than the long thread's first ones.
+            {"id": "gid://gitlab/Discussion/short", "resolvable": true, "resolved": false,
+             "head": {"nodes": [activity_note(100, "kim", &at(8, 30), Value::Null)]},
+             "tail": {"count": 1, "nodes": [activity_note(100, "kim", &at(8, 30), Value::Null)]}},
+            {"id": "gid://gitlab/Discussion/long", "resolvable": true, "resolved": false,
+             "head": {"nodes": [activity_note(1, "alex", &at(8, 0), place)]},
+             "tail": {"count": 60, "nodes": tail}}
+        ]}}}}});
+        let a = parse_activity(&v).unwrap();
+        // Sorted by its real newest reply (08:59), above the short one (08:30).
+        assert_eq!(a[0].id, "gid://gitlab/Discussion/long");
+        let long = &a[0];
+        assert_eq!(long.notes.len(), 50);
+        assert_eq!(long.notes[0].body, "Note 1");
+        assert_eq!(long.notes[0].author, "alex");
+        assert_eq!(long.notes[1].body, "Note 12");
+        assert_eq!(long.notes[49].body, "Note 60");
+        assert_eq!(long.hidden, 10, "notes 2 to 11");
+        assert_eq!(long.place.as_deref(), Some("src/a.rs:12"));
+        assert!(long.resolvable);
     }
 
     /// A merge request node of `project` by `author`, updated at `at`.

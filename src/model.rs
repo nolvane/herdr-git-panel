@@ -236,4 +236,25 @@ pub struct Discussion {
     /// `path:line` when the thread is on a line of the changes.
     pub place: Option<String>,
     pub notes: Vec<Note>,
+    /// Replies between the first note and the newest ones that were not
+    /// loaded; 0 when every note is there.
+    pub hidden: usize,
+}
+
+/// The notes of a thread loaded from both ends: `head` (the first notes)
+/// and `tail` (the newest ones), each as (note id, note) oldest first, of
+/// `total` notes in all. A short thread comes in both; each note shows
+/// once. Gives the notes oldest first and how many between were not loaded.
+pub fn thread_notes(
+    head: Vec<(String, Note)>,
+    tail: Vec<(String, Note)>,
+    total: usize,
+) -> (Vec<Note>, usize) {
+    let mut notes: Vec<(String, Note)> = head
+        .into_iter()
+        .filter(|(id, _)| !tail.iter().any(|(t, _)| t == id))
+        .collect();
+    notes.extend(tail);
+    let hidden = total.saturating_sub(notes.len());
+    (notes.into_iter().map(|(_, n)| n).collect(), hidden)
 }
