@@ -366,7 +366,11 @@ enum Failure {
 /// `--hostname` and keeps in its own login as the API host instead.
 fn port_error(host: &str) -> Option<String> {
     let (name, port) = host.rsplit_once(':')?;
-    if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+    // A name before the port, itself without one (not an IPv6 address).
+    if name.is_empty() || name.contains(':') || port.is_empty() {
+        return None;
+    }
+    if !port.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     Some(format!(
@@ -1530,6 +1534,8 @@ mod tests {
         assert_eq!(port_error("git.acme.test"), None);
         assert_eq!(port_error("https://git.acme.test"), None);
         assert_eq!(port_error("git.acme.test:"), None);
+        assert_eq!(port_error(":8443"), None);
+        assert_eq!(port_error("::1"), None);
     }
 
     #[test]

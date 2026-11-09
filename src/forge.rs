@@ -386,7 +386,7 @@ mod tests {
     }
 
     #[test]
-    fn a_port_in_gitlab_host_says_how_to_fix_it() {
+    fn a_port_in_gitlab_host_shows_in_the_footer_or_as_the_error() {
         // GitLab's answer, which comes without starting glab.
         let host = "git.acme.test:8443";
         let fix = gitlab::fetch(host, Status::Open, None).err().unwrap();
