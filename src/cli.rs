@@ -329,15 +329,44 @@ mod tests {
             .unwrap();
         assert_eq!(e, "example.org did not answer within 0 s");
         assert!(started.elapsed() < Duration::from_secs(10));
-        let pid = std::fs::read_to_string(&pidfile).unwrap();
-        std::fs::remove_file(&pidfile).ok();
-        let alive = Command::new("kill")
-            .args(["-0", pid.trim()])
-            .stderr(Stdio::null())
-            .status()
+        let pid: u32 = std::fs::read_to_string(&pidfile)
             .unwrap()
-            .success();
-        assert!(!alive, "the sleep it started is gone too");
+            .trim()
+            .parse()
+            .unwrap();
+        std::fs::remove_file(&pidfile).ok();
+        // `ps` must see a process that surely runs, or "gone" below proves
+        // nothing.
+        assert!(still_runs(std::process::id()), "ps sees this test running");
+        // The kill is sent, not yet done: give it a moment.
+        let waited = Instant::now();
+        while still_runs(pid) && waited.elapsed() < Duration::from_secs(2) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!still_runs(pid), "the sleep it started is gone too");
+    }
+
+    /// Whether the process still runs, by its state in `ps`. A killed
+    /// process whose parent is gone waits as a zombie (state `Z`) until
+    /// process 1 collects it, and in some containers process 1 never does;
+    /// `kill -0` still answers for a zombie, though it runs nothing any more.
+    #[cfg(unix)]
+    fn still_runs(pid: u32) -> bool {
+        let out = Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        let state = String::from_utf8_lossy(&out.stdout);
+        let state = state.trim();
+        // `ps` fails silently with no line only when no such process
+        // exists; any other failure (an unknown option, no permission)
+        // says why on stderr and must not count as "gone".
+        assert!(
+            out.status.success() || (state.is_empty() && out.stderr.is_empty()),
+            "ps could not tell: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        !state.is_empty() && !state.starts_with('Z')
     }
 
     fn failed(stdout: &str, stderr: &str) -> Output {
