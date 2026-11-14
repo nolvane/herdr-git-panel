@@ -331,13 +331,40 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(10));
         let pid = std::fs::read_to_string(&pidfile).unwrap();
         std::fs::remove_file(&pidfile).ok();
-        let alive = Command::new("kill")
-            .args(["-0", pid.trim()])
+        let pid = pid.trim();
+        // The kill is sent, not yet done: give it a moment.
+        let waited = Instant::now();
+        while still_runs(pid) && waited.elapsed() < Duration::from_secs(2) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!still_runs(pid), "the sleep it started is gone too");
+    }
+
+    /// Whether the process still runs. A killed process whose parent is
+    /// gone waits as a zombie until process 1 collects it, and in some
+    /// containers process 1 never does; `kill -0` still answers for a
+    /// zombie, though it runs nothing any more.
+    #[cfg(unix)]
+    fn still_runs(pid: &str) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+                return false;
+            };
+            // The state follows the name in parentheses, which may hold
+            // spaces or parentheses itself.
+            let state = stat
+                .rsplit_once(')')
+                .and_then(|(_, rest)| rest.split_whitespace().next());
+            state != Some("Z")
+        }
+        #[cfg(not(target_os = "linux"))]
+        Command::new("kill")
+            .args(["-0", pid])
             .stderr(Stdio::null())
             .status()
             .unwrap()
-            .success();
-        assert!(!alive, "the sleep it started is gone too");
+            .success()
     }
 
     fn failed(stdout: &str, stderr: &str) -> Output {
