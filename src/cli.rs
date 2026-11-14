@@ -335,6 +335,9 @@ mod tests {
             .parse()
             .unwrap();
         std::fs::remove_file(&pidfile).ok();
+        // `ps` must see a process that surely runs, or "gone" below proves
+        // nothing.
+        assert!(still_runs(std::process::id()), "ps sees this test running");
         // The kill is sent, not yet done: give it a moment.
         let waited = Instant::now();
         while still_runs(pid) && waited.elapsed() < Duration::from_secs(2) {
@@ -351,15 +354,17 @@ mod tests {
     fn still_runs(pid: u32) -> bool {
         let out = Command::new("ps")
             .args(["-o", "stat=", "-p", &pid.to_string()])
-            .stderr(Stdio::null())
             .output()
             .unwrap();
         let state = String::from_utf8_lossy(&out.stdout);
         let state = state.trim();
-        // `ps` fails with no line only when no such process exists.
+        // `ps` fails silently with no line only when no such process
+        // exists; any other failure (an unknown option, no permission)
+        // says why on stderr and must not count as "gone".
         assert!(
-            out.status.success() || state.is_empty(),
-            "ps could not tell"
+            out.status.success() || (state.is_empty() && out.stderr.is_empty()),
+            "ps could not tell: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
         );
         !state.is_empty() && !state.starts_with('Z')
     }
