@@ -8,7 +8,7 @@ of `glab` and `gh` is installed and logged in; with both, the lists mix
 GitLab and GitHub, each row with its forge's logo.
 
 ```
-  Merge requests    Mine 8   To review 2   All 14                     ⌕ Search   all projects
+  Open merge requests    Mine 8   To review 2   All 14                ⌕ Search   all projects
 
      Merge request                         Author   Review  CI  Approvals  Threads       Changes  Opened  Updated
     Add payment notices to the contract    @alex      ●     ●   1/2        –             +48 -9   2d      1h
@@ -101,10 +101,10 @@ it looks at your 100 most recently active projects on each forge. Since
 
 The list shows open merge requests when it opens. `z` (or a click on the
 title) switches to merged ones, then to ones closed without merging, then
-back to open ones. The title says which: "Merge requests" for open ones,
-"Merged merge requests" or "Closed merge requests" otherwise ("pull
-requests" when everything shown is on GitHub; only "Merged" or "Closed" on
-a narrow pane). Every section follows it, each row says "Merged" or
+back to open ones. The title says which: "Open merge requests", "Merged
+merge requests" or "Closed merge requests" ("pull requests" when
+everything shown is on GitHub; only "Open", "Merged" or "Closed" on a
+narrow pane). Every section follows it, each row says "Merged" or
 "Closed", and the list opens on open ones again next time.
 
 - Merged and closed ones load when you first switch to them, the most

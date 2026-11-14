@@ -621,15 +621,14 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
     }
 }
 
-/// The list's title: "Merge requests" (or "Pull requests") for open ones,
-/// "Merged merge requests" or "Closed pull requests" for the others.
+/// The list's title, the state and then the noun: "Open merge requests",
+/// "Merged merge requests" or "Closed pull requests".
 pub fn list_title(app: &App) -> String {
-    let noun = app.plural_noun();
-    match app.status {
-        Status::Open => noun.to_string(),
-        Status::Merged => format!("Merged {}", noun.to_lowercase()),
-        Status::Closed => format!("Closed {}", noun.to_lowercase()),
-    }
+    format!(
+        "{} {}",
+        app.status.title(),
+        app.plural_noun().to_lowercase()
+    )
 }
 
 fn draw_header(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
@@ -653,15 +652,12 @@ fn draw_header(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
             (section, format!(" {} {count} ", section.name()))
         })
         .collect();
-    // On a pane too narrow for the tabs next to "Merged merge requests",
-    // the title is only "Merged".
+    // On a pane too narrow for the tabs next to "Open merge requests",
+    // the title is only the state: "Open", "Merged" or "Closed".
     let tabs_width: usize = labels.iter().map(|(_, l)| l.chars().count() + 1).sum();
     let mut title = format!("{icon} {}", list_title(app));
-    if app.status != Status::Open
-        && Line::from(title.as_str()).width() + 3 + tabs_width > line.width as usize
-    {
-        let state = app.status.name();
-        title = format!("{icon} {}{}", state[..1].to_uppercase(), &state[1..]);
+    if Line::from(title.as_str()).width() + 3 + tabs_width > line.width as usize {
+        title = format!("{icon} {}", app.status.title());
     }
     // A click on the title steps the state, like its key.
     let title_width = Line::from(title.as_str()).width() as u16;
@@ -2559,12 +2555,21 @@ mod tests {
         let mut app = app_with(vec![], vec![], false);
         app.data = None;
         app.section = Section::All;
-        assert!(shown(&mut app, "Loading merge requests…"));
+        assert!(shown(&mut app, "Loading open merge requests…"));
+        // GitHub only: pull requests, in the same words.
+        app.project = Some(Project {
+            host: "github.com".into(),
+            path: "acme/app".into(),
+        });
+        app.scope = crate::config::Scope::Current;
+        assert!(shown(&mut app, "Loading open pull requests…"));
         // Loaded for "your projects" while "this project" is shown.
         let mut app = app_with_all(sample_rows(), 6, None);
         app.project = Some(acme_app());
         let rows = screen(&mut app, 120, 20);
-        assert!(rows.iter().any(|r| r.contains("Loading merge requests…")));
+        assert!(rows
+            .iter()
+            .any(|r| r.contains("Loading open merge requests…")));
         assert!(rows.iter().any(|r| r.contains(" All … ")), "{rows:#?}");
         app.section = Section::Mine;
         assert!(shown(&mut app, "Add export"), "Mine switches at once");
@@ -2578,7 +2583,10 @@ mod tests {
             "{rows:#?}"
         );
         app.loading = true;
-        assert!(shown(&mut app, "Loading merge requests…"), "trying again");
+        assert!(
+            shown(&mut app, "Loading open merge requests…"),
+            "trying again"
+        );
     }
 
     #[test]
@@ -2635,7 +2643,13 @@ mod tests {
     #[test]
     fn header_says_which_state_is_shown() {
         let mut app = app_with(vec![], sample_rows(), false);
-        assert!(screen(&mut app, 120, 20)[0].contains("Merge requests   "));
+        assert!(screen(&mut app, 120, 20)[0].contains("Open merge requests   "));
+        // GitHub only, open ones: "Open pull requests".
+        for mr in app.data.as_mut().unwrap().mine.iter_mut() {
+            mr.forge = Forge::GitHub;
+        }
+        let header = &screen(&mut app, 120, 20)[0];
+        assert!(header.contains("Open pull requests   "), "{header}");
         let mut app = app_in(Status::Merged);
         assert!(screen(&mut app, 120, 20)[0].contains("Merged merge requests"));
         let mut app = app_in(Status::Closed);
@@ -2661,10 +2675,17 @@ mod tests {
         // Narrower still: the state shows first.
         let header = &screen(&mut app, 30, 20)[0];
         assert!(header.contains("Merged"), "{header}");
-        // Open ones keep their title as today.
+        // Open ones shorten the same way: only "Open", every tab still there.
         let mut app = app_with(vec![], sample_rows(), false);
         let header = &screen(&mut app, 54, 20)[0];
-        assert!(header.contains("Merge requests"), "{header}");
+        assert!(header.contains("Open "), "{header}");
+        assert!(!header.contains("merge requests"), "{header}");
+        for tab in [" Mine ", " To review ", " All "] {
+            assert!(header.contains(tab), "{tab} in {header}");
+        }
+        // A wide pane keeps the whole title.
+        let header = &screen(&mut app, 120, 20)[0];
+        assert!(header.contains("Open merge requests   "), "{header}");
     }
 
     #[test]

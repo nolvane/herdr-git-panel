@@ -103,6 +103,15 @@ impl Status {
             Status::Closed => "closed",
         }
     }
+
+    /// The state as the list's title starts with it.
+    pub fn title(self) -> &'static str {
+        match self {
+            Status::Open => "Open",
+            Status::Merged => "Merged",
+            Status::Closed => "Closed",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
