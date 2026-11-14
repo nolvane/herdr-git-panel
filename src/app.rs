@@ -2825,9 +2825,7 @@ mod tests {
         press(&mut app, KeyCode::Char('x'));
         let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
         terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
-        let buf = terminal.backend().buffer().clone();
-        let title: String = (0..20).map(|x| buf[(x, 0)].symbol()).collect();
-        click(&mut app, title.find("Open").unwrap() as u16, 0);
+        click(&mut app, title_column(&terminal), 0);
         assert_eq!(app.status, Status::Merged);
         assert_eq!(app.filter, "x", "nothing typed into the search");
     }
@@ -2837,11 +2835,18 @@ mod tests {
         let mut app = app();
         let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
         terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
-        let buf = terminal.backend().buffer().clone();
-        let title: String = (0..20).map(|x| buf[(x, 0)].symbol()).collect();
-        let x = title.find("Open").expect("title") as u16;
-        click(&mut app, x, 0);
+        click(&mut app, title_column(&terminal), 0);
         assert_eq!(app.status, Status::Merged);
+    }
+
+    /// The column of the "O" of "Open" in the header, by cell (the icon
+    /// before it may take several bytes).
+    fn title_column(terminal: &Terminal<TestBackend>) -> u16 {
+        let buf = terminal.backend().buffer();
+        let cells: Vec<&str> = (0..buf.area.width).map(|x| buf[(x, 0)].symbol()).collect();
+        (0..cells.len())
+            .find(|&x| cells[x..].starts_with(&["O", "p", "e", "n"]))
+            .expect("title") as u16
     }
 
     #[test]
@@ -2850,16 +2855,10 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(54, 20)).unwrap();
         terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
         let buf = terminal.backend().buffer().clone();
-        let cells: Vec<&str> = (0..54).map(|x| buf[(x, 0)].symbol()).collect();
-        let title = cells.concat();
+        let title: String = (0..54).map(|x| buf[(x, 0)].symbol()).collect();
         assert!(!title.contains("merge requests"), "{title}");
-        // The last letter of "Open" (by cell, the icon may take several
-        // bytes): the click area covers the short title.
-        let x = (0..cells.len())
-            .find(|&x| cells[x..].starts_with(&["O", "p", "e", "n"]))
-            .expect("short title") as u16
-            + 3;
-        click(&mut app, x, 0);
+        // The last letter of "Open": the click area covers the short title.
+        click(&mut app, title_column(&terminal) + 3, 0);
         assert_eq!(app.status, Status::Merged);
     }
 

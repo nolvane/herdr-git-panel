@@ -626,15 +626,9 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
 pub fn list_title(app: &App) -> String {
     format!(
         "{} {}",
-        state_word(app.status),
+        app.status.title(),
         app.plural_noun().to_lowercase()
     )
-}
-
-/// The state with a capital: "Open", "Merged" or "Closed".
-fn state_word(status: Status) -> String {
-    let state = status.name();
-    format!("{}{}", state[..1].to_uppercase(), &state[1..])
 }
 
 fn draw_header(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
@@ -663,7 +657,7 @@ fn draw_header(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
     let tabs_width: usize = labels.iter().map(|(_, l)| l.chars().count() + 1).sum();
     let mut title = format!("{icon} {}", list_title(app));
     if Line::from(title.as_str()).width() + 3 + tabs_width > line.width as usize {
-        title = format!("{icon} {}", state_word(app.status));
+        title = format!("{icon} {}", app.status.title());
     }
     // A click on the title steps the state, like its key.
     let title_width = Line::from(title.as_str()).width() as u16;
