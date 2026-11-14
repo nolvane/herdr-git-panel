@@ -64,9 +64,24 @@ pub fn wrap_tagged(
         *used += text.width();
         current.push(Span::styled(text, style));
     };
-    for (word, style, link) in words {
+    // A word that does not end in a space runs on into the next one (a key
+    // drawn in its own style next to "(" or ":"): a line breaks only where
+    // a space is, so such a run moves to the next line whole.
+    let mut runs = vec![0; words.len()];
+    let mut start = 0;
+    for (i, (word, _, _)) in words.iter().enumerate() {
+        if word.ends_with(' ') || i + 1 == words.len() {
+            let run = &words[start..=i];
+            let full: usize = run.iter().map(|(w, _, _)| w.width()).sum();
+            let trailing = word.width() - word.trim_end().width();
+            runs[start] = full - trailing;
+            start = i + 1;
+        }
+    }
+    for (i, (word, style, link)) in words.into_iter().enumerate() {
         let w = word.trim_end().width();
-        if used + w > width && used > indent.max(first.content.width()) {
+        let run = runs[i];
+        if run > 0 && used + run > width && used > indent.max(first.content.width()) {
             lines.push(Line::from(std::mem::take(&mut current)));
             current.push(rest.clone());
             used = indent;
@@ -349,6 +364,34 @@ mod tests {
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect()
+    }
+
+    #[test]
+    fn a_word_in_several_spans_wraps_whole() {
+        use ratatui::style::{Modifier, Style};
+        let key = Style::new().add_modifier(Modifier::BOLD);
+        let lines = wrap(
+            vec![
+                Span::raw("send it (then "),
+                Span::styled("y", key),
+                Span::raw(") now"),
+            ],
+            15,
+            Span::raw(""),
+            Span::raw(""),
+        );
+        assert_eq!(text(&lines), ["send it (then ", "y) now"]);
+        let lines = wrap(
+            vec![
+                Span::raw("all ("),
+                Span::styled("a", key),
+                Span::raw(" see)"),
+            ],
+            5,
+            Span::raw(""),
+            Span::raw(""),
+        );
+        assert_eq!(text(&lines), ["all ", "(a ", "see)"]);
     }
 
     #[test]

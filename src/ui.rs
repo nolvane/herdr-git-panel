@@ -1056,27 +1056,24 @@ fn draw_table(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
     if rows_data.is_empty() {
         // Only the hint is a text of the list's own with a key in it; the
         // rest may hold a project's name or a forge's error.
-        let mut hint = "";
-        let (text, color) = if app.data.is_none() || section_loading {
+        let (text, color, hint) = if app.data.is_none() || section_loading {
             match &app.error {
                 // Nothing loads any more: say why instead of "Loading".
-                Some(e) if app.data.is_none() || !app.loading => (e.clone(), RED),
+                Some(e) if app.data.is_none() || !app.loading => (e.clone(), RED, ""),
                 _ => (
                     format!("Loading {}…", list_title(app).to_lowercase()),
                     MUTED,
+                    "",
                 ),
             }
         } else if let Some(e) = all_failed {
-            (e, RED)
+            (e, RED, "")
         } else {
             let place = match (app.scoped_project(), app.section) {
                 (Some(p), _) => format!(" in {}", p.name()),
                 (None, Section::All) => " in your projects".to_string(),
                 (None, _) => String::new(),
             };
-            if app.scoped_project().is_some() {
-                hint = "  (`a` shows all projects)";
-            }
             let noun = app.plural_noun().to_lowercase();
             let state = app.status.name();
             let what = match (app.section, app.status) {
@@ -1085,7 +1082,12 @@ fn draw_table(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
                 (Section::Mine, _) => &format!("No {state} {noun} of yours"),
                 (Section::All, _) => &format!("No {state} {noun}"),
             };
-            (format!("{what}{place}"), MUTED)
+            let hint = if app.scoped_project().is_some() {
+                "  (`a` shows all projects)"
+            } else {
+                ""
+            };
+            (format!("{what}{place}"), MUTED, hint)
         };
         let mut spans = vec![Span::styled(text, Style::new().fg(color))];
         spans.extend(keyed(theme::keys(hint), color));
@@ -1888,7 +1890,7 @@ fn draw_footer(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
     if app.ask_quit {
         let question = " Close the git panel? ";
         let qw = question.chars().count() as u16;
-        let line = Line::from(vec![
+        let mut spans = vec![
             Span::styled(question, Style::new().fg(TEXT).add_modifier(Modifier::BOLD)),
             Span::styled(
                 " y close ",
@@ -1898,17 +1900,12 @@ fn draw_footer(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" "),
-        ]);
-        let line = Line::from(
-            [
-                line.spans,
-                with_keys(
-                    theme::keys(" `any other key` stays "),
-                    Style::new().fg(TEXT).bg(BORDER),
-                ),
-            ]
-            .concat(),
-        );
+        ];
+        spans.extend(with_keys(
+            theme::keys(" `any other key` stays "),
+            Style::new().fg(TEXT).bg(BORDER),
+        ));
+        let line = Line::from(spans);
         app.hits
             .push((Rect::new(area.x + qw, area.y, 9, 1), Hit::Key('y')));
         app.hits
@@ -1938,7 +1935,7 @@ fn draw_footer(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
         let yes = " y yes ";
         let no = theme::keys(" `n` no ");
         let qw = question.chars().count() as u16;
-        let line = Line::from(vec![
+        let mut spans = vec![
             Span::styled(question, Style::new().fg(TEXT).add_modifier(Modifier::BOLD)),
             Span::styled(
                 yes,
@@ -1948,9 +1945,9 @@ fn draw_footer(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" "),
-        ]);
-        let line =
-            Line::from([line.spans, with_keys(no, Style::new().fg(TEXT).bg(BORDER))].concat());
+        ];
+        spans.extend(with_keys(no, Style::new().fg(TEXT).bg(BORDER)));
+        let line = Line::from(spans);
         app.hits
             .push((Rect::new(area.x + qw, area.y, 7, 1), Hit::Key('y')));
         app.hits

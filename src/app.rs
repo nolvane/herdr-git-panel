@@ -1178,7 +1178,7 @@ impl App {
             .selected_thread()
             .map(|d| (d.id.clone(), d.place.clone()));
         let Some((thread, place)) = thread else {
-            self.say(theme::keys("Choose a thread first: `n`"));
+            self.say_keys("Choose a thread first: `n`");
             return;
         };
         self.compose = Some(Compose::new(mr, Target::Reply { thread, place }));
@@ -1759,8 +1759,18 @@ impl App {
         self.section = self.section.step(forward);
     }
 
+    /// Shows a message in the footer. It may hold a forge's error, a title
+    /// or a branch name, so a key mark in it is taken out: only `say_keys`
+    /// draws keys.
     fn say(&mut self, text: impl Into<String>) {
-        self.flash = Some((text.into(), Instant::now() + Duration::from_secs(3)));
+        let text = text.into().replace(theme::KEY_MARK, "");
+        self.flash = Some((text, Instant::now() + Duration::from_secs(3)));
+    }
+
+    /// `say` for a message of the list's own that names keys between
+    /// backticks, as in "Choose a thread first: `n`".
+    fn say_keys(&mut self, text: &str) {
+        self.flash = Some((theme::keys(text), Instant::now() + Duration::from_secs(3)));
     }
 
     fn open_selected(&mut self) {
@@ -1937,7 +1947,7 @@ impl App {
                 if let Some(t) = self.thread {
                     self.toggle_resolved(t);
                 } else {
-                    self.say(theme::keys("Choose a thread first: `n`"));
+                    self.say_keys("Choose a thread first: `n`");
                 }
             }
             KeyCode::Char('v') => self.ask_approval(),
@@ -2170,6 +2180,18 @@ mod tests {
 
     fn flash(app: &App) -> Option<&str> {
         app.flash.as_ref().map(|(t, _)| t.as_str())
+    }
+
+    #[test]
+    fn a_message_from_outside_never_carries_a_key_mark() {
+        let mut app = App::new(Config::default(), None, None);
+        app.say("GitLab: `main` is \u{2060}protected\u{2060}");
+        assert_eq!(flash(&app), Some("GitLab: `main` is protected"));
+        app.say_keys("Choose a thread first: `n`");
+        assert_eq!(
+            flash(&app),
+            Some("Choose a thread first: \u{2060}n\u{2060}")
+        );
     }
 
     /// `app()` opened in a clone whose remote names `host`/`path`.

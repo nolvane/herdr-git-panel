@@ -850,8 +850,12 @@ name, a comment or a forge's error, which may hold backticks of their own.
 
 - The same building blocks and look as herdr-routines (its decision of
   2026-11-11), so the plugins look alike.
-- A mark without width: every place that wraps, cuts or measures a text
-  works as before, and the key spans themselves hold no mark, so no click
-  area moves. Places that measure a text that may hold marks (a message
-  on the right of the footer) measure its display width, not its
+- A mark without width, and the key spans themselves hold no mark, so no
+  click area moves. Places that measure a text that may hold marks (a
+  message on the right of the footer) measure its display width, not its
   characters.
+- `text::wrap` breaks a line only at a space: a key drawn in its own span
+  stays with the "(" or ")" around it instead of starting a line with ")".
+- Messages in the footer go through `App::say`, which takes any mark out,
+  since they often hold a forge's error, a title or a branch name;
+  `App::say_keys` is for the list's own messages that name a key.
