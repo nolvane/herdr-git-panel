@@ -641,12 +641,9 @@ fn draw_header(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
     let labels: Vec<(Section, String)> = Section::ORDER
         .iter()
         .map(|&section| {
-            // Still loading for this scope ("All", merged and closed ones;
-            // open ones count from 0 as before): only the name, the count
-            // in parentheses once it is known.
-            let loading = app.loading_section(section)
-                && (section == Section::All || app.status != Status::Open);
-            let label = if loading {
+            // Still loading (nothing yet, or loaded for the other scope):
+            // only the name, the count in parentheses once it is known.
+            let label = if app.loading_section(section) {
                 format!(" {} ", section.name())
             } else {
                 format!(" {} ({}) ", section.name(), app.rows(section).len())
@@ -2597,6 +2594,10 @@ mod tests {
         app.data = None;
         app.section = Section::All;
         assert!(shown(&mut app, "Loading merge requests…"));
+        // Every tab shows only its name until its list is there.
+        let header = &screen(&mut app, 120, 20)[0];
+        assert!(header.contains(" Mine   To review   All  "), "{header}");
+        assert!(!header.contains('('), "{header}");
         // Loaded for "your projects" while "this project" is shown.
         let mut app = app_with_all(sample_rows(), 6, None);
         app.project = Some(acme_app());
@@ -2604,7 +2605,7 @@ mod tests {
         assert!(rows.iter().any(|r| r.contains("Loading merge requests…")));
         // Only the name while it loads: no number, no "()", no "(0)", no "…".
         let header = &rows[0];
-        assert!(header.contains(" All "), "{header}");
+        assert!(header.contains(" To review (2)   All  "), "{header}");
         assert!(!header.contains("All ("), "{header}");
         assert!(!header.contains('…'), "{header}");
         app.section = Section::Mine;
@@ -2888,7 +2889,7 @@ mod tests {
         app.loading = true;
         assert!(shown(&mut app, "Loading closed merge requests…"));
         let header = &screen(&mut app, 120, 20)[0];
-        assert!(header.contains(" Mine "), "{header}");
+        assert!(header.contains(" Mine   To review   All "), "{header}");
         assert!(!header.contains("Mine ("), "{header}");
         assert!(!header.contains('…'), "{header}");
     }
