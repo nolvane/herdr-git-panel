@@ -2507,9 +2507,9 @@ mod tests {
                 })
                 .expect(label)
         };
-        let (mine_x, mine_y) = find(" Mine 3 ");
-        let (review_x, review_y) = find(" To review 3 ");
-        let (all_x, all_y) = find(" All 4 ");
+        let (mine_x, mine_y) = find(" Mine (3) ");
+        let (review_x, review_y) = find(" To review (3) ");
+        let (all_x, all_y) = find(" All (4) ");
         assert!(mine_x < review_x && review_x < all_x);
         click(&mut app, review_x, review_y);
         assert_eq!(app.section, Section::Review);
@@ -2517,6 +2517,11 @@ mod tests {
         assert_eq!(app.section, Section::All);
         click(&mut app, mine_x, mine_y);
         assert_eq!(app.section, Section::Mine);
+        // The parentheses belong to the tab too: " To review (3) " has its
+        // ")" 12 cells after the "T" the click above hit.
+        assert_eq!(buf[(review_x + 12, review_y)].symbol(), ")");
+        click(&mut app, review_x + 12, review_y);
+        assert_eq!(app.section, Section::Review);
     }
 
     /// Merged ones in every section, as loaded for `of`.
