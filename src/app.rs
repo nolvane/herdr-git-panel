@@ -7,6 +7,7 @@ use crate::forge::{self, AskGitLab, Fetched, GitLabLogin, Posted};
 use crate::gitlab;
 use crate::model::{AllList, Data, Forge, MergeRequest, MergeState, Status};
 use crate::repo::Project;
+use crate::theme;
 use crate::ui;
 use crate::view::{self, Show, SortKey};
 use ratatui::crossterm::event::{
@@ -445,7 +446,7 @@ impl App {
         // Until icons are chosen, say how to fix "?" or boxes in place of icons.
         let flash = (!config.icons_chosen).then(|| {
             (
-                "No icons, only ? or boxes? Press i for plain symbols".to_string(),
+                theme::keys("No icons, only ? or boxes? Press `i` for plain symbols"),
                 Instant::now() + Duration::from_secs(15),
             )
         });
@@ -1015,10 +1016,7 @@ impl App {
         }
         self.opening_branch = true;
         // Shown until the answer comes: the fetch has 30 s, Herdr two minutes.
-        self.flash = Some((
-            format!("Fetching {branch}…"),
-            Instant::now() + Duration::from_secs(180),
-        ));
+        self.say_for(format!("Fetching {branch}…"), Duration::from_secs(180));
         let tx = self.branch_tx.clone();
         std::thread::spawn(move || {
             // A panic still answers, so `b` does not stay blocked.
@@ -1177,7 +1175,7 @@ impl App {
             .selected_thread()
             .map(|d| (d.id.clone(), d.place.clone()));
         let Some((thread, place)) = thread else {
-            self.say("Choose a thread first: n");
+            self.say_keys("Choose a thread first: `n`");
             return;
         };
         self.compose = Some(Compose::new(mr, Target::Reply { thread, place }));
@@ -1758,8 +1756,23 @@ impl App {
         self.section = self.section.step(forward);
     }
 
+    /// Shows a message in the footer. It may hold a forge's error, a title
+    /// or a branch name, so a key mark in it is taken out: only `say_keys`
+    /// draws keys.
     fn say(&mut self, text: impl Into<String>) {
-        self.flash = Some((text.into(), Instant::now() + Duration::from_secs(3)));
+        self.say_for(text, Duration::from_secs(3));
+    }
+
+    /// `say` for a message that stays longer than the usual 3 s.
+    fn say_for(&mut self, text: impl Into<String>, how_long: Duration) {
+        let text = text.into().replace(theme::KEY_MARK, "");
+        self.flash = Some((text, Instant::now() + how_long));
+    }
+
+    /// `say` for a message of the list's own that names keys between
+    /// backticks, as in "Choose a thread first: `n`".
+    fn say_keys(&mut self, text: &str) {
+        self.flash = Some((theme::keys(text), Instant::now() + Duration::from_secs(3)));
     }
 
     fn open_selected(&mut self) {
@@ -1936,7 +1949,7 @@ impl App {
                 if let Some(t) = self.thread {
                     self.toggle_resolved(t);
                 } else {
-                    self.say("Choose a thread first: n");
+                    self.say_keys("Choose a thread first: `n`");
                 }
             }
             KeyCode::Char('v') => self.ask_approval(),
@@ -2171,6 +2184,18 @@ mod tests {
         app.flash.as_ref().map(|(t, _)| t.as_str())
     }
 
+    #[test]
+    fn a_message_from_outside_never_carries_a_key_mark() {
+        let mut app = App::new(Config::default(), None, None);
+        app.say("GitLab: `main` is \u{2060}protected\u{2060}");
+        assert_eq!(flash(&app), Some("GitLab: `main` is protected"));
+        app.say_keys("Choose a thread first: `n`");
+        assert_eq!(
+            flash(&app),
+            Some("Choose a thread first: \u{2060}n\u{2060}")
+        );
+    }
+
     /// `app()` opened in a clone whose remote names `host`/`path`.
     fn app_in(host: &str, path: &str) -> App {
         let mut app = app();
@@ -2257,6 +2282,26 @@ mod tests {
         press(&mut app, KeyCode::Char('b'));
         assert_eq!(flash(&app), None);
         assert!(!app.opening_branch);
+    }
+
+    #[test]
+    fn a_branch_name_from_the_forge_never_has_the_key_look() {
+        // A key mark in a branch name is text from outside: the "Fetching"
+        // message must not draw any of it as a key.
+        let dir = std::env::temp_dir().join(format!("herdr-git-panel-mark-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = app_in_clone(&dir);
+        for mr in &mut app.data.as_mut().unwrap().mine {
+            mr.source_branch = format!("fix{0}y{0}", theme::KEY_MARK);
+        }
+        press(&mut app, KeyCode::Char('b'));
+        assert_eq!(flash(&app), Some("Fetching fixy…"));
+        let until = Instant::now() + Duration::from_secs(10);
+        while app.opening_branch && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+            app.receive_branch();
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -3200,7 +3245,10 @@ mod tests {
         let mut app = in_activity();
         press(&mut app, KeyCode::Char('>'));
         assert!(app.compose.is_none());
-        assert_eq!(flash(&app), Some("Choose a thread first: n"));
+        assert_eq!(
+            flash(&app),
+            Some(theme::keys("Choose a thread first: `n`").as_str())
+        );
         // Comments still loading: no thread to reply to either.
         let mut app = in_activity();
         app.activity.clear();
