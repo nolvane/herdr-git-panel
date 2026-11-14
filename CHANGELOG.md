@@ -17,6 +17,10 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   ("`a` shows all projects"). What a key does stays in a quieter colour, and
   the headings in the help are white, so the accent colour in a text means a
   key (#42).
+- The title names the state for open ones too: "Open merge requests" (or
+  "Open pull requests"), like "Merged merge requests" and "Closed merge
+  requests". On a narrow pane it shortens to "Open", like the other two
+  (#39).
 
 ### Fixed
 
