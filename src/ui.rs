@@ -642,15 +642,16 @@ fn draw_header(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
         .iter()
         .map(|&section| {
             // Still loading for this scope ("All", merged and closed ones;
-            // open ones count from 0 as before).
+            // open ones count from 0 as before): only the name, the count
+            // in parentheses once it is known.
             let loading = app.loading_section(section)
                 && (section == Section::All || app.status != Status::Open);
-            let count = if loading {
-                "…".to_string()
+            let label = if loading {
+                format!(" {} ", section.name())
             } else {
-                app.rows(section).len().to_string()
+                format!(" {} ({}) ", section.name(), app.rows(section).len())
             };
-            (section, format!(" {} {count} ", section.name()))
+            (section, label)
         })
         .collect();
     // On a pane too narrow for the tabs next to "Merged merge requests",
@@ -2423,8 +2424,8 @@ mod tests {
         let (y, mine, review) = tabs(&buf);
         assert!(mine < review, "Mine at {mine}, To review at {review}");
         let text = row_text(&buf, y);
-        assert!(text.contains(" Mine 6 "), "{text}");
-        assert!(text.contains(" To review 2 "), "{text}");
+        assert!(text.contains(" Mine (6) "), "{text}");
+        assert!(text.contains(" To review (2) "), "{text}");
     }
 
     #[test]
@@ -2498,11 +2499,47 @@ mod tests {
         let all = word_x(&buf, y, "All").expect("All tab");
         assert!(mine < review && review < all, "{mine} {review} {all}");
         let text = row_text(&buf, y);
-        assert!(text.contains(" All 4 "), "{text}");
+        assert!(text.contains(" All (4) "), "{text}");
         assert_eq!(buf[(all, y)].bg, SELECTED_BG, "All is the active tab");
         let h = headings(&buf);
         assert!(word_x(&buf, h.y, "Author").is_some());
         assert!(row_text(&buf, h.y + 1).contains("@alex"));
+    }
+
+    #[test]
+    fn an_empty_tab_shows_zero_in_parentheses() {
+        let mut app = app_with(sample_rows()[..2].to_vec(), vec![], false);
+        let header = &screen(&mut app, 120, 20)[0];
+        assert!(header.contains(" Mine (0) "), "{header}");
+        assert!(header.contains(" To review (2) "), "{header}");
+    }
+
+    #[test]
+    fn a_three_digit_count_shows_in_full() {
+        let items: Vec<MergeRequest> = (0..124)
+            .map(|i| {
+                let mut mr = sample_rows()[0].clone();
+                mr.iid = 1000 + i;
+                mr
+            })
+            .collect();
+        let mut app = app_with_all(items, 124, None);
+        let header = &screen(&mut app, 120, 20)[0];
+        assert!(header.contains(" All (124) "), "{header}");
+    }
+
+    #[test]
+    fn a_search_changes_the_count_in_parentheses() {
+        let mut items = sample_rows();
+        items[0].title = "Fix the login redirect".into();
+        let mut app = app_with_all(items, 6, None);
+        let before = app.rows(Section::All).len();
+        assert!(screen(&mut app, 120, 20)[0].contains(&format!(" All ({before}) ")));
+        app.filter = "login".into();
+        let after = app.rows(Section::All).len();
+        assert!(after < before, "{after} of {before}");
+        let header = &screen(&mut app, 120, 20)[0];
+        assert!(header.contains(&format!(" All ({after}) ")), "{header}");
     }
 
     #[test]
@@ -2565,7 +2602,11 @@ mod tests {
         app.project = Some(acme_app());
         let rows = screen(&mut app, 120, 20);
         assert!(rows.iter().any(|r| r.contains("Loading merge requests…")));
-        assert!(rows.iter().any(|r| r.contains(" All … ")), "{rows:#?}");
+        // Only the name while it loads: no number, no "()", no "(0)", no "…".
+        let header = &rows[0];
+        assert!(header.contains(" All "), "{header}");
+        assert!(!header.contains("All ("), "{header}");
+        assert!(!header.contains('…'), "{header}");
         app.section = Section::Mine;
         assert!(shown(&mut app, "Add export"), "Mine switches at once");
         // The refresh for this project failed: "All" says why.
@@ -2657,7 +2698,7 @@ mod tests {
         let header = &screen(&mut app, 54, 20)[0];
         assert!(header.contains("Merged "), "{header}");
         assert!(!header.contains("merge requests"), "{header}");
-        assert!(header.contains(" All 1 "), "{header}");
+        assert!(header.contains(" All (1) "), "{header}");
         // Narrower still: the state shows first.
         let header = &screen(&mut app, 30, 20)[0];
         assert!(header.contains("Merged"), "{header}");
@@ -2665,6 +2706,17 @@ mod tests {
         let mut app = app_with(vec![], sample_rows(), false);
         let header = &screen(&mut app, 54, 20)[0];
         assert!(header.contains("Merge requests"), "{header}");
+    }
+
+    #[test]
+    fn merged_and_closed_tabs_show_their_counts_in_parentheses() {
+        for status in [Status::Merged, Status::Closed] {
+            let mut app = app_in(status);
+            let header = &screen(&mut app, 120, 20)[0];
+            assert!(header.contains(" Mine (1) "), "{header}");
+            assert!(header.contains(" To review (1) "), "{header}");
+            assert!(header.contains(" All (1) "), "{header}");
+        }
     }
 
     #[test]
@@ -2835,7 +2887,10 @@ mod tests {
         app.data.as_mut().unwrap().of = None;
         app.loading = true;
         assert!(shown(&mut app, "Loading closed merge requests…"));
-        assert!(screen(&mut app, 120, 20)[0].contains(" Mine … "));
+        let header = &screen(&mut app, 120, 20)[0];
+        assert!(header.contains(" Mine "), "{header}");
+        assert!(!header.contains("Mine ("), "{header}");
+        assert!(!header.contains('…'), "{header}");
     }
 
     #[test]
