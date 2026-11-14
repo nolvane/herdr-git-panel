@@ -1016,10 +1016,7 @@ impl App {
         }
         self.opening_branch = true;
         // Shown until the answer comes: the fetch has 30 s, Herdr two minutes.
-        self.flash = Some((
-            format!("Fetching {branch}…"),
-            Instant::now() + Duration::from_secs(180),
-        ));
+        self.say_for(format!("Fetching {branch}…"), Duration::from_secs(180));
         let tx = self.branch_tx.clone();
         std::thread::spawn(move || {
             // A panic still answers, so `b` does not stay blocked.
@@ -1763,8 +1760,13 @@ impl App {
     /// or a branch name, so a key mark in it is taken out: only `say_keys`
     /// draws keys.
     fn say(&mut self, text: impl Into<String>) {
+        self.say_for(text, Duration::from_secs(3));
+    }
+
+    /// `say` for a message that stays longer than the usual 3 s.
+    fn say_for(&mut self, text: impl Into<String>, how_long: Duration) {
         let text = text.into().replace(theme::KEY_MARK, "");
-        self.flash = Some((text, Instant::now() + Duration::from_secs(3)));
+        self.flash = Some((text, Instant::now() + how_long));
     }
 
     /// `say` for a message of the list's own that names keys between
@@ -2280,6 +2282,26 @@ mod tests {
         press(&mut app, KeyCode::Char('b'));
         assert_eq!(flash(&app), None);
         assert!(!app.opening_branch);
+    }
+
+    #[test]
+    fn a_branch_name_from_the_forge_never_has_the_key_look() {
+        // A key mark in a branch name is text from outside: the "Fetching"
+        // message must not draw any of it as a key.
+        let dir = std::env::temp_dir().join(format!("herdr-git-panel-mark-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = app_in_clone(&dir);
+        for mr in &mut app.data.as_mut().unwrap().mine {
+            mr.source_branch = format!("fix{0}y{0}", theme::KEY_MARK);
+        }
+        press(&mut app, KeyCode::Char('b'));
+        assert_eq!(flash(&app), Some("Fetching fixy…"));
+        let until = Instant::now() + Duration::from_secs(10);
+        while app.opening_branch && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+            app.receive_branch();
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
