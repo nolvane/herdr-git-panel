@@ -7,6 +7,7 @@ use crate::forge::{self, AskGitLab, Fetched, GitLabLogin, Posted};
 use crate::gitlab;
 use crate::model::{AllList, Data, Forge, MergeRequest, MergeState, Status};
 use crate::repo::Project;
+use crate::theme;
 use crate::ui;
 use crate::view::{self, Show, SortKey};
 use ratatui::crossterm::event::{
@@ -445,7 +446,7 @@ impl App {
         // Until icons are chosen, say how to fix "?" or boxes in place of icons.
         let flash = (!config.icons_chosen).then(|| {
             (
-                "No icons, only ? or boxes? Press i for plain symbols".to_string(),
+                theme::keys("No icons, only ? or boxes? Press `i` for plain symbols"),
                 Instant::now() + Duration::from_secs(15),
             )
         });
@@ -1177,7 +1178,7 @@ impl App {
             .selected_thread()
             .map(|d| (d.id.clone(), d.place.clone()));
         let Some((thread, place)) = thread else {
-            self.say("Choose a thread first: n");
+            self.say(theme::keys("Choose a thread first: `n`"));
             return;
         };
         self.compose = Some(Compose::new(mr, Target::Reply { thread, place }));
@@ -1936,7 +1937,7 @@ impl App {
                 if let Some(t) = self.thread {
                     self.toggle_resolved(t);
                 } else {
-                    self.say("Choose a thread first: n");
+                    self.say(theme::keys("Choose a thread first: `n`"));
                 }
             }
             KeyCode::Char('v') => self.ask_approval(),
@@ -3157,7 +3158,10 @@ mod tests {
         let mut app = in_activity();
         press(&mut app, KeyCode::Char('>'));
         assert!(app.compose.is_none());
-        assert_eq!(flash(&app), Some("Choose a thread first: n"));
+        assert_eq!(
+            flash(&app),
+            Some(theme::keys("Choose a thread first: `n`").as_str())
+        );
         // Comments still loading: no thread to reply to either.
         let mut app = in_activity();
         app.activity.clear();

@@ -11,10 +11,34 @@ use crate::theme::{
 use crate::time;
 use crate::view::{Show, SortKey};
 use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Cell, HighlightSpacing, Paragraph, Row, Table};
 use ratatui::Frame;
+
+/// How a key looks, everywhere: bold and in the accent colour. What it
+/// does stands beside it in a quieter colour.
+fn key_style() -> Style {
+    Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)
+}
+
+/// A text with its keys (marked by `theme::keys`) in the look of a key
+/// and the rest in `style`. A text without marks comes back as it is.
+fn with_keys(text: impl AsRef<str>, style: Style) -> Vec<Span<'static>> {
+    // A key keeps the background of the text it stands in (a button).
+    let key = style.patch(key_style());
+    text.as_ref()
+        .split(theme::KEY_MARK)
+        .enumerate()
+        .filter(|(_, part)| !part.is_empty())
+        .map(|(i, part)| Span::styled(part.to_string(), if i % 2 == 1 { key } else { style }))
+        .collect()
+}
+
+/// `with_keys` for a text in one colour.
+fn keyed(text: impl AsRef<str>, color: Color) -> Vec<Span<'static>> {
+    with_keys(text, Style::new().fg(color))
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Col {
@@ -141,9 +165,9 @@ fn compose_lines(c: &Compose, width: u16) -> (Vec<Line<'static>>, (u16, usize)) 
         (last, lines.len() - 1)
     };
     if c.field.text.is_empty() {
-        lines[0] = Line::from(Span::styled(
-            "⏎ new line · Ctrl+s send · Esc discard",
-            Style::new().fg(FAINT),
+        lines[0] = Line::from(keyed(
+            theme::keys("`⏎` new line · `Ctrl+s` send · `Esc` discard"),
+            FAINT,
         ));
     }
     if let Some(m) = &c.message {
@@ -348,10 +372,7 @@ fn draw_diff(frame: &mut Frame, app: &mut App, icons: &Icons) {
             app.hits.push((Rect::new(x, foot.y, w - 3, 1), Hit::Key(c)));
         }
         x += w;
-        spans.push(Span::styled(
-            key,
-            Style::new().fg(MUTED).add_modifier(Modifier::BOLD),
-        ));
+        spans.push(Span::styled(key, key_style()));
         spans.push(Span::styled(text, Style::new().fg(FAINT)));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), foot);
@@ -455,29 +476,29 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
                 ("p  Space", "details panel on / off"),
                 ("c", "panel: overview / activity"),
                 ("Ctrl+d Ctrl+u", "scroll the panel"),
-                ("d", "show the changes (n N files, f tree, q back)"),
+                ("d", "show the changes (`n` `N` files, `f` tree, `q` back)"),
                 ("b", "open the branch in a new Herdr workspace"),
                 ("v", "approve / take approval back"),
-                ("!", "request changes, with a reason (then y)"),
+                ("!", "request changes, with a reason (then `y`)"),
                 ("m", "merge (when GitLab or GitHub allows it)"),
-                ("Ctrl+r", "open ones: start failed jobs again (then y)"),
+                ("Ctrl+r", "open ones: start failed jobs again (then `y`)"),
                 ("w", "your own: draft / ready for review"),
-                ("", "b v ! m w: open ones only"),
+                ("", "`b` `v` `!` `m` `w`: open ones only"),
                 ("y", "copy the link"),
             ],
         ),
         (
-            "Activity (c)",
+            "Activity (`c`)",
             &[
                 ("t", "all / open / resolved threads"),
                 ("n N", "select the next / previous thread"),
                 ("e", "resolve the thread / open it again"),
                 (">", "reply to the selected thread"),
                 ("+", "write a comment"),
-                ("", "> +: open ones only"),
+                ("", "`>` `+`: open ones only"),
                 (
                     "⏎ Ctrl+s Esc",
-                    "in the text: new line / send (then y) / discard",
+                    "in the text: new line / send (then `y`) / discard",
                 ),
             ],
         ),
@@ -510,19 +531,17 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
             if i > 0 {
                 lines.push(Line::from(""));
             }
-            lines.push(Line::from(Span::styled(
-                *title,
-                Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+            // White, so only keys are in the accent colour here.
+            lines.push(Line::from(with_keys(
+                theme::keys(title),
+                Style::new().fg(TEXT).add_modifier(Modifier::BOLD),
             )));
             // A long description wraps under itself instead of being cut.
             for (k, what) in keys.iter() {
                 lines.extend(text::wrap(
-                    vec![Span::styled(*what, Style::new().fg(MUTED))],
+                    keyed(theme::keys(what), MUTED),
                     width,
-                    Span::styled(
-                        format!("  {k:<15}"),
-                        Style::new().fg(TEXT).add_modifier(Modifier::BOLD),
-                    ),
+                    Span::styled(format!("  {k:<15}"), key_style()),
                     Span::raw(" ".repeat(17)),
                 ));
             }
@@ -1035,6 +1054,9 @@ fn draw_table(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
     // open ones in the other sections switch at once.
     let section_loading = app.loading_section(app.section);
     if rows_data.is_empty() {
+        // Only the hint is a text of the list's own with a key in it; the
+        // rest may hold a project's name or a forge's error.
+        let mut hint = "";
         let (text, color) = if app.data.is_none() || section_loading {
             match &app.error {
                 // Nothing loads any more: say why instead of "Loading".
@@ -1052,11 +1074,9 @@ fn draw_table(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
                 (None, Section::All) => " in your projects".to_string(),
                 (None, _) => String::new(),
             };
-            let hint = if app.scoped_project().is_some() {
-                "  (a shows all projects)"
-            } else {
-                ""
-            };
+            if app.scoped_project().is_some() {
+                hint = "  (`a` shows all projects)";
+            }
             let noun = app.plural_noun().to_lowercase();
             let state = app.status.name();
             let what = match (app.section, app.status) {
@@ -1065,15 +1085,12 @@ fn draw_table(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
                 (Section::Mine, _) => &format!("No {state} {noun} of yours"),
                 (Section::All, _) => &format!("No {state} {noun}"),
             };
-            (format!("{what}{place}{hint}"), MUTED)
+            (format!("{what}{place}"), MUTED)
         };
+        let mut spans = vec![Span::styled(text, Style::new().fg(color))];
+        spans.extend(keyed(theme::keys(hint), color));
         // Wrapped on narrow panes instead of cut off.
-        let lines = text::wrap(
-            vec![Span::styled(text, Style::new().fg(color))],
-            inner.width,
-            Span::raw(""),
-            Span::raw(""),
-        );
+        let lines = text::wrap(spans, inner.width, Span::raw(""), Span::raw(""));
         let [_, mid, _] = Layout::vertical([
             Constraint::Fill(1),
             Constraint::Length(lines.len().max(1) as u16),
@@ -1425,10 +1442,7 @@ fn draw_details(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
     // Only a failed one of the open ones can be started again (Ctrl+r).
     if mr.pipeline == Pipeline::Failed && mr.status == Status::Open {
         pipeline.push(Span::raw("   "));
-        pipeline.push(Span::styled(
-            "Ctrl+r",
-            Style::new().fg(MUTED).add_modifier(Modifier::BOLD),
-        ));
+        pipeline.push(Span::styled("Ctrl+r", key_style()));
         pipeline.push(Span::styled(" start again", Style::new().fg(FAINT)));
     }
     lines.extend(field("Pipeline", pipeline));
@@ -1470,7 +1484,7 @@ fn draw_details(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
     }
 
     // What can be done from here.
-    let key = Style::new().fg(MUTED).add_modifier(Modifier::BOLD);
+    let key = key_style();
     let mut actions = vec![
         Span::styled("⏎", key),
         Span::styled(" open   ", Style::new().fg(FAINT)),
@@ -1669,7 +1683,7 @@ fn activity_lines(
     // What the keys do, spelled out: the selected thread has a bar on the left.
     let hint = |key: &'static str, what: &'static str| {
         [
-            Span::styled(key, Style::new().fg(MUTED).add_modifier(Modifier::BOLD)),
+            Span::styled(key, key_style()),
             Span::styled(what, Style::new().fg(FAINT)),
         ]
     };
@@ -1884,8 +1898,17 @@ fn draw_footer(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" "),
-            Span::styled(" any other key stays ", Style::new().fg(TEXT).bg(BORDER)),
         ]);
+        let line = Line::from(
+            [
+                line.spans,
+                with_keys(
+                    theme::keys(" `any other key` stays "),
+                    Style::new().fg(TEXT).bg(BORDER),
+                ),
+            ]
+            .concat(),
+        );
         app.hits
             .push((Rect::new(area.x + qw, area.y, 9, 1), Hit::Key('y')));
         app.hits
@@ -1913,7 +1936,7 @@ fn draw_footer(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
             cut(clean_title(&c.mr.title), 50)
         );
         let yes = " y yes ";
-        let no = " n no ";
+        let no = theme::keys(" `n` no ");
         let qw = question.chars().count() as u16;
         let line = Line::from(vec![
             Span::styled(question, Style::new().fg(TEXT).add_modifier(Modifier::BOLD)),
@@ -1925,8 +1948,9 @@ fn draw_footer(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" "),
-            Span::styled(no, Style::new().fg(TEXT).bg(BORDER)),
         ]);
+        let line =
+            Line::from([line.spans, with_keys(no, Style::new().fg(TEXT).bg(BORDER))].concat());
         app.hits
             .push((Rect::new(area.x + qw, area.y, 7, 1), Hit::Key('y')));
         app.hits
@@ -1934,33 +1958,34 @@ fn draw_footer(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
         frame.render_widget(Paragraph::new(line), area);
         return;
     }
+    // A message of the list's own may name a key (marked by `theme::keys`).
     let right = if let Some((text, _)) = &app.flash {
-        Span::styled(format!("{text} "), Style::new().fg(ACCENT))
+        Line::from(keyed(format!("{text} "), ACCENT))
     } else if app.loading {
-        Span::styled(
+        Line::from(Span::styled(
             format!("{} refreshing… ", icons.refresh()),
             Style::new().fg(YELLOW),
-        )
+        ))
     } else if let (Some(e), true) = (&app.error, app.data.is_some()) {
-        Span::styled(format!("{e} "), Style::new().fg(RED))
+        Line::from(Span::styled(format!("{e} "), Style::new().fg(RED)))
     } else if let Some(at) = app.updated_at {
-        Span::styled(
+        Line::from(Span::styled(
             format!(
                 "{} updated {} ago ",
                 icons.refresh(),
                 short_age(at.elapsed().as_secs())
             ),
             Style::new().fg(FAINT),
-        )
+        ))
     } else {
-        Span::raw("")
+        Line::from("")
     };
     // `r` refreshes now; shown (and clickable) in front of the status.
     let refresh_key = if app.loading || app.flash.is_some() {
         None
     } else {
         Some(vec![
-            Span::styled("r", Style::new().fg(MUTED).add_modifier(Modifier::BOLD)),
+            Span::styled("r", key_style()),
             Span::styled(" refresh  ", Style::new().fg(FAINT)),
         ])
     };
@@ -1998,7 +2023,7 @@ fn draw_footer(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
     }
     let mut right_spans: Vec<Span> = cut.into_iter().collect();
     right_spans.extend(refresh_key.unwrap_or_default());
-    right_spans.push(right);
+    right_spans.extend(right.spans);
     let right = Line::from(right_spans);
     // Key hints; the ones with a letter can be clicked.
     // Only the most used keys; ? shows all of them.
@@ -2024,10 +2049,7 @@ fn draw_footer(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
                 .push((Rect::new(x, area.y, width - 2, 1), Hit::Key(c)));
         }
         x += width;
-        spans.push(Span::styled(
-            key,
-            Style::new().fg(MUTED).add_modifier(Modifier::BOLD),
-        ));
+        spans.push(Span::styled(key, key_style()));
         spans.push(Span::styled(text, Style::new().fg(FAINT)));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), left_area);
@@ -2042,35 +2064,39 @@ fn draw_footer(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
 /// preview the question with clickable buttons (only `y` posts).
 fn draw_compose_footer(frame: &mut Frame, app: &mut App, c: Compose, area: Rect) {
     let bold = Style::new().fg(TEXT).add_modifier(Modifier::BOLD);
+    // A coloured button is one block; a key on it would not read.
     let button = |text: String, bg| {
-        Span::styled(
+        vec![Span::styled(
             text,
             Style::new()
                 .fg(theme::on(bg))
                 .bg(bg)
                 .add_modifier(Modifier::BOLD),
-        )
+        )]
     };
-    let plain = |text: &'static str| Span::styled(text, Style::new().fg(TEXT).bg(BORDER));
+    // A grey button shows its key in the look of a key.
+    let plain = |text: &str| with_keys(theme::keys(text), Style::new().fg(TEXT).bg(BORDER));
+    let gap = || vec![Span::raw(" ")];
     // Buttons first in the room left after the text, each with its key.
-    let (head, buttons): (String, Vec<(Span<'static>, Option<char>)>) = match c.stage {
+    type Button = (Vec<Span<'static>>, Option<char>);
+    let (head, buttons): (String, Vec<Button>) = match c.stage {
         Stage::Writing => (
             format!(" {}  ", cut(&c.title(), 60)),
             vec![
                 (button(" Ctrl+s send ".into(), GREEN), Some('s')),
-                (Span::raw(" "), None),
-                (plain(" Esc discard "), Some('\u{1b}')),
-                (Span::styled("   ⏎ new line ", Style::new().fg(FAINT)), None),
+                (gap(), None),
+                (plain(" `Esc` discard "), Some('\u{1b}')),
+                (keyed(theme::keys("   `⏎` new line "), FAINT), None),
             ],
         ),
         Stage::Preview => (
             format!(" {} ", cut(&c.question(), 70)),
             vec![
                 (button(format!(" y {} ", c.verb()), GREEN), Some('y')),
-                (Span::raw(" "), None),
-                (plain(" n edit "), Some('n')),
-                (Span::raw(" "), None),
-                (plain(" Esc discard "), Some('\u{1b}')),
+                (gap(), None),
+                (plain(" `n` edit "), Some('n')),
+                (gap(), None),
+                (plain(" `Esc` discard "), Some('\u{1b}')),
             ],
         ),
         Stage::Posting => (
@@ -2081,34 +2107,34 @@ fn draw_compose_footer(frame: &mut Frame, app: &mut App, c: Compose, area: Rect)
     // A narrow footer shortens the text, never the buttons.
     let mut buttons = buttons;
     if c.hidden > 0 {
-        buttons.push((Span::styled("   ↑↓ scroll ", Style::new().fg(FAINT)), None));
+        buttons.push((keyed(theme::keys("   `↑↓` scroll "), FAINT), None));
     }
-    let buttons_width: usize = buttons.iter().map(|(s, _)| s.width()).sum();
+    let width = |spans: &[Span]| spans.iter().map(Span::width).sum::<usize>();
+    let buttons_width: usize = buttons.iter().map(|(s, _)| width(s)).sum();
     let head = cut(
         &head,
         (area.width as usize).saturating_sub(buttons_width).max(4),
     );
     let mut x = area.x + Span::raw(head.as_str()).width() as u16;
     let mut spans = vec![Span::styled(head, bold)];
-    for (span, key) in buttons {
-        let w = span.width() as u16;
+    for (button, key) in buttons {
+        let w = width(&button) as u16;
         if let Some(k) = key {
             if x + w <= area.x + area.width {
                 app.hits.push((Rect::new(x, area.y, w, 1), Hit::Compose(k)));
             }
         }
         x += w;
-        spans.push(span);
+        spans.extend(button);
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
     // What other writes said (a merge that failed) shows on the right.
     if let Some((text, _)) = &app.flash {
         let room = (area.x + area.width).saturating_sub(x + 2);
-        let text = format!("{text} ");
-        if room as usize >= text.chars().count() {
+        let text = Line::from(keyed(format!("{text} "), ACCENT));
+        if room as usize >= text.width() {
             frame.render_widget(
-                Paragraph::new(Span::styled(text, Style::new().fg(ACCENT)))
-                    .alignment(Alignment::Right),
+                Paragraph::new(text).alignment(Alignment::Right),
                 Rect::new(x + 2, area.y, room, 1),
             );
         }
@@ -3483,5 +3509,405 @@ mod tests {
             rows.iter().any(|r| r.contains("opened 5m ago")),
             "{rows:#?}"
         );
+    }
+
+    // ---- the look of keys ----------------------------------------------
+
+    /// The frame of this size as drawn.
+    fn drawn(app: &mut App, width: u16, height: u16) -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    /// Every place `text` starts on screen, cell by cell, from the top.
+    fn places(buf: &Buffer, text: &str) -> Vec<(u16, u16)> {
+        let letters: Vec<String> = text.chars().map(String::from).collect();
+        let mut found = Vec::new();
+        for y in 0..buf.area.height {
+            let cells: Vec<&str> = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
+            let Some(last) = cells.len().checked_sub(letters.len()) else {
+                continue;
+            };
+            for x in 0..=last {
+                if letters.iter().zip(&cells[x..]).all(|(l, c)| l == c) {
+                    found.push((x as u16, y));
+                }
+            }
+        }
+        found
+    }
+
+    /// Where `text` first starts on screen.
+    fn place(buf: &Buffer, text: &str) -> (u16, u16) {
+        *places(buf, text).first().unwrap_or_else(|| {
+            panic!(
+                "{text:?} not on screen: {:#?}",
+                (0..buf.area.height)
+                    .map(|y| row_text(buf, y))
+                    .collect::<Vec<_>>()
+            )
+        })
+    }
+
+    /// The cell has the look of a key: bold and in the accent colour.
+    fn key_cell(buf: &Buffer, x: u16, y: u16) -> bool {
+        let c = &buf[(x, y)];
+        c.fg == ACCENT && c.modifier.contains(Modifier::BOLD)
+    }
+
+    /// In `hint` (as "q close"), drawn where it first shows, the first
+    /// `key` cells have the look of a key and the rest does not.
+    fn assert_hint(buf: &Buffer, hint: &str, key: usize) {
+        let (x, y) = place(buf, hint);
+        for i in 0..hint.chars().count() as u16 {
+            assert_eq!(
+                key_cell(buf, x + i, y),
+                (i as usize) < key,
+                "{hint:?}, cell {i}: {:?}",
+                row_text(buf, y)
+            );
+        }
+    }
+
+    #[test]
+    fn a_marked_key_is_drawn_as_a_key_and_takes_no_room() {
+        use unicode_width::UnicodeWidthStr;
+        let marked = theme::keys("Press `i` for plain symbols, `Ctrl+s` sends");
+        assert_eq!(
+            marked.width(),
+            "Press i for plain symbols, Ctrl+s sends".width()
+        );
+        let spans = keyed(&marked, MUTED);
+        let looks: Vec<(&str, bool)> = spans
+            .iter()
+            .map(|s| (s.content.as_ref(), s.style == key_style()))
+            .collect();
+        assert_eq!(
+            looks,
+            [
+                ("Press ", false),
+                ("i", true),
+                (" for plain symbols, ", false),
+                ("Ctrl+s", true),
+                (" sends", false),
+            ]
+        );
+        // On a button the key keeps the button's background.
+        let on_button = with_keys(theme::keys(" `n` no "), Style::new().fg(TEXT).bg(BORDER));
+        assert_eq!(on_button[1].style.bg, Some(BORDER));
+        assert_eq!(on_button[1].style.fg, Some(ACCENT));
+        // A text without marks keeps its backticks and its one look.
+        let outside = keyed("`main` is protected", RED);
+        assert_eq!(outside.len(), 1);
+        assert_eq!(outside[0].content, "`main` is protected");
+    }
+
+    #[test]
+    fn footer_keys_have_the_key_look() {
+        let mut app = app_updated();
+        let buf = drawn(&mut app, 120, 20);
+        for hint in HINTS {
+            assert_hint(&buf, hint, 1);
+        }
+        assert_hint(&buf, "r refresh", 1);
+    }
+
+    #[test]
+    fn thread_hints_have_the_key_look() {
+        let activity = Activity::Loaded(vec![]);
+        for writable in [true, false] {
+            let (lines, _, _, _) =
+                activity_lines(Some(&activity), "me", 80, ThreadFilter::All, None, writable);
+            let keys: Vec<String> = lines[1]
+                .spans
+                .iter()
+                .filter(|s| s.style == key_style())
+                .map(|s| s.content.to_string())
+                .collect();
+            let mut want = vec!["t", "n", "N", "e"];
+            if writable {
+                want.extend([">", "+"]);
+            }
+            assert_eq!(keys, want);
+            for s in &lines[1].spans {
+                if s.style != key_style() {
+                    assert_ne!(s.style.fg, Some(ACCENT), "{:?}", s.content);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn overview_actions_have_the_key_look() {
+        let mut mr = sample_mr(1, ReviewState::Unreviewed, Pipeline::Failed);
+        mr.merge_state = MergeState::Ready;
+        let mut app = app_with(vec![], vec![mr], false);
+        app.details = true;
+        app.mine_state.select(Some(0));
+        let buf = drawn(&mut app, 160, 40);
+        for hint in [
+            "⏎ open",
+            "d changes",
+            "v approve",
+            "! request",
+            "m merge",
+            "c activity",
+        ] {
+            assert_hint(&buf, hint, 1);
+        }
+        assert_hint(&buf, "Ctrl+r start again", 6);
+    }
+
+    #[test]
+    fn diff_footer_keys_have_the_key_look_and_click_where_they_are() {
+        let mut app = app_updated();
+        app.diff = Some(crate::app::DiffView {
+            iid: 1,
+            reference: "!1".into(),
+            title: "Add export".into(),
+            diff: None,
+            scroll: 0,
+            height: 20,
+            tree: false,
+        });
+        let buf = drawn(&mut app, 120, 20);
+        for (hint, key) in [
+            ("↑↓ scroll", 2),
+            ("n next file", 1),
+            ("N previous file", 1),
+            ("f file tree", 1),
+            ("⏎ open in browser", 1),
+            ("q back to the list", 1),
+        ] {
+            assert_hint(&buf, hint, key);
+        }
+        for (hint, c) in [("n next file", 'n'), ("q back to the list", 'q')] {
+            let (x, y) = place(&buf, hint);
+            let (rect, _) = app
+                .hits
+                .iter()
+                .find(|(_, h)| *h == Hit::Key(c))
+                .unwrap_or_else(|| panic!("no click area for {c}"));
+            assert_eq!((rect.x, rect.y), (x, y), "{hint}");
+            assert_eq!(rect.width as usize, hint.chars().count(), "{hint}");
+        }
+    }
+
+    #[test]
+    fn help_keys_have_the_key_look_and_headings_do_not() {
+        let mut app = app_with(vec![], vec![], false);
+        app.help = true;
+        let buf = drawn(&mut app, 120, 60);
+        // The key column.
+        for key in ["Ctrl+r", "Esc", "double-click", "⏎ Ctrl+s Esc"] {
+            assert_hint(&buf, key, key.chars().count());
+        }
+        // Keys inside descriptions.
+        assert_hint(&buf, "y)", 1);
+        let (x, y) = place(&buf, "(n N files, f tree, q back)");
+        let looks: String = (0..27)
+            .map(|i| if key_cell(&buf, x + i, y) { 'k' } else { '.' })
+            .collect();
+        assert_eq!(looks, ".k.k........k.......k......");
+        let (x, y) = place(&buf, "b v ! m w: open ones only");
+        let looks: String = (0..25)
+            .map(|i| if key_cell(&buf, x + i, y) { 'k' } else { '.' })
+            .collect();
+        assert_eq!(looks, "k.k.k.k.k................");
+        // The headings are white, never in the accent colour.
+        for heading in ["Move", "List", "Mouse", "Merge request or pull request"] {
+            let (x, y) = place(&buf, heading);
+            for i in 0..heading.chars().count() as u16 {
+                assert_eq!(buf[(x + i, y)].fg, TEXT, "{heading}");
+            }
+        }
+        // A key in a heading is still a key.
+        let (x, y) = place(&buf, "Activity (c)");
+        assert_eq!(buf[(x, y)].fg, TEXT);
+        assert!(!key_cell(&buf, x + 9, y) && key_cell(&buf, x + 10, y));
+    }
+
+    #[test]
+    fn help_keys_keep_their_look_when_a_description_wraps() {
+        let mut app = app_with(vec![], vec![], false);
+        app.help = true;
+        let buf = drawn(&mut app, 40, 90);
+        // "(n N files, f tree, q back)" no longer fits one row.
+        assert!(places(&buf, "(n N files, f tree, q back)").is_empty());
+        // The `q` at the end of the row above "back)".
+        let (_, y) = place(&buf, "back)");
+        let q = (1..buf.area.width - 1)
+            .rev()
+            .find(|&x| {
+                buf[(x, y - 1)].symbol() == "q"
+                    && buf[(x - 1, y - 1)].symbol() == " "
+                    && buf[(x + 1, y - 1)].symbol() == " "
+            })
+            .unwrap_or_else(|| panic!("{:?}", row_text(&buf, y - 1)));
+        assert!(key_cell(&buf, q, y - 1), "{:?}", row_text(&buf, y - 1));
+        let then = places(&buf, "y)");
+        assert!(!then.is_empty(), "{then:?}");
+        for (x, y) in then {
+            assert!(key_cell(&buf, x, y), "{:?}", row_text(&buf, y));
+        }
+    }
+
+    #[test]
+    fn keys_inside_sentences_have_the_key_look() {
+        // The empty list's hint.
+        let mut app = app_in(Status::Closed);
+        app.data.as_mut().unwrap().mine.clear();
+        let project = Project {
+            host: "gitlab.com".into(),
+            path: "acme/app".into(),
+        };
+        app.project = Some(project.clone());
+        app.data.as_mut().unwrap().of = Some(project);
+        let buf = drawn(&mut app, 120, 20);
+        assert_hint(&buf, "a shows all projects", 1);
+        assert_hint(&buf, "No closed merge requests", 0);
+
+        // The text field's placeholder and footer.
+        let mr = sample_mr(1, ReviewState::Unreviewed, Pipeline::Success);
+        let mut app = app_with(vec![], vec![mr.clone()], false);
+        app.compose = Some(Compose::new(mr, crate::compose::Target::Comment));
+        let buf = drawn(&mut app, 120, 20);
+        let (x, y) = place(&buf, "⏎ new line · Ctrl+s send · Esc discard");
+        assert!(y < 19);
+        assert_hint(&buf, "⏎ new line · ", 1);
+        assert!(key_cell(&buf, x + 13, y) && key_cell(&buf, x + 18, y));
+        assert!(!key_cell(&buf, x + 19, y));
+        let footer = places(&buf, "⏎ new line");
+        let (fx, fy) = *footer.last().unwrap();
+        assert_eq!(fy, 19);
+        assert!(key_cell(&buf, fx, fy) && !key_cell(&buf, fx + 2, fy));
+
+        // A message that names a key.
+        let config = Config {
+            icons_chosen: false,
+            ..Config::default()
+        };
+        let mut app = App::new(config, None, None);
+        app.herdr = false;
+        let buf = drawn(&mut app, 120, 20);
+        assert_hint(&buf, "i for plain symbols", 1);
+        let (x, y) = place(&buf, "Press");
+        assert_eq!(buf[(x, y)].fg, ACCENT, "the message keeps its colour");
+        assert!(!key_cell(&buf, x, y));
+    }
+
+    #[test]
+    fn compose_footer_scroll_key_has_the_key_look() {
+        let mr = sample_mr(1, ReviewState::Unreviewed, Pipeline::Success);
+        let mut app = app_with(vec![], vec![mr.clone()], false);
+        let mut c = Compose::new(mr, crate::compose::Target::Comment);
+        c.field.text = "line\n".repeat(30);
+        app.compose = Some(c);
+        let buf = drawn(&mut app, 120, 20);
+        assert_hint(&buf, "↑↓ scroll", 2);
+    }
+
+    #[test]
+    fn grey_buttons_show_their_key_coloured_buttons_stay_one_block() {
+        // Closing the list.
+        let mut app = app_updated();
+        app.ask_quit = true;
+        let buf = drawn(&mut app, 120, 20);
+        assert_hint(&buf, "any other key stays", 13);
+        let (x, y) = place(&buf, "any other key stays");
+        assert_eq!(buf[(x, y)].bg, BORDER);
+        assert_eq!(buf[(x + 15, y)].fg, TEXT);
+        let (x, y) = place(&buf, " y close ");
+        for i in 0..9 {
+            assert_eq!(buf[(x + i, y)].bg, RED);
+            assert_eq!(buf[(x + i, y)].fg, theme::on(RED));
+        }
+        // Click areas as before: the whole button.
+        let hit = |app: &App, c| {
+            app.hits
+                .iter()
+                .find(|(_, h)| *h == Hit::Key(c))
+                .map(|(r, _)| (r.x, r.width))
+                .unwrap()
+        };
+        assert_eq!(hit(&app, 'y'), (x, 9));
+        assert_eq!(hit(&app, 'n'), (place(&buf, " any other key").0, 21));
+
+        // A write that asks first.
+        let mr = sample_mr(1, ReviewState::Unreviewed, Pipeline::Failed);
+        let mut app = app_with(vec![], vec![mr.clone()], false);
+        app.confirm = Some(crate::app::Confirm {
+            action: Action::Approve,
+            mr,
+        });
+        let buf = drawn(&mut app, 120, 20);
+        assert_hint(&buf, "n no", 1);
+        let (x, y) = place(&buf, " y yes ");
+        for i in 0..7 {
+            assert_eq!(buf[(x + i, y)].fg, theme::on(GREEN));
+        }
+        assert_eq!(hit(&app, 'y'), (x, 7));
+        assert_eq!(hit(&app, 'n'), (place(&buf, " n no ").0, 6));
+
+        // The text field: writing and the preview.
+        let mr = sample_mr(1, ReviewState::Unreviewed, Pipeline::Success);
+        let mut app = app_with(vec![], vec![mr.clone()], false);
+        let mut c = Compose::new(mr, crate::compose::Target::Comment);
+        c.field.text = "Looks good".into();
+        app.compose = Some(c.clone());
+        let buf = drawn(&mut app, 120, 20);
+        assert_hint(&buf, "Esc discard", 3);
+        let (x, y) = place(&buf, " Ctrl+s send ");
+        for i in 0..13 {
+            assert_eq!(buf[(x + i, y)].fg, theme::on(GREEN));
+        }
+        let compose_hit = |app: &App, k| {
+            app.hits
+                .iter()
+                .find(|(_, h)| *h == Hit::Compose(k))
+                .map(|(r, _)| (r.x, r.width))
+                .unwrap()
+        };
+        assert_eq!(compose_hit(&app, 's'), (x, 13));
+        assert_eq!(
+            compose_hit(&app, '\u{1b}'),
+            (place(&buf, " Esc discard ").0, 13)
+        );
+        c.stage = Stage::Preview;
+        app.compose = Some(c);
+        let buf = drawn(&mut app, 120, 20);
+        assert_hint(&buf, "n edit", 1);
+        assert_hint(&buf, "Esc discard", 3);
+        assert_eq!(compose_hit(&app, 'n'), (place(&buf, " n edit ").0, 8));
+    }
+
+    #[test]
+    fn text_from_a_forge_never_has_the_key_look() {
+        // An error in place of the list.
+        let mut app = app_with(vec![], vec![], false);
+        app.data = None;
+        app.error = Some("GitLab: `main` is protected, press `a` (y)".into());
+        let buf = drawn(&mut app, 120, 20);
+        assert_hint(&buf, "GitLab: `main` is protected, press `a` (y)", 0);
+
+        // A message after a write, and a title in a question.
+        let mut mr = sample_mr(1, ReviewState::Unreviewed, Pipeline::Success);
+        mr.title = "Use `a` and `y` in docs".into();
+        let mut app = app_with(vec![], vec![mr.clone()], false);
+        app.flash = Some((
+            "Cannot merge !1: `main` is protected".into(),
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+        ));
+        let buf = drawn(&mut app, 160, 20);
+        assert_hint(&buf, "Cannot merge !1: `main` is protected", 0);
+        assert_hint(&buf, "Use `a` and `y` in docs", 0);
+        app.flash = None;
+        app.confirm = Some(crate::app::Confirm {
+            action: Action::Merge,
+            mr,
+        });
+        let buf = drawn(&mut app, 160, 20);
+        assert_hint(&buf, "Merge !1 Use `a` and `y` in docs?", 0);
     }
 }

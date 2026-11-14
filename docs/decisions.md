@@ -827,3 +827,31 @@ the backslash, as on GitLab's page.
   and GitHub's Markdown shows `\/` as `/` as well.
 - Only `\/`: other escapes (`\*`, `\_`, `\#`) still show their backslash;
   the list writes no other.
+
+## 2026-11-14: A key has one look, also inside a sentence
+
+Every key the list names is bold and in the accent colour (`key_style` in
+`ui.rs`): in the footer and the `r` in front of the status, the thread
+hints, the details panel's actions and `Ctrl+r`, the changes view's
+footer, the help's key column and its descriptions, on grey buttons, and
+inside a sentence. What a key does stands beside it in a quieter colour,
+and the headings in the help are white, so the accent colour in a text
+means a key. Titles (the list, the panel, the changes view, the help box)
+and your own name on a note keep their bold accent: they stand alone at
+the top of a box or a note. Coloured block buttons (`y close`, `y yes`,
+`Ctrl+s send`, `y post`) stay one block, since an accent key on green or
+red would not read.
+
+A key inside a sentence is written between backticks in the source ("(`a`
+shows all projects)"); `theme::keys` turns each backtick into U+2060 (word
+joiner), and `with_keys` draws what stands between two of them as a key.
+Only texts written in the code go through `theme::keys`, never a title, a
+name, a comment or a forge's error, which may hold backticks of their own.
+
+- The same building blocks and look as herdr-routines (its decision of
+  2026-11-11), so the plugins look alike.
+- A mark without width: every place that wraps, cuts or measures a text
+  works as before, and the key spans themselves hold no mark, so no click
+  area moves. Places that measure a text that may hold marks (a message
+  on the right of the footer) measure its display width, not its
+  characters.

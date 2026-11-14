@@ -11,6 +11,12 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - The section tabs show their counts in parentheses: "Mine (3)",
   "To review (2)", "All (12)". A tab whose list is still loading shows only
   its name, such as "All", instead of "All …" (#41).
+- Every key the list names is bold and in the accent colour, as in the
+  other Herdr plugins: in the footer, the thread hints, the details panel,
+  the changes view, the `?` help, on grey buttons and inside a sentence
+  ("`a` shows all projects"). What a key does stays in a quieter colour, and
+  the headings in the help are white, so the accent colour in a text means a
+  key (#42).
 
 ### Fixed
 
