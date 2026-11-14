@@ -8,7 +8,7 @@ of `glab` and `gh` is installed and logged in; with both, the lists mix
 GitLab and GitHub, each row with its forge's logo.
 
 ```
-  Open merge requests    Mine 8   To review 2   All 14                ⌕ Search   all projects
+  Open merge requests    Mine (8)   To review (2)   All (14)          ⌕ Search   all projects
 
      Merge request                         Author   Review  CI  Approvals  Threads       Changes  Opened  Updated
     Add payment notices to the contract    @alex      ●     ●   1/2        –             +48 -9   2d      1h
