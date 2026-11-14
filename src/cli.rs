@@ -329,9 +329,12 @@ mod tests {
             .unwrap();
         assert_eq!(e, "example.org did not answer within 0 s");
         assert!(started.elapsed() < Duration::from_secs(10));
-        let pid = std::fs::read_to_string(&pidfile).unwrap();
+        let pid: u32 = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
         std::fs::remove_file(&pidfile).ok();
-        let pid = pid.trim();
         // The kill is sent, not yet done: give it a moment.
         let waited = Instant::now();
         while still_runs(pid) && waited.elapsed() < Duration::from_secs(2) {
@@ -340,31 +343,25 @@ mod tests {
         assert!(!still_runs(pid), "the sleep it started is gone too");
     }
 
-    /// Whether the process still runs. A killed process whose parent is
-    /// gone waits as a zombie until process 1 collects it, and in some
-    /// containers process 1 never does; `kill -0` still answers for a
-    /// zombie, though it runs nothing any more.
+    /// Whether the process still runs, by its state in `ps`. A killed
+    /// process whose parent is gone waits as a zombie (state `Z`) until
+    /// process 1 collects it, and in some containers process 1 never does;
+    /// `kill -0` still answers for a zombie, though it runs nothing any more.
     #[cfg(unix)]
-    fn still_runs(pid: &str) -> bool {
-        #[cfg(target_os = "linux")]
-        {
-            let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
-                return false;
-            };
-            // The state follows the name in parentheses, which may hold
-            // spaces or parentheses itself.
-            let state = stat
-                .rsplit_once(')')
-                .and_then(|(_, rest)| rest.split_whitespace().next());
-            state != Some("Z")
-        }
-        #[cfg(not(target_os = "linux"))]
-        Command::new("kill")
-            .args(["-0", pid])
+    fn still_runs(pid: u32) -> bool {
+        let out = Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
             .stderr(Stdio::null())
-            .status()
-            .unwrap()
-            .success()
+            .output()
+            .unwrap();
+        let state = String::from_utf8_lossy(&out.stdout);
+        let state = state.trim();
+        // `ps` fails with no line only when no such process exists.
+        assert!(
+            out.status.success() || state.is_empty(),
+            "ps could not tell"
+        );
+        !state.is_empty() && !state.starts_with('Z')
     }
 
     fn failed(stdout: &str, stderr: &str) -> Output {
