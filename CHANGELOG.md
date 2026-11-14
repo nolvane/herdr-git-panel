@@ -11,6 +11,10 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - The section tabs show their counts in parentheses: "Mine (3)",
   "To review (2)", "All (12)". A tab whose list is still loading shows only
   its name, such as "All", instead of "All …" (#41).
+- The title names the state for open ones too: "Open merge requests" (or
+  "Open pull requests"), like "Merged merge requests" and "Closed merge
+  requests". On a narrow pane it shortens to "Open", like the other two
+  (#39).
 
 ### Fixed
 
