@@ -6,6 +6,13 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- The title names the state for open ones too: "Open merge requests" (or
+  "Open pull requests"), like "Merged merge requests" and "Closed merge
+  requests". On a narrow pane it shortens to "Open", like the other two
+  (#39).
+
 ### Fixed
 
 - On GitLab, a line starting with `/` that the list posted as text now shows

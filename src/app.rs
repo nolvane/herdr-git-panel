@@ -2827,7 +2827,7 @@ mod tests {
         terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
         let buf = terminal.backend().buffer().clone();
         let title: String = (0..20).map(|x| buf[(x, 0)].symbol()).collect();
-        click(&mut app, title.find("Merge").unwrap() as u16, 0);
+        click(&mut app, title.find("Open").unwrap() as u16, 0);
         assert_eq!(app.status, Status::Merged);
         assert_eq!(app.filter, "x", "nothing typed into the search");
     }
@@ -2839,9 +2839,53 @@ mod tests {
         terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
         let buf = terminal.backend().buffer().clone();
         let title: String = (0..20).map(|x| buf[(x, 0)].symbol()).collect();
-        let x = title.find("Merge").expect("title") as u16;
+        let x = title.find("Open").expect("title") as u16;
         click(&mut app, x, 0);
         assert_eq!(app.status, Status::Merged);
+    }
+
+    #[test]
+    fn clicking_the_short_open_title_steps_the_state() {
+        let mut app = app();
+        let mut terminal = Terminal::new(TestBackend::new(54, 20)).unwrap();
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let cells: Vec<&str> = (0..54).map(|x| buf[(x, 0)].symbol()).collect();
+        let title = cells.concat();
+        assert!(!title.contains("merge requests"), "{title}");
+        // The last letter of "Open" (by cell, the icon may take several
+        // bytes): the click area covers the short title.
+        let x = (0..cells.len())
+            .find(|&x| cells[x..].starts_with(&["O", "p", "e", "n"]))
+            .expect("short title") as u16
+            + 3;
+        click(&mut app, x, 0);
+        assert_eq!(app.status, Status::Merged);
+    }
+
+    #[test]
+    fn z_steps_the_title_through_every_state() {
+        let mut app = app();
+        let title = |app: &mut App| {
+            screen_text(app, 120, 20)
+                .lines()
+                .next()
+                .unwrap()
+                .to_string()
+        };
+        let mut seen = vec![title(&mut app)];
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Char('z'));
+            seen.push(title(&mut app));
+        }
+        for (header, want) in seen.iter().zip([
+            "Open merge requests   ",
+            "Merged merge requests   ",
+            "Closed merge requests   ",
+            "Open merge requests   ",
+        ]) {
+            assert!(header.contains(want), "{want} in {header}");
+        }
     }
 
     /// Comments of a merge request: an open thread on a line, a plain

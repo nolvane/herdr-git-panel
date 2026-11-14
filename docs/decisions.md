@@ -236,6 +236,8 @@ that entry).
 
 The header says "Pull requests" when everything in view is on GitHub, else
 "Merge requests"; numbers are written `#n` and `!n` like the forges do.
+Since #39 the state comes first ("Open pull requests"; see the entry on
+`z`).
 
 ## 2026-11-08: Esc never closes the list
 
@@ -445,6 +447,10 @@ the list opens on open ones, like its other filters.
   ones.
 - `state` adds about 3 to the complexity of GitLab's "All" request over 50
   projects, measured at 209 of the 250 allowed.
+- The title names the state in all three (the owner's decision on #39,
+  2026-11-14, replacing "Merge requests" for open ones from #7): "Open merge
+  requests", "Merged merge requests", "Closed pull requests". A pane too
+  narrow for it next to the tabs shows only "Open", "Merged" or "Closed".
 
 ## 2026-11-09: Replies and comments from the activity tab
 
